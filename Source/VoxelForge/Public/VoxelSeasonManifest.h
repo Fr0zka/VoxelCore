@@ -134,10 +134,6 @@ struct VOXELFORGE_API FVoxelSeasonCompositionSettings
     }
 };
 
-// Friendly aliases for callers that use the task's shorter naming.
-using FVoxelSeasonComposerSettings = FVoxelSeasonCompositionSettings;
-using FVoxelSeasonComposeSettings = FVoxelSeasonCompositionSettings;
-
 /** Compact audit row; the full vectors live only for selected strates. */
 struct VOXELFORGE_API FVoxelSeasonCandidateAudit
 {
@@ -259,10 +255,6 @@ struct VOXELFORGE_API FVoxelSeasonManifest
         return true;
     }
 };
-
-/** Human-readable enum names used by JSON and the review page. */
-VOXELFORGE_API const TCHAR* VF_GetVoxelSeasonSelectionReasonName(
-    EVoxelSeasonSelectionReason Reason);
 
 /** Compose, validate, select, serialize, and (by default) write one season. Editor/build-box only. */
 #if WITH_EDITOR

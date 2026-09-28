@@ -26,7 +26,7 @@ public class VoxelForge : ModuleRules
 		//
 		// Precise resolves to "/fp:precise" on MSVC and "-ffp-contract=off" on Clang — both
 		// IEEE-754 compliant with no FMA contraction, so the two toolchains agree BY CONSTRUCTION
-		// rather than by luck. That is the fix for AUDIT-2026-07.md C9.
+		// rather than by luck. That is the fix for Docs/archive/AUDIT-2026-07.md C9.
 		//
 		// COST: /fp:precise forbids the reassociation and contraction /fp:fast allowed, on a
 		// noise-heavy hot path. Expect a measurable perf regression and check it against

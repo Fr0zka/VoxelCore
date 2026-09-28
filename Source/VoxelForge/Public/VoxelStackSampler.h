@@ -48,15 +48,6 @@ public:
         uint64 RetainedSamples = 0;
         uint64 DroppedSamples = 0;
         uint64 TotalFrames = 0;
-        // Kept for source compatibility with the earlier in-process summary.  Raw sessions leave
-        // these zero; the offline summary owns all resolved-frame counts and tables.
-        uint64 ResolvedFrames = 0;
-        uint64 UnknownFrames = 0;
-        uint64 WaitLikeFrames = 0;
-        uint64 SamplesWithResolvedLeaf = 0;
-        uint64 SamplesWithWaitLikeFrame = 0;
-        uint64 UniqueProgramCounters = 0;
-        uint64 InlineSymbols = 0;
         uint64 MaxActiveRegisteredThreads = 0;
         uint64 ModuleCount = 0;
         double RunSeconds = 0.0;
@@ -77,8 +68,6 @@ public:
 
     /** Used by the module shutdown path as a final lifecycle backstop. */
     void Shutdown();
-
-    bool IsRunning() const;
 
     /** Called only by FScopedVoxelStackRegistration; cheap when disabled. */
     static bool RegisterCurrentThread(int32 LODLevel = INDEX_NONE);

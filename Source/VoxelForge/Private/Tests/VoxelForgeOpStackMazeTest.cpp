@@ -1,73 +1,17 @@
 // VoxelForgeOpStackMazeTest.cpp
-// PHASE 1, LE TEST QUI COMPTE — la pile d'opérateurs Maze contre GetMazeDensity.
-// PHASE 1'S LOAD-BEARING TEST — the Maze operator stack against GetMazeDensity.
+// La pile d'opérateurs Maze / The Maze operator stack.
 //
-// CE QUE LA PHASE 1 DEVAIT PROUVER / WHAT PHASE 1 HAD TO PROVE
-// Le déclencheur d'arrêt de `OPSTACK-PLAN §4` : **« est-ce que la séparation source / modifier tombe
-// naturellement du code existant ? »** Réponse mesurée : oui. Maze se décompose en huit opérateurs
-// sans contorsion, le SDF est reproduit BIT POUR BIT, et aucun échantillon ne change de côté de
-// l'isosurface.
-//
-// ═════════════════════════════════════════════════════════════════════════════════════════
-// ✅ MISE À JOUR 2026-07-27 : LE PLANCHER ULP N'EXISTE PLUS. C'ÉTAIT `/fp:fast`.
-// ═════════════════════════════════════════════════════════════════════════════════════════
-// `FPSemantics = Precise` sur le module (AUDIT §C9, posé pour le cross-play Linux/Windows) fait
-// passer ce test à **BIT-IDENTIQUE**. La section ci-dessous décrit un état RÉVOLU ; elle est gardée
-// parce qu'elle explique pourquoi les cinq expériences d'isolation avaient toutes échoué (sous
-// `/fp:fast` le compilateur transforme selon le CONTEXTE — il n'y avait aucune variable à isoler)
-// et parce qu'elle dit quoi regarder si la bit-identité régresse un jour.
-//
-// **Conséquence pratique : ce test est maintenant un instrument BEAUCOUP plus fin.** Le moindre
-// écart est désormais une vraie trouvaille, pas du bruit à noter. La machinerie de gradation ULP
-// est conservée exprès — c'est elle qui signalerait une régression du modèle flottant.
-//
-// UPDATE: the ULP floor is GONE — FPSemantics = Precise makes this test bit-identical. The section
-// below describes a past state, kept because it explains why five isolation experiments all failed
-// (under /fp:fast the compiler transforms by CONTEXT — there was no variable to isolate) and what to
-// look at if bit-identity ever regresses.
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// ⚠️ LE PLANCHER ULP (HISTORIQUE) — lire ceci avant de « corriger » un écart résiduel
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// (HISTORIQUE, avant `FPSemantics = Precise`) la pile reproduisait `GetMazeDensity` à ~1-2 ULP près
-// sur ~2 % des échantillons (ceux qui tombent
-// dans la coquille de blend du SDF, où `Blend - Sdf` annule catastrophiquement et amplifie le
-// dernier arrondi). **Zéro échantillon ne traverse l'isosurface**, donc pas un triangle ne bouge.
-//
-// L'origine exacte de ce dernier arrondi n'a PAS été identifiée, après six cycles de build et cinq
-// hypothèses toutes réfutées par la mesure (aller-retour FVector · fenêtre de rugosité · `/fp:fast`
-// entre unités de compilation · contexte d'inlining · constante de compilation vs donnée
-// d'exécution). Ce qui EST établi par la mesure :
-//
-//   • le SDF est bit-identique sur 126/126 des écarts — le treillis, les hashs, l'ensemble d'arêtes
-//     et `VoxelSDF::Capsule` sont donc exacts ;
-//   • l'écart naît entièrement dans la conversion SDF→densité, au dernier arrondi ;
-//   • il est DÉTERMINISTE (mêmes échantillons, même delta, même coordonnée à chaque run) ;
-//   • il ne dépend ni de l'unité de compilation, ni de l'inlining, ni du modèle flottant.
-//
-// **Décision (Jahni, 2026-07-27) : on l'accepte et on avance.** Aucune décision du projet ne dépend
-// de la réponse, et la chasse coûtait plus que l'information. Consigné comme point ouvert dans
-// `AUDIT-2026-07.md §C10`.
-//
-// ⚠️ LA RÈGLE QUI EN DÉCOULE, ELLE, EST IMPORTANTE :
-// **ne jamais faire tourner les deux chemins (switch d'archétype et pile d'opérateurs) dans le même
-// monde, et ne jamais comparer leurs sorties pour égalité.** Ce n'est PAS un risque de désync entre
-// clients — dans un même binaire le champ est prouvé pur (`VoxelForge.Determinism.DensityPurity`,
-// bit-identique entre threads et ordres de requête) et tous les pairs exécutent le même chemin. Mais
-// une strate à moitié migrée produirait une couture. Le vrai sujet multijoueur est ailleurs :
-// `AUDIT §C9` (le défaut FP d'UBT diffère selon la toolchain).
-//
-// Never run both paths in one world and never compare their outputs for equality. This is NOT a
-// client-desync risk — within one binary the field is proven pure and every peer runs the same path —
-// but a half-migrated strate would produce a seam.
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// LA BARRE D'ACCEPTATION, ENCODÉE CI-DESSOUS / THE ACCEPTANCE BAR, ENCODED BELOW
-// ─────────────────────────────────────────────────────────────────────────────────────────
-//   • ÉCHEC DUR : un seul échantillon qui change de côté de l'isosurface (la géométrie bouge).
-//   • INFO      : des écarts à l'échelle de l'ULP (le plancher, attendu).
-//   • WARN      : un écart plus grand — ÇA, c'est une vraie dérive de portage, et il faut chercher.
-// Un test qui avertit à chaque portage serait ignoré par le portage qui compte.
+// Ce que ce test vérifie / What this test checks:
+//   • TOPOLOGIE — le graphe parent orienté vers l'origine est un arbre couvrant (N-1 arêtes, zéro
+//     cellule déconnectée), les boucles optionnelles restent bornées, et le graphe est déterministe
+//     sur 64 seeds. / The origin-directed parent graph is a spanning tree, deterministic per seed.
+//   • DÉCOMPOSITION — huit opérateurs (roche + couloirs + rugosité + carve + 4 structurels), pas un
+//     `FMazeOp` monolithique. / Eight ops, not one wrapped monolith.
+//   • INVARIANCE DE FENÊTRE — le cache par cellule est `thread_local` : bit-identique quel que soit
+//     l'ordre des requêtes et le thread. / Bit-identical across query order and worker threads.
+//   • VERDICTS DE BOÎTE — chaque verdict uniforme survit à la force brute (un faux verdict est un
+//     trou), y compris pour une pile source/convertisseur jamais écrite à la main.
+//     Every uniform box verdict survives brute force, including for a novel source/converter stack.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -355,13 +299,13 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    // GetMazeDensity court-circuite sur une strate dégénérée (`return 1.0f`). Cette garde appartient
-    // à la fonction d'archétype, pas à un opérateur ; la pile suppose une strate valide.
+    // La pile suppose une strate valide ; `GetDensityAt` rend de l'air sans pile sur une strate
+    // dégénérée. / The stack assumes a valid strate; GetDensityAt returns air for a degenerate one.
     if (MazeParams.StrateTopWorldZ - MazeParams.StrateBottomWorldZ <= 0.0f)
     {
         AddError(FString::Printf(
-            TEXT("The Maze strate has degenerate Z bounds (top %.1f, bottom %.1f), which sends ")
-            TEXT("GetMazeDensity down its early-out. The op stack has no such early-out by design."),
+            TEXT("The Maze strate has degenerate Z bounds (top %.1f, bottom %.1f); GetDensityAt ")
+            TEXT("builds no stack for it. The op stack has no degenerate-strate early-out by design."),
             MazeParams.StrateTopWorldZ, MazeParams.StrateBottomWorldZ));
         return false;
     }
@@ -486,70 +430,6 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
     }
 
     //=========================================================================
-    // ÉQUIVALENCE — géométrie d'abord, bits ensuite.
-    //=========================================================================
-    int32 NumDiff = 0, WorstIdx = -1, NumBeyondUlpNoise = 0, NumSolidDisagreements = 0;
-    float WorstDelta = 0.0f;
-    for (int32 i = 0; i < NumMazeSamples; ++i)
-    {
-        const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
-
-        const float Old = Gen->GetMazeDensity(X, Y, Z, MazeParams);   // MC : négatif = solide
-        const float New = Stack.EvalMC(X, Y, Z);
-
-        if (!BitEqual(Old, New))
-        {
-            ++NumDiff;
-            const float Delta = FMath::Abs(Old - New);
-            if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
-
-            // `Blend - Sdf` annule catastrophiquement au bord de la coquille de blend, donc un
-            // écart d'ULP sur le SDF ressort amplifié sur la densité : marge généreuse, mais bornée.
-            const float UlpNoise = 16.0f * FMath::Max(FMath::Abs(Old), 1.0f) * FLT_EPSILON;
-            if (Delta > UlpNoise) { ++NumBeyondUlpNoise; }
-        }
-        // Le mesher ne lit que le SIGNE (D >= IsoLevel ⇒ air). Un désaccord de CÔTÉ bouge la géométrie.
-        if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSolidDisagreements; }
-    }
-
-    if (NumDiff == 0)
-    {
-        AddInfo(FString::Printf(TEXT("Bit-identical across %d samples."), NumMazeSamples));
-    }
-    else if (NumBeyondUlpNoise == 0)
-    {
-        AddInfo(FString::Printf(
-            TEXT("%d of %d samples differ, ALL at ULP scale (largest |delta| %.9g at (%.0f, %.0f, ")
-            TEXT("%.0f)), and 0 cross the isosurface -- not one triangle would move. This is the ")
-            TEXT("accepted floor; see the header comment and AUDIT-2026-07.md C10. The SDF itself is ")
-            TEXT("reproduced BIT FOR BIT, so the lattice, the hashes and VoxelSDF::Capsule are exact; ")
-            TEXT("only the final SDF->density rounding differs. Do not go hunting this again without ")
-            TEXT("reading C10 first -- five hypotheses have already been measured and refuted."),
-            NumDiff, NumMazeSamples, WorstDelta,
-            WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f));
-    }
-    else
-    {
-        AddWarning(FString::Printf(
-            TEXT("%d of %d samples differ and %d are TOO LARGE to be the accepted ULP floor (largest ")
-            TEXT("|delta| %.9g at (%.0f, %.0f, %.0f)); %d cross the isosurface. THIS one is real port ")
-            TEXT("drift, not the known floor. Check, in order: the roughness apply-window ")
-            TEXT("(R + SurfaceRoughness + 2), the carve blend (2.0), the noise frequency (0.12) and ")
-            TEXT("octave count (3), and the order of the structural post ops."),
-            NumDiff, NumMazeSamples, NumBeyondUlpNoise, WorstDelta,
-            WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
-            NumSolidDisagreements));
-    }
-
-    // Le SEUL échec dur : un désaccord de côté d'iso EST une différence de géométrie.
-    TestEqual(TEXT("no sample lands on the opposite side of the isosurface from the original"),
-              NumSolidDisagreements, 0);
-
-    //=========================================================================
     // INVARIANCE DE FENÊTRE — la pile doit tenir les mêmes règles que le générateur.
     //=========================================================================
     // Le cache par cellule de la source de couloirs est `thread_local` : c'est exactement le genre
@@ -624,10 +504,9 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
     //=========================================================================
     // LE VERDICT DE BOÎTE — le prix perf de l'intervalle SDF conservatif.
     //=========================================================================
-    // ClassifyTile renvoie Mixed pour tout archétype de grotte, donc TunnelNetwork, Maze,
-    // VerticalShafts, FloatingIslands, FlatPlain, CrystalChamber et Underwater ne captent RIEN du
-    // gain T1.d. Tout nombre > 0 ici est le saut de tuile propre à la pile, pas une décision du
-    // classifieur historique.
+    // Pour un slot de cave, ClassifyTile plie `ClassifyBox` de cette pile : tout nombre > 0 ici est
+    // une tuile que le mesher saute. / For a cave slot ClassifyTile folds this stack's ClassifyBox:
+    // every proved box here is a tile the mesher skips.
     {
         int32 NumProved = 0, NumMixed = 0, NumUnsound = 0, NumBruteSamples = 0;
         FRandomStream Rng(24680);
@@ -689,17 +568,14 @@ bool FVoxelForgeOpStackMazeTest::RunTest(const FString& Parameters)
 
         AddInfo(FString::Printf(
             TEXT("Box verdicts over %d Maze tiles (XY sampled from +/- %d voxels = %.1f x ")
-            TEXT("CellSize %.0f): %d proved uniform, %d Mixed, %d voxels checked, %d violations. Today's ClassifyTile ")
-            TEXT("proves ZERO of these -- every cave archetype falls through to \"pas prouvable en ")
-            TEXT("v1\". Any number above zero here is tile-skipping Maze has never had."),
+            TEXT("CellSize %.0f): %d proved uniform, %d Mixed, %d voxels checked, %d violations."),
             NumMazeBoxTests, SpanVoxels, (float)SpanVoxels / FMath::Max(MazeParams.CellSize, 1.0f), MazeParams.CellSize,
             NumProved, NumMixed, NumBruteSamples, NumUnsound));
 
         if (NumProved == 0)
         {
-            AddWarning(TEXT("The stack proved no tile uniform, so it is not yet better than today's ")
-                       TEXT("classifier for Maze. Not a correctness problem, but the perf case for ")
-                       TEXT("the port rests on this number."));
+            AddWarning(TEXT("The stack proved no tile uniform, so ClassifyTile skips no Maze tile. ")
+                       TEXT("Not a correctness problem, but a perf regression."));
         }
     }
 

@@ -16,7 +16,7 @@
 #include "VoxelWormField.h"
 #include "VoxelDensityAblation.h" // fingerprinted development-only stage measurements
 #include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
-#include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
+#include "VoxelDensityOpStack.h"      // the per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 #include "VoxelDensityProfile.h"
@@ -264,13 +264,12 @@ private:
 };
 
 //=============================================================================
-// SURFACE COLUMN CACHE (T1.a) — kill the per-Z heightfield redundancy
+// SURFACE COLUMN CACHE — ClassifyTile's SurfaceWorld column proof (T1.d)
 //=============================================================================
-// The SurfaceWorld heightfield + sky-cap + biome blend are functions of XY ONLY, but
-// the mesher samples ~33 Z grid-points per column, each re-running that XY work. We cache
-// the column (terrain Z + ceiling Z) once per integer XY and reuse it down the column.
-// Used ONLY for integer-XY queries (the density grid); fractional queries (gradient
-// normals at interpolated vertices) fall through and compute directly → bit-identical.
+// The SurfaceWorld heightfield + sky-cap + biome blend are functions of XY ONLY, but a tile
+// spans many Z grid-points per column. ClassifyTile caches the column (terrain Z + ceiling Z)
+// once per integer XY and reuses it down the column. (The surface density stack keeps its own
+// column memo in FSurfaceColumnSource.)
 // The surface heightfield (TerrainZ + sky-cap CeilSurf) is a PURE function of (worldX, worldY,
 // seed, strate) — ZERO Z dependence: the climate/Voronoi fields are pure-XY (see ResolveBiomeSampleAt:
 // "result is the pure function of XY either way") and surface params are constant within a strate (Hard
@@ -283,7 +282,7 @@ private:
 // F20 phase 2 OVERHANG, resolved once per column (biome-blended, slope-gated) so the per-voxel
 // density path is cheap: OverhangAmp = strength · slope-gate (0 ⇒ no overhang here); (DirX,DirY) =
 // the UNIT UPHILL direction of the terrain gradient (the lip extends downhill, borrowing rock from
-// uphill). See SurfaceDensityFromColumn for the warped-terrain union that makes the shelf.
+// uphill). See FOverhangShelfMod for the warped-terrain union that makes the shelf.
 struct FSurfaceColumn
 {
     // Toutes les sorties sont écrites par ComputeSurfaceColumn avant Computed=true ; les valeurs
@@ -362,9 +361,9 @@ struct FSurfaceColumnCache
     }
 };
 
-// Cache de colonnes PARTAGÉ par thread : GetDensityAt (hot path, T1.a) + ClassifyTile (T1.d).
-// Les deux stockent des valeurs bit-identiques (même ComputeSurfaceColumn, champs purs en XY),
-// donc un ClassifyTile qui rend Mixed laisse ses colonnes chaudes pour le GenerateMesh qui suit.
+// Cache de colonnes par thread de ClassifyTile (T1.d) : les pré-passes et passes complètes
+// successives d'une même tuile, et les tuiles voisines, réutilisent leurs colonnes.
+// Per-thread column cache for ClassifyTile: successive passes and neighbouring tiles reuse columns.
 static thread_local FSurfaceColumnCache GSurfColCache;
 
 //=============================================================================
@@ -669,9 +668,9 @@ struct FVoxelDensityBlockSession
             return;
         }
 
-        // Allocate lazily on the first operator-stack sample.  Legacy archetypes still use the
-        // ordinary scalar generator and should not pay for a block scratch lattice merely because
-        // the mesher opened the scoped hand-off.
+        // Allocate lazily on the first operator-stack sample.  Chunks that never reach a stack
+        // (gaps, out-of-layout, degenerate strates) use the ordinary scalar path and should not
+        // pay for a block scratch lattice merely because the mesher opened the scoped hand-off.
         BlockScratch.Reset();
     }
 
@@ -969,12 +968,11 @@ static float RidgedNoise3D(const FVector3f& Position, int32 Octaves = 4,
 // Using F2-F1 (difference of two closest distances) gives smooth cell
 // boundaries with ridges between cells — more interesting than raw distance.
 
-// Le CORPS a déménagé dans Public/VoxelCaveMorphology.h (namespace VoxelNoise), au plus bas point
+// Le CORPS vit dans Public/VoxelCaveMorphology.h (namespace VoxelNoise), au plus bas point
 // qui voit déjà `VoxelHash` : la pile d'opérateurs a besoin exactement du même bruit pour la
 // rugosité (4b, type Cellular) et pour les festons (4f), et deux copies d'une fonction pure finissent
 // par diverger — c'est littéralement `AUDIT §C1`. Ce forwarder garde les ~3 sites d'appel ci-dessous
-// inchangés, comme l'ont fait FractalNoise3D et RidgedNoise3D lors de T2.a. Le chemin chaud garde
-// maintenant les coordonnées en float : la compatibilité d'arrondi historique est abandonnée.
+// inchangés, comme FractalNoise3D et RidgedNoise3D. Le chemin chaud garde les coordonnées en float.
 static float CellularNoise3D(const FVector3f& Position)
 {
     return VoxelNoise::Cellular3D(Position);
@@ -1198,9 +1196,9 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     }
 }
 
-// The disturbance pass is deterministic and spatially sparse.  ClassifyTile used to treat a
-// non-zero density as a world-wide influence, which made an otherwise proven all-solid/all-air
-// LOD0 box fall back to the full mesher.  These predicates are deliberately one-sided: they only
+// The disturbance pass is deterministic and spatially sparse.  Treating a non-zero density as a
+// world-wide influence would make an otherwise proven all-solid/all-air LOD0 box fall back to the
+// full mesher.  These predicates are deliberately one-sided: they only
 // prove that no hash-placed primitive can touch the queried box.  An intersecting candidate, an
 // invalid range, or an unknown parameter keeps the conservative Mixed result.
 static FORCEINLINE bool VF_DisturbanceBandTouchesBox(
@@ -2550,12 +2548,11 @@ namespace
     /**
      * Construit la pile de cet archétype dans `OutStack` et remplit les bornes Z de `OutCtx`.
      *
-     * @return false quand la pile NE DOIT PAS être utilisée — archétype non porté, params absents,
-     *         ou **strate dégénérée**. Ce dernier cas n'est pas de la prudence : cinq fonctions
-     *         d'archétype court-circuitent sur `return 1.0f` (= air) quand la hauteur est nulle,
-     *         et la pile n'a pas cet early-out, par conception. L'appelant retombe sur le `switch`,
-     *         qui EST le comportement de référence. (`GetDensityWithParams`, lui, n'a aucun
-     *         early-out de ce genre : TunnelNetwork/Underwater n'ont donc pas cette garde.)
+     * @return false quand la pile NE DOIT PAS être utilisée — archétype inconnu, params absents,
+     *         ou **strate dégénérée** (hauteur nulle). La pile n'a pas d'early-out pour ce dernier
+     *         cas, par conception : l'appelant rend de l'air (`GetDensityAt`) ou refuse de prouver
+     *         la tuile (`ClassifyTile`). (`GetDensityWithParams` n'a aucun early-out de ce genre :
+     *         TunnelNetwork/Underwater n'ont donc pas cette garde.)
      */
     bool VF_BuildOpStackForChunk(ECaveGeneratorType Type, FVoxelStackParamRefs& Refs,
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* SM,
@@ -2573,8 +2570,8 @@ namespace
 
         case ECaveGeneratorType::FlatPlain:
         case ECaveGeneratorType::CrystalChamber:
-            // UN SEUL cas pour les deux, comme le `switch` de production : `GetSlabDensity` ne les
-            // distingue pas non plus. Voir BuildSlabStack.
+            // UN SEUL cas pour les deux : ils ne diffèrent que par leurs valeurs par défaut.
+            // Voir BuildSlabStack.
             if (!Refs.Slab) { return false; }
             if (Refs.Slab->StrateTopWorldZ - Refs.Slab->StrateBottomWorldZ <= 0.0f) { return false; }
             OutCtx.StrateTopWorldZ    = Refs.Slab->StrateTopWorldZ;
@@ -2622,9 +2619,8 @@ namespace
             return true;
 
         default:
-            // `UsesOperatorStackForChunk` ne rend true que pour les archétypes portés (les 8), donc
-            // on ne devrait jamais arriver ici. Si ça arrive : retomber sur le `switch` plutôt que
-            // générer du vide — un monde faux est pire qu'un monde non porté.
+            // `UsesOperatorStackForChunk` ne rend true que pour les 8 archétypes, donc on ne devrait
+            // jamais arriver ici (valeur d'enum invalide).
             return false;
         }
     }
@@ -2843,11 +2839,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         thread_local FBiomeContext            CP_BiomeCtx;
         thread_local FChunkBiomeCache         CP_BiomeCache;
         thread_local TArray<FSurfaceGenerationParams> CP_SurfaceBiomeParams;
-        // T1.a per-column surface cache: GSurfColCache (file-scope, shared with ClassifyTile).
-        // Discriminates the surface cache by strate: same strate ⇒ identical heightfield params ⇒ columns
-        // are shareable across the whole vertical chunk stack. Taken from the params themselves
-        // (StrateBottomWorldZ is unique per stacked strate) so the key can never disagree with CP_Surface.
-        thread_local int32                    CP_StrateKey = MIN_int32;
         // AUDIT C2 — la clé DOIT contenir la version de layout, pas seulement le chunk. Après un
         // RebuildStrates / une édition à chaud, StrateManager reconstruit le layout et bumpe la
         // version ; un worker dont CP_Chunk vaut encore ce chunk sauterait le refetch et
@@ -2860,9 +2851,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // tile-window context. A cache hit moves the prepared stack/core out of these TLS values;
         // when the other context misses, this bit must force the rebuild guard below to run.
         thread_local bool                      CP_UsesTileCacheWindow = false;
-        // OPSTACK Phase 1 — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
-        // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide tant que
-        // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
+        // OPSTACK — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
+        // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide
+        // seulement pour une strate dégénérée (hauteur nulle).
         thread_local FVoxelOpStack            CP_OpStack;
         thread_local bool                     CP_UseOpStack = false;
         thread_local uint64                    CP_ManagerLifetimeId = 0;
@@ -2891,8 +2882,8 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // A coarse tile samples thousands of exact XY chunk keys, but those keys describe the
         // same immutable stack whenever the selected archetype is operator-stack backed.  Share
         // that prepared state by Z; the stack still queries the actual world position, and its
-        // room-graph cache remains keyed by the real XY search window.  Legacy tunnel states keep
-        // the full XYZ key because their native cache is built for one XY window.
+        // room-graph cache remains keyed by the real XY search window.  Chunks outside the strate
+        // layout (constant air) keep the full XYZ key.
         const ECaveGeneratorType QueryGeneratorType = bUseChunkRoutingCache
             ? CP_RouteGeneratorType
             : StrateManager->GetGeneratorTypeForChunk(ChunkCoord);
@@ -3067,7 +3058,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 CP_Maze    = StrateManager->GetMazeParamsForChunk(ChunkCoord);            break;
             case ECaveGeneratorType::SurfaceWorld:
                 ResolveSurfaceChunkParams(ChunkCoord, CP_Surface, CP_BiomeCtx, CP_SurfaceBiomeParams);
-                CP_StrateKey = FMath::RoundToInt(CP_Surface.StrateBottomWorldZ);
                 break;
             case ECaveGeneratorType::VerticalShafts:
                 CP_Vert    = StrateManager->GetVerticalShaftParamsForChunk(ChunkCoord);   break;
@@ -3086,131 +3076,112 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             }
             CP_Dist = StrateManager->GetDisturbanceParamsForChunk(ChunkCoord);
 
-            // ── OPSTACK Phase 1 : (re)construire la pile si cette strate l'a demandée. ──
-            // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
-            // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
-            CP_UseOpStack = bUseChunkRoutingCache
-                ? CP_RouteUsesOperatorStack
-                : StrateManager->UsesOperatorStackForChunk(ChunkCoord);
-            CP_UseOpStack = CP_UseOpStack || CP_UseCustomRecipe;
+            // ── OPSTACK : (re)construire la pile de ce chunk. ──
+            // Toute strate est générée par une pile d'opérateurs. La construction est par chunk
+            // (comme le refetch de params juste au-dessus), jamais par voxel.
+            // Every strate is generated by an operator stack. An editor composer candidate or a
+            // cooked-season recipe supplies its own stack; otherwise — or if that stack cannot be
+            // built — the archetype's native stack is used.
+            CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
+            CP_UseOpStack = false;
 #if WITH_EDITOR
-            // A composer override is already an explicit, validated stack description.  It must
-            // be evaluated even when the authored definition had the normal operator-stack opt-in
-            // disabled; otherwise a multi-region candidate would be installed in the manager but
-            // silently fall back to the old one-archetype switch.
-            CP_UseOpStack = CP_UseOpStack || CP_UseComposerRegions;
-#endif
-            if (CP_UseOpStack)
+            if (CP_UseComposerRegions)
             {
-                CP_OpStack = FVoxelOpStack();   // move-assign : libère l'ancienne pile
-                bool bBuiltSpecialStack = false;
-#if WITH_EDITOR
-                if (CP_UseComposerRegions)
+                FVoxelOpContext RegionContext;
+                if (VF_BuildStrateRegionStack(
+                    CP_ComposerRegions, OriginSpineRadius, StrateManager,
+                    CP_OpStack, RegionContext, nullptr))
                 {
-                    bBuiltSpecialStack = true;
-                    FVoxelOpContext RegionContext;
-                    if (VF_BuildStrateRegionStack(
-                        CP_ComposerRegions, OriginSpineRadius, StrateManager,
-                        CP_OpStack, RegionContext, nullptr))
-                    {
-                        RegionContext.ChunkCoord = ChunkCoord;
-                        RegionContext.Step = 1;
-                        RegionContext.LayoutVersion = LayoutVersion;
-                        RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
-                        RegionContext.EdgeSealThickness = EdgeSealThickness;
-                        CP_OpStack.PrepareChunk(RegionContext);
-                    }
-                    else
-                    {
-                        CP_UseOpStack = false;
-                    }
+                    RegionContext.ChunkCoord = ChunkCoord;
+                    RegionContext.Step = 1;
+                    RegionContext.LayoutVersion = LayoutVersion;
+                    RegionContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                    RegionContext.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack.PrepareChunk(RegionContext);
+                    CP_UseOpStack = true;
                 }
-#endif
-                if (!bBuiltSpecialStack)
+                else
                 {
-                    if (CP_UseCustomRecipe)
-                    {
-                        FVoxelOpContext RecipeContext;
-                        if (VF_BuildStackFromRecipe(
-                            CP_CustomRecipe, CP_CustomParams, CP_CustomRecipeSeed,
-                            OriginSpineRadius, StrateManager, CP_OpStack, RecipeContext, nullptr))
-                        {
-                            RecipeContext.ChunkCoord = ChunkCoord;
-                            RecipeContext.Step = 1;
-                            RecipeContext.LayoutVersion = LayoutVersion;
-                            // The recipe builder supplies the candidate's vertical seal to the
-                            // structural post. The XY edge seal is global and uses live settings.
-                            RecipeContext.WorldRadiusVoxels = WorldRadiusVoxels;
-                            RecipeContext.EdgeSealThickness = EdgeSealThickness;
-                            CP_OpStack.PrepareChunk(RecipeContext);
-                        }
-                        else
-                        {
-                            // Import/load validates recipes before a season becomes active. Keep
-                            // the fallback hole-safe if a future schema changes underneath it.
-                            CP_UseOpStack = false;
-                        }
-                    }
-                    else
-                    {
-                        FVoxelOpContext OpCtx;
-                        OpCtx.ChunkCoord    = ChunkCoord;
-                        OpCtx.Seed          = (uint32)Seed;
-                        OpCtx.LayoutVersion = LayoutVersion;
-                        OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
-                        OpCtx.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack = FVoxelOpStack();
+                    CP_UseComposerRegions = false;
+                }
+            }
+#endif
+            if (!CP_UseOpStack && CP_UseCustomRecipe)
+            {
+                FVoxelOpContext RecipeContext;
+                if (VF_BuildStackFromRecipe(
+                    CP_CustomRecipe, CP_CustomParams, CP_CustomRecipeSeed,
+                    OriginSpineRadius, StrateManager, CP_OpStack, RecipeContext, nullptr))
+                {
+                    RecipeContext.ChunkCoord = ChunkCoord;
+                    RecipeContext.Step = 1;
+                    RecipeContext.LayoutVersion = LayoutVersion;
+                    // The recipe builder supplies the candidate's vertical seal to the
+                    // structural post. The XY edge seal is global and uses live settings.
+                    RecipeContext.WorldRadiusVoxels = WorldRadiusVoxels;
+                    RecipeContext.EdgeSealThickness = EdgeSealThickness;
+                    CP_OpStack.PrepareChunk(RecipeContext);
+                    CP_UseOpStack = true;
+                }
+                else
+                {
+                    // Import/load validates recipes before a season becomes active. If a future
+                    // schema still fails here, fall back to the archetype's native stack below.
+                    CP_OpStack = FVoxelOpStack();
+                    CP_UseCustomRecipe = false;
+                }
+            }
+            if (!CP_UseOpStack)
+            {
+                FVoxelOpContext OpCtx;
+                OpCtx.ChunkCoord    = ChunkCoord;
+                OpCtx.Seed          = (uint32)Seed;
+                OpCtx.LayoutVersion = LayoutVersion;
+                OpCtx.WorldRadiusVoxels = WorldRadiusVoxels;
+                OpCtx.EdgeSealThickness = EdgeSealThickness;
 
                 // ⚠️ LE MAPPING VIT DANS `VF_BuildOpStackForChunk` (haut de ce fichier) ET NULLE
                 // PART AILLEURS — `ClassifyTile` appelle la MÊME fabrique. Un verdict de tuile issu
                 // d'une pile construite autrement serait un trou. Ici on ne fait que fournir les
                 // params déjà cherchés juste au-dessus.
-                        FVoxelStackParamRefs Refs;
-                        Refs.Slab   = &CP_Slab;
-                        Refs.Maze   = &CP_Maze;
-                        Refs.Vert   = &CP_Vert;
-                        Refs.Float  = &CP_Float;
-                        Refs.Tunnel = &CP_Tunnel;
+                FVoxelStackParamRefs Refs;
+                Refs.Slab   = &CP_Slab;
+                Refs.Maze   = &CP_Maze;
+                Refs.Vert   = &CP_Vert;
+                Refs.Float  = &CP_Float;
+                Refs.Tunnel = &CP_Tunnel;
 
                 // SurfaceWorld : le champ de biomes est fabriqué ICI, du côté qui connaît le
                 // générateur, et TRANSFÉRÉ à la pile. L'opérateur ne voit qu'une `IVoxelBiomeField`,
                 // ce qui lui permet de devenir un asset en Phase 3 sans traîner le générateur.
-                        TArray<FSurfaceGenerationParams> PerBiome;
-                        if (CP_GenType == ECaveGeneratorType::SurfaceWorld)
-                        {
-                            Refs.Surface = &CP_Surface;
-                            if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
-                            {
-                                PerBiome = CP_SurfaceBiomeParams;
-                                Refs.SurfaceBiomeParams = &PerBiome;
-                                Refs.BiomeField = MakeUnique<FGeneratorBiomeField>(
-                                    this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
-                            }
-                        }
-
-                        CP_UseOpStack = VF_BuildOpStackForChunk(
-                            CP_GenType, Refs, Seed, OriginSpineRadius,
-                            StrateManager, CP_OpStack, OpCtx);
-
-                // Le test appelle PrepareChunk, pas la production : c'est exactement la divergence
-                // qui rend un opérateur vert en test et faux en jeu. Les sept `PrepareChunk`
-                // actuels sont vides, donc ceci ne change RIEN aujourd'hui — c'est le point : le
-                // premier opérateur qui hisse vraiment du travail par chunk doit trouver l'appel
-                // déjà là. `Step` reste 1 : GetDensityAt ne connaît pas le pas d'échantillonnage
-                // du mesher (voir le contrat T2.b dans VoxelDensityOp.h).
-                // The test calls PrepareChunk and production did not — the exact divergence that
-                // makes an op green in test and wrong in game. All seven bodies are empty today,
-                // which is the point: the first op that hoists real per-chunk work must find the
-                // call already here.
-                        if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
+                TArray<FSurfaceGenerationParams> PerBiome;
+                if (CP_GenType == ECaveGeneratorType::SurfaceWorld)
+                {
+                    Refs.Surface = &CP_Surface;
+                    if (CP_BiomeCtx.IsValid() && CP_SurfaceBiomeParams.Num() > 0)
+                    {
+                        PerBiome = CP_SurfaceBiomeParams;
+                        Refs.SurfaceBiomeParams = &PerBiome;
+                        Refs.BiomeField = MakeUnique<FGeneratorBiomeField>(
+                            this, &CP_BiomeCtx, &CP_BiomeCache, ChunkCoord.Z);
                     }
                 }
+
+                CP_UseOpStack = VF_BuildOpStackForChunk(
+                    CP_GenType, Refs, Seed, OriginSpineRadius,
+                    StrateManager, CP_OpStack, OpCtx);
+
+                // PrepareChunk runs here exactly as in the tests, so an op that hoists real
+                // per-chunk work behaves the same in game. `Step` reste 1 : GetDensityAt ne connaît
+                // pas le pas d'échantillonnage du mesher (voir le contrat T2.b dans VoxelDensityOp.h).
+                if (CP_UseOpStack) { CP_OpStack.PrepareChunk(OpCtx); }
             }
 
-            // The legacy path needs its prepared native tunnel-core cache.  An operator-stack
-            // tunnel source publishes the same world-space result after EvalMC, so preparing a
-            // second full graph/core cache here would only duplicate the work that made coarse
-            // streaming expensive in the first place.  Custom/composer paths retain the legacy
-            // cache unless their own stack supplies the hand-off.
+            // An operator-stack tunnel source publishes the world-space core after EvalMC, so
+            // preparing a second full graph/core cache here would only duplicate the work that made
+            // coarse streaming expensive in the first place. Only an editor composer region stack,
+            // which does not publish that hand-off, still gets the prepared native core.
             const bool bNativeTunnelCore = !CP_UseCustomRecipe
                 && (CP_GenType == ECaveGeneratorType::TunnelNetwork
                     || CP_GenType == ECaveGeneratorType::Underwater);
@@ -3287,7 +3258,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         float BlockDensity = 0.f;
         bool bBlockHasTunnelCore = false;
         float BlockTunnelCoreSDF = FLT_MAX;
-        bool bBlockTunnelCoreSupportFloor = false;
         bool bBlockTunnelCoreRoomFloor = false;
         bool bBlockHasTunnelCoreSweptFloor = false;
         float BlockTunnelCoreSweptFloorZ = -FLT_MAX;
@@ -3296,12 +3266,9 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         FTunnelCoreWorldEvaluation FusedTunnelCore;
         bool bRoomOwnsBottom = false;
         bool bRoomOwnsBottomValid = false;
-        FVector NativeWarpedPosition = FVector::ZeroVector;
-        bool bNativeWarpedPositionValid = false;
 
         // Le seul point d'entrée de la pile dans le chemin de production. Elle rend la convention
-        // MC (négatif = solide) comme les fonctions d'archétype, donc les disturbances et la couche
-        // de diff qui suivent ne voient aucune différence.
+        // MC (négatif = solide), que les disturbances et la couche de diff qui suivent attendent.
         if (CP_UseOpStack)
         {
             const bool bCanUseFusedEvaluator =
@@ -3362,7 +3329,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                     BlockDensity = BlockCoreSample.Density;
                     bBlockHasTunnelCore = BlockCoreSample.bHasTunnelCoreWorldEvaluation;
                     BlockTunnelCoreSDF = BlockCoreSample.TunnelCoreWorldSDF;
-                    bBlockTunnelCoreSupportFloor = BlockCoreSample.bTunnelCoreSupportFloor;
                     bBlockTunnelCoreRoomFloor = BlockCoreSample.bTunnelCoreRoomFloor;
                     bBlockHasTunnelCoreSweptFloor =
                         BlockCoreSample.bHasTunnelCoreSweptFloor;
@@ -3386,66 +3352,11 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
                 }
             }
         }
-        else switch (CP_GenType)
+        else
         {
-        case ECaveGeneratorType::FlatPlain:
-        case ECaveGeneratorType::CrystalChamber:
-            Result = GetSlabDensity(WorldX, WorldY, WorldZ, CP_Slab);                 break;
-        case ECaveGeneratorType::Maze:
-            Result = GetMazeDensity(WorldX, WorldY, WorldZ, CP_Maze);                 break;
-        case ECaveGeneratorType::SurfaceWorld:
-        {
-            // Integer XY (the density grid) → reuse the column down its whole Z extent (T1.a).
-            // Fractional XY (gradient-normal samples) → compute directly (no cache key).
-            if (WorldX == FMath::FloorToFloat(WorldX) && WorldY == FMath::FloorToFloat(WorldY))
-            {
-                const int32 IX = (int32)WorldX, IY = (int32)WorldY;
-                // XY-keyed LRU box (shared down the whole vertical strate stack). Acquire centres a box on
-                // the first sample so the rest of the chunk's queries — incl. the ±Step margin ring — hit.
-                FSurfaceColumnBox& Box = GSurfColCache.Acquire(
-                    IX, IY, CP_StrateKey, Seed, LayoutVersion,
-                    DensityCacheOwnerId, ManagerLifetimeId);
-                const int32 CI = (IY - Box.BaseY) * FSurfaceColumnBox::Dim + (IX - Box.BaseX);
-                if (!Box.Computed[CI])
-                {
-                    ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                        CP_SurfaceBiomeParams, CP_BiomeCache,
-                        Box.Cols[CI].TerrainZ, Box.Cols[CI].CeilSurf,
-                        Box.Cols[CI].OverhangAmp, Box.Cols[CI].DirX, Box.Cols[CI].DirY);
-                    Box.Computed[CI] = true;
-                }
-                const FSurfaceColumn& Col = Box.Cols[CI];
-                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
-                    Col.TerrainZ, Col.CeilSurf, Col.OverhangAmp,
-                    Col.DirX, Col.DirY, CP_Surface);
-            }
-            else
-            {
-                float TerrainZ, CeilSurf, OverhangAmp, DirX, DirY;
-                ComputeSurfaceColumn(WorldX, WorldY, ChunkCoord.Z, CP_Surface, CP_BiomeCtx,
-                    CP_SurfaceBiomeParams, CP_BiomeCache, TerrainZ, CeilSurf,
-                    OverhangAmp, DirX, DirY);
-                Result = SurfaceDensityFromColumn(WorldX, WorldY, WorldZ,
-                    TerrainZ, CeilSurf, OverhangAmp, DirX, DirY, CP_Surface);
-            }
-            break;
-        }
-        case ECaveGeneratorType::VerticalShafts:
-            Result = GetVerticalShaftDensity(WorldX, WorldY, WorldZ, CP_Vert);        break;
-        case ECaveGeneratorType::FloatingIslands:
-            Result = GetFloatingIslandDensity(WorldX, WorldY, WorldZ, CP_Float);      break;
-        case ECaveGeneratorType::Underwater:
-        case ECaveGeneratorType::TunnelNetwork:
-        default:
-            // Underwater shares tunnel rock (water table is a render-side overlay).
-        Result = GetDensityWithParams(WorldX, WorldY, WorldZ, CP_Tunnel,
-                                          CP_TunnelFP, LayoutVersion,
-                                          /*bApplyLegacyStructuralPosts=*/false,
-                                          nullptr, false, &bRoomOwnsBottom,
-                                          &NativeWarpedPosition);
-            bRoomOwnsBottomValid = true;
-            bNativeWarpedPositionValid = true;
-            break;
+            // Only a degenerate strate (zero height) has no stack. It is open air, like the
+            // archetype functions the stack replaced.
+            Result = 1.0f;
         }
         DensityCoreTimer.End();
 
@@ -3466,7 +3377,6 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             else if (bUsedOpBlockSample && bBlockHasTunnelCore)
             {
                 PreDisturbanceTunnelCore.SDF = BlockTunnelCoreSDF;
-                PreDisturbanceTunnelCore.bSupportFloor = bBlockTunnelCoreSupportFloor;
                 PreDisturbanceTunnelCore.bRoomFloor = bBlockTunnelCoreRoomFloor;
                 PreDisturbanceTunnelCore.bHasSweptFloor =
                     bBlockHasTunnelCoreSweptFloor;
@@ -3486,21 +3396,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         {
             VoxelDensityProfile::FScopedTimer ProfileTimer(
                 VoxelDensityProfile::EBucket::TunnelCorePosts);
-            FVector RoomQueryPosition;
-            if (bNativeWarpedPositionValid)
+            FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+            if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
             {
-                RoomQueryPosition = NativeWarpedPosition;
+                RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
             }
-            else
-            {
-                RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
-                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
-                {
-                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
-                }
-                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
-            }
+            RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
             PreDisturbanceTunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                 WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache, nullptr,
                 VoxelGenLOD::ShouldUseSpatialIndex(
@@ -3524,7 +3426,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // A disturbance is allowed to add visual detail, but it must not refill the landing's
         // measured air volume or turn its support slab back into a hole. Reassert the landing
         // air first, then the structural floor, in MC space before the final XY seal. The two
-        // calls use the same landing geometry already evaluated by the legacy and op-stack post.
+        // calls use the same landing geometry already evaluated by the op-stack structural post.
         VoxelDensityProfile::FScopedTimer DensityStructuralPostsTimer(
             VoxelDensityProfile::EBucket::DensityStructuralPosts);
         VoxelDensityProfile::FScopedTimer StructuralTailTimer(
@@ -3699,21 +3601,13 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             {
                 VoxelDensityProfile::FScopedTimer ProfileTimer(
                     VoxelDensityProfile::EBucket::TunnelCorePosts);
-                FVector RoomQueryPosition;
-                if (bNativeWarpedPositionValid)
+                FVector RoomQueryPosition(WorldX, WorldY, WorldZ);
+                if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
                 {
-                    RoomQueryPosition = NativeWarpedPosition;
+                    RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
                 }
-                else
-                {
-                    RoomQueryPosition = FVector(WorldX, WorldY, WorldZ);
-                    if (CP_Tunnel.VerticalScale != 1.0f && CP_Tunnel.VerticalScale > 0.0f)
-                    {
-                        RoomQueryPosition.Z = WorldZ / CP_Tunnel.VerticalScale;
-                    }
-                    RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
-                        RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
-                }
+                RoomQueryPosition = VoxelCaveMorphology::ApplyCaveWarp(
+                    RoomQueryPosition, CP_Tunnel, static_cast<uint32>(Seed));
                 TunnelCore = VoxelCaveMorphology::EvaluateTunnelCoreWorld(
                     WorldX, WorldY, WorldZ, ActiveTunnelCoreCache->Cache,
                     nullptr,
@@ -3858,8 +3752,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
                                              bool bApplyLegacyStructuralPosts,
                                              FTunnelCoreWorldEvaluation* OutTunnelCore,
                                              bool bCollectFusedDiagnostics,
-                                             bool* OutRoomOwnsBottom,
-                                             FVector* OutWarpedPosition) const
+                                             bool* OutRoomOwnsBottom) const
 {
     //=========================================================================
     // STRATE DENSITY FUNCTION (Morphology Pipeline)
@@ -3893,10 +3786,6 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     if (OutRoomOwnsBottom != nullptr)
     {
         *OutRoomOwnsBottom = false;
-    }
-    if (OutWarpedPosition != nullptr)
-    {
-        *OutWarpedPosition = FVector::ZeroVector;
     }
     if (bCollectFusedDiagnostics && VoxelDensityProfile::AreCountersEnabled())
     {
@@ -3969,10 +3858,6 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
         WarpedY += WarpY * VOXEL_NOISE_SCALE * WS;
         WarpedZ += WarpZ * VOXEL_NOISE_SCALE * WS;
     }
-    if (OutWarpedPosition != nullptr)
-    {
-        *OutWarpedPosition = FVector(WarpedX, WarpedY, WarpedZ);
-    }
 
     //=========================================================================
     // STEP 4: SDF MORPHOLOGY (rooms + tunnels) — CACHED PER CHUNK
@@ -4002,7 +3887,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     thread_local float CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
     thread_local int32 CachedStrate = INT32_MIN;
     thread_local uint32 CachedSeed = 0;
-    // ⚠️ AUDIT §C2 (corrigé le 2026-07-28). Les deux lignes qui manquaient à cette clé.
+    // ⚠️ AUDIT §C2 — `CachedFingerprint` et `CachedLayout` ci-dessous sont OBLIGATOIRES dans cette clé.
     // La clé ci-dessus décrit la GÉOMÉTRIE de la fenêtre (boîte, strate, seed) et rien de ce qui
     // détermine les PARAMS avec lesquels les salles ont été cuites. Comme `GetGenerationParams`
     // blende à l'intérieur d'une strate (`Alpha` = f(chunk Z), et f(chunk XY) aussi en
@@ -4013,7 +3898,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // Pourquoi ça ne casse PAS l'invariant de perf de §8.10 : la clé reste une BOÎTE, donc les
     // sondes de gradient à `WorldX ± 1` ne font toujours pas tourner le cache. Ce qui le fait
     // tourner en plus, c'est un changement RÉEL de params — une fois par chunk dans une bande de
-    // transition, ce qui est le nombre de reconstructions que ce cache aurait toujours dû faire.
+    // transition, ce qui est exactement le nombre de reconstructions nécessaire.
     thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
     thread_local uint32 CachedLayout      = 0xFFFFFFFFu;
     thread_local bool CachedUsesFusedCacheWindow = false;
@@ -4521,7 +4406,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //
     // We copy Params and apply the nearest room's terrain op on top.
     // Base Params has all terrain op fields = 0 (disabled) since
-    // BuildParamsFromDefinition no longer merges them globally.
+    // BuildParamsFromDefinition does not merge them globally.
     //
     // Result: voxels inside different rooms see different terrain ops.
     // Rooms with no assigned op leave terrain fields at 0 → no terrain op. Clean.
@@ -5178,353 +5063,6 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
 }
 
 //=============================================================================
-// SLAB DENSITY (FlatPlain / CrystalChamber generator types)
-//=============================================================================
-// Produces a large horizontal void between a noisy floor and a noisy ceiling.
-// No rooms, no tunnels, no worm noise — just two surfaces with noise displacement.
-//
-// Key difference from TunnelNetwork: ceiling uses abs(noise) so ALL formations
-// point DOWNWARD. This creates the stalactite/crystal hanging-from-above effect.
-// Floor uses signed noise for natural ground undulation (hills and valleys).
-//
-// Columns are placed on a world-space hash grid (no rooms to anchor them to).
-
-float UVoxelGenerator::GetSlabDensity(float WorldX, float WorldY, float WorldZ,
-                                        const FSlabGenerationParams& Params) const
-{
-    const float StrateHeight = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-
-    // Degenerate strate (zero or inverted bounds) — return solid.
-    if (StrateHeight <= 0.0f) return 1.0f;
-
-    const uint32 SeedU = (uint32)Seed;
-
-    //=========================================================================
-    // STEP 1: FLOOR SURFACE
-    //=========================================================================
-    // The floor is at FloorZ + signed noise displacement.
-    // Signed noise allows both hills (noise > 0 → floor rises) and
-    // valleys (noise < 0 → floor dips) for natural rolling ground.
-    //
-    // ⚠️ XY-PUR / XY-PURE (OPSTACK-DECOMPOSITION §3.1, tranché par Jahni 2026-07-27).
-    // La 3e coordonnée était `WorldZ * FF * 0.05f` : une hauteur de sol qui dépendait de
-    // l'altitude d'où on la demandait. Le coefficient était minuscule, donc ça se lisait comme un
-    // léger étirement vertical plutôt que comme un bug — mais ça bloquait le cache de colonnes T1.a
-    // et rendait toute classification de boîte inexacte. Constante ⇒ la surface est une vraie
-    // fonction de (X,Y). Le monde se re-tune une fois : on échantillonne une autre tranche du champ
-    // de bruit, donc la forme du sol change (elle ne se dégrade pas).
-    //
-    // The 3rd coord was WorldZ * FF * 0.05f — a floor height that depended on the altitude you
-    // asked from. Now a constant, so the surface is a genuine function of (X,Y): the T1.a column
-    // cache and an exact box verdict both become available. Worlds re-tune once.
-
-    const float FloorZ = Params.StrateBottomWorldZ + StrateHeight * Params.FloorRelativeHeight;
-
-    float FloorNoise = 0.0f;
-    if (Params.FloorRoughness > 0.0f)
-    {
-        float FF = Params.FloorRoughnessFrequency;
-        FloorNoise = FractalNoise3D(FVector3f(
-            WorldX * FF + VoxelHash::SeedOffset(SeedU, 7.3f),
-            WorldY * FF + VoxelHash::SeedOffset(SeedU, 11.1f),
-            0.0f                          // XY-pur : plus aucune dépendance en Z / no Z dependence
-        ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE * Params.FloorRoughness;
-    }
-
-    // Actual floor surface Z after noise displacement.
-    const float FloorSurface = FloorZ + FloorNoise;
-
-    //=========================================================================
-    // STEP 2: CEILING SURFACE (formations hang DOWNWARD)
-    //=========================================================================
-    // The ceiling uses abs(noise) so ALL displacement pushes the ceiling DOWN.
-    // When abs(noise) is high, rock protrudes further into the void — stalactite.
-    // When abs(noise) is near 0, the ceiling is near the base CeilZ line.
-    //
-    // This asymmetry (only downward protrusions, never upward pockets) creates
-    // the crystal-forest / stalactite silhouette from below.
-    //
-    // XY-PUR, même raison que le sol ci-dessus (§3.1). Le `+ 3000.0f` RESTE : ce n'est pas un
-    // terme en Z, c'est le décalage qui décorrèle le champ du plafond de celui du sol.
-    // XY-pure for the same reason as the floor. The + 3000.0f STAYS — it is not a Z term, it is
-    // the offset that decorrelates the ceiling's noise field from the floor's.
-
-    const float CeilZ = Params.StrateBottomWorldZ + StrateHeight * Params.CeilingRelativeHeight;
-
-    float CeilNoise = 0.0f;
-    if (Params.CeilingRoughness > 0.0f)
-    {
-        float CF = Params.CeilingRoughnessFrequency;
-        float RawNoise = FractalNoise3D(FVector3f(
-            WorldX * CF + VoxelHash::SeedOffset(SeedU, 17.3f) + 1000.0f,
-            WorldY * CF + VoxelHash::SeedOffset(SeedU, 19.7f) + 2000.0f,
-            3000.0f                         // XY-pur : décalage de décorrélation seul / offset only
-        ), VoxelGenLOD::Eff(3)) * VOXEL_NOISE_SCALE;
-
-        // abs() → formations ONLY hang down, never push ceiling up into solid rock.
-        // Result: every noise peak creates a downward protrusion (crystal/stalactite).
-        CeilNoise = FMath::Abs(RawNoise) * Params.CeilingRoughness;
-    }
-
-    // Actual ceiling surface Z (can only move downward due to abs above).
-    // Clamp so ceiling never drops below floor + 2 voxels of headroom.
-    // Without this clamp, extreme CeilingRoughness could completely fill the void.
-    const float CeilSurface = FMath::Max(CeilZ - CeilNoise, FloorSurface + 2.0f);
-
-    //=========================================================================
-    // STEP 3: VOID FIELD → BASE DENSITY
-    //=========================================================================
-    // Each voxel is measured against both surfaces:
-    //   DistAboveFloor > 0 → voxel is above the floor (possibly in the void)
-    //   DistBelowCeil  > 0 → voxel is below the ceiling (possibly in the void)
-    //
-    // VoidField = min of both distances.
-    // Positive inside the void (between floor and ceiling).
-    // Negative outside (below floor or above ceiling = solid rock).
-    //
-    // Density = -VoidField (internal convention: positive = solid, negative = air).
-
-    const float DistAboveFloor = WorldZ - FloorSurface;   // + when above floor
-    const float DistBelowCeil  = CeilSurface - WorldZ;    // + when below ceiling
-
-    const float VoidField = FMath::Min(DistAboveFloor, DistBelowCeil);
-
-    float Density = -VoidField;  // Negative = air (inside void), positive = solid
-
-    //=========================================================================
-    // STEP 4: COLUMNS (hash-based, world-space grid)
-    //=========================================================================
-    // Unlike TunnelNetwork columns (anchored to room centers), slab columns
-    // are placed on a regular world-space hash grid. They are infinite-height
-    // cylinders — the void field already defines where solid/air is, so the
-    // column SDF just adds density everywhere along its XY position.
-    // The column is only visible where the void field carved air around it.
-    if (Params.ColumnDensity > 0.0f && Params.ColumnSpacing > 0.0f)
-    {
-        const float Spacing = Params.ColumnSpacing;
-
-        // Which cell are we in?
-        const int32 ColCX = FMath::FloorToInt(WorldX / Spacing);
-        const int32 ColCY = FMath::FloorToInt(WorldY / Spacing);
-
-        // The 3×3 neighbourhood's columns (existence roll, jitter, radius) are a pure function of
-        // (cell, seed, params) yet were re-derived PER VOXEL — 9 hash rolls + mixes in the slab hot
-        // loop. Bake them once per centre cell (thread_local); rebuild only when the query crosses a
-        // cell border or the seed/params change. Bit-identical (same hashes, same math).
-        struct FSlabColumn { float X, Y, R; };
-        thread_local TArray<FSlabColumn, TInlineAllocator<9>> SC_Cols;
-        thread_local int32  SC_CX = INT32_MAX, SC_CY = INT32_MAX;
-        thread_local uint32 SC_Seed = 0xFFFFFFFFu;
-        thread_local float  SC_Spacing = -1.0f, SC_Dens = -1.0f, SC_MinR = -1.0f, SC_MaxR = -1.0f;
-
-        if (ColCX != SC_CX || ColCY != SC_CY || (uint32)Seed != SC_Seed || Spacing != SC_Spacing ||
-            Params.ColumnDensity != SC_Dens || Params.ColumnMinRadius != SC_MinR || Params.ColumnMaxRadius != SC_MaxR)
-        {
-            SC_CX = ColCX;  SC_CY = ColCY;  SC_Seed = (uint32)Seed;  SC_Spacing = Spacing;
-            SC_Dens = Params.ColumnDensity;  SC_MinR = Params.ColumnMinRadius;  SC_MaxR = Params.ColumnMaxRadius;
-            SC_Cols.Reset();
-
-            for (int32 DY = -1; DY <= 1; DY++)
-            {
-                for (int32 DX = -1; DX <= 1; DX++)
-                {
-                    const int32 NCX = ColCX + DX;
-                    const int32 NCY = ColCY + DY;
-
-                    // Deterministic: same seed → same column pattern every session.
-                    // XOR with a prime salt so columns don't correlate with room placement.
-                    const uint32 H = VoxelHash::Cell(NCX, NCY, (uint32)Seed ^ 0xC01C01u);
-
-                    // ColumnDensity is the probability this cell has a column.
-                    if (VoxelHash::ToFloat01(H) > Params.ColumnDensity) continue;
-
-                    // Jitter the column center within the cell (15%-85% of cell extent)
-                    // to avoid a perfectly regular grid pattern.
-                    const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x12345678u));
-                    const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0x9ABCDEF0u));
-
-                    FSlabColumn& Col = SC_Cols.AddDefaulted_GetRef();
-                    Col.X = (NCX + 0.15f + JX * 0.7f) * Spacing;
-                    Col.Y = (NCY + 0.15f + JY * 0.7f) * Spacing;
-                    // Column radius: hash-derived within configured range.
-                    Col.R = FMath::Lerp(Params.ColumnMinRadius, Params.ColumnMaxRadius,
-                        VoxelHash::ToFloat01(VoxelHash::Mix(H ^ 0xBEEFu)));
-                }
-            }
-        }
-
-        float ColumnSDF = FLT_MAX;
-        for (const FSlabColumn& Col : SC_Cols)
-        {
-            // 2D cylinder SDF (infinite height — void field handles top/bottom).
-            const float DX2D = WorldX - Col.X;
-            const float DY2D = WorldY - Col.Y;
-            ColumnSDF = FMath::Min(ColumnSDF, FMath::Sqrt(DX2D * DX2D + DY2D * DY2D) - Col.R);
-        }
-
-        // Smoothstep blend zone around the column edge (avoids hard MC aliasing).
-        const float ColBlend = 2.0f;
-        if (ColumnSDF < ColBlend && ColumnSDF < FLT_MAX)
-        {
-            float Fill = FMath::Clamp((ColBlend - ColumnSDF) / (ColBlend * 2.0f), 0.0f, 1.0f);
-            Fill = SmoothStep01(Fill);  // Smoothstep
-            Density += Fill * Params.BaseDensity * 1.5f;
-        }
-    }
-
-    //=========================================================================
-    // STEP 5: BOUNDARY SEAL + STEP 6: PASSAGES + STEP 7: XY EDGE SEAL
-    //=========================================================================
-    // Même logique que TunnelNetwork — factorisée dans les helpers ci-dessus.
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
-
-    if (StrateManager)
-    {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            Params.BaseDensity, Params.BoundarySealThickness);
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
-
-    // Convention MC: négatif = solide.
-    return -Density;
-}
-
-//=============================================================================
-// MAZE GENERATOR  (ECaveGeneratorType::Maze)
-//=============================================================================
-// Solid rock carved by a deterministic 3D lattice of corridors. Each non-origin lattice node
-// chooses one parent toward (0,0,0), which is a spanning tree by construction. A small, capped
-// hash-gated loop set adds alternate routes without being needed for connectivity. The local
-// source evaluates the eight child nodes in the current cell's {-1,0} halo, so chunk seams cannot
-// change an edge decision.
-
-float UVoxelGenerator::GetMazeDensity(float WorldX, float WorldY, float WorldZ,
-                                      const FMazeGenerationParams& Params) const
-{
-    const float StrateHeight = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    if (StrateHeight <= 0.0f) return 1.0f;
-
-    const float CS = FMath::Max(Params.CellSize, 1.0f);
-    const FVector Pos(WorldX, WorldY, WorldZ);
-    const uint32 S = (uint32)Seed ^ 0x4D617A65u;  // 'Maze'
-
-    float Density = Params.BaseDensity;  // start solid
-
-    const int32 CX = FMath::FloorToInt(WorldX / CS);
-    const int32 CY = FMath::FloorToInt(WorldY / CS);
-    const int32 CZ = FMath::FloorToInt(WorldZ / CS);
-
-    // The edge set reachable from this voxel's cell is a pure function of (cell, seed, params).
-    // Bake the parent and optional loop capsule endpoints once per cell (thread_local); the
-    // per-voxel work is just the capsule SDFs. Rebuilds only on a cell crossing / param change.
-    struct FMazeEdge { FVector A, B; };
-    thread_local TArray<FMazeEdge, TInlineAllocator<24>> MZ_Edges;
-    thread_local FIntVector MZ_Cell(INT32_MAX, INT32_MAX, INT32_MAX);
-    thread_local uint32 MZ_Seed = 0xFFFFFFFFu;
-    thread_local float  MZ_CS = -1.0f, MZ_Branch = -1.0f, MZ_Vert = -1.0f;
-
-    const FIntVector Cell(CX, CY, CZ);
-    if (Cell != MZ_Cell || S != MZ_Seed || CS != MZ_CS ||
-        Params.BranchProbability != MZ_Branch || Params.Verticality != MZ_Vert)
-    {
-        MZ_Cell = Cell;  MZ_Seed = S;  MZ_CS = CS;
-        MZ_Branch = Params.BranchProbability;  MZ_Vert = Params.Verticality;
-        MZ_Edges.Reset();
-
-        auto NodeCenter = [CS](int32 X, int32 Y, int32 Z)
-        {
-            return FVector((X + 0.5f) * CS, (Y + 0.5f) * CS, (Z + 0.5f) * CS);
-        };
-        // Canonical lower-node edges in {-1,0} per axis cover every corridor that can reach this
-        // voxel's cell. IsOpenEdge checks both endpoints, including a +1 node's parent choice.
-        for (int32 dz = -1; dz <= 0; dz++)
-        for (int32 dy = -1; dy <= 0; dy++)
-        for (int32 dx = -1; dx <= 0; dx++)
-        {
-            const int32 nx = CX + dx, ny = CY + dy, nz = CZ + dz;
-            const FVector A = NodeCenter(nx, ny, nz);
-
-            if (VoxelMazeTopology::IsOpenEdge(
-                    nx, ny, nz, VoxelMazeTopology::EAxis::X,
-                    S, Params.BranchProbability, Params.Verticality))
-            {
-                MZ_Edges.Add({ A, NodeCenter(nx + 1, ny, nz) });
-            }
-            if (VoxelMazeTopology::IsOpenEdge(
-                    nx, ny, nz, VoxelMazeTopology::EAxis::Y,
-                    S, Params.BranchProbability, Params.Verticality))
-            {
-                MZ_Edges.Add({ A, NodeCenter(nx, ny + 1, nz) });
-            }
-            if (VoxelMazeTopology::IsOpenEdge(
-                    nx, ny, nz, VoxelMazeTopology::EAxis::Z,
-                    S, Params.BranchProbability, Params.Verticality))
-            {
-                MZ_Edges.Add({ A, NodeCenter(nx, ny, nz + 1) });
-            }
-        }
-    }
-
-    const float R = FMath::Max(Params.CorridorRadius, 0.5f);
-    float MazeSDF = FLT_MAX;
-    for (const FMazeEdge& E : MZ_Edges)
-    {
-        MazeSDF = FMath::Min(MazeSDF, VoxelSDF::Capsule(Pos, E.A, E.B, R));
-    }
-
-    // Wall roughness: perturb the corridor surface.
-    if (Params.SurfaceRoughness > 0.0f && MazeSDF < R + Params.SurfaceRoughness + 2.0f)
-    {
-        MazeSDF += FractalNoise3D(FVector3f(WorldX * 0.12f, WorldY * 0.12f, WorldZ * 0.12f), VoxelGenLOD::Eff(3))
-                 * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
-    }
-
-    // Carve air where inside a corridor.
-    const float Blend = 2.0f;
-    if (MazeSDF < Blend)
-    {
-        float Carve = FMath::Clamp((Blend - MazeSDF) / (Blend * 2.0f), 0.0f, 1.0f);
-        Carve = SmoothStep01(Carve);
-        Density -= Carve * Params.BaseDensity * 2.0f;
-    }
-
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
-
-    if (StrateManager)
-    {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            Params.BaseDensity, Params.BoundarySealThickness);
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
-
-    return -Density;
-}
-
-//=============================================================================
 // SURFACE-WORLD GENERATOR  (ECaveGeneratorType::SurfaceWorld)
 //=============================================================================
 // A heightfield terrain (fBM continents + ridged mountains + fine detail) under a
@@ -5726,71 +5264,6 @@ float UVoxelGenerator::ComputeSurfaceCeiling(float WorldX, float WorldY,
     return CeilZ - Hang;
 }
 
-float UVoxelGenerator::SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
-                                                float TerrainZ, float CeilSurf,
-                                                float OverhangAmp, float DirX, float DirY,
-                                                const FSurfaceGenerationParams& S) const
-{
-    // Solid below the terrain surface; solid above the sky-cap ceiling.
-    float Density = TerrainZ - WorldZ;
-    Density = FMath::Max(Density, WorldZ - CeilSurf);
-
-    // F20 phase 2 — OVERHANG shelf (warped-terrain union): for AIR voxels in a window just above a
-    // steep slope, re-sample the heightfield UPHILL (toward the cliff) by a height-varying amount and
-    // union that rock in → the cliff-top rock juts OUT over the void below, self-capping at the cliff's
-    // height. Genuine 3D (per-voxel re-eval), so it's gated hard: only steep overhang columns (amp>0),
-    // only air voxels within OverhangHeight of the local ground, only when the shift is ≥ a voxel.
-    // The lip is capped at TerrainZ+OverhangHeight, which ClassifyTile treats as ambiguous (no holes).
-    if (OverhangAmp > 0.0f && S.OverhangHeight > 0.0f
-        && WorldZ > TerrainZ && WorldZ <= TerrainZ + S.OverhangHeight)
-    {
-        const uint32 SeedU = (uint32)Seed;
-        const float f     = S.OverhangFrequency;
-        // Shelf-shape noise [0,1]; the Z term makes the reach fold/curl with height (ragged, not a lip).
-        const float Ns = FractalNoise3D(FVector3f(
-            WorldX * f + VoxelHash::SeedOffset(SeedU, 17.3f),
-            WorldY * f + VoxelHash::SeedOffset(SeedU, 23.9f),
-            WorldZ * f * S.OverhangZScale + VoxelHash::SeedOffset(SeedU, 5.1f)), 3) * 0.5f + 0.5f;   // [0,1]
-        // KEY: the uphill reach GROWS with height in the window (Frac: 0 at ground → 1 at the cap). Low
-        // down the shift is tiny ⇒ borrows nearby low rock ⇒ stays AIR over the void; high up the shift
-        // reaches the far cliff ⇒ solid ⇒ the lip sits on top with air UNDERNEATH = a real overhang.
-        const float Frac   = (WorldZ - TerrainZ) / S.OverhangHeight;            // (0,1] inside the window
-        const float ShiftV = S.OverhangReach * OverhangAmp * Frac * Ns;         // uphill reach (voxels)
-        if (ShiftV > 0.5f)
-        {
-            // Borrow the uphill STRUCTURAL height (not the full op'd surface): the shelf underside doesn't
-            // need cliff/terrace refinement, and this avoids re-running Cliff's resamples per lip voxel.
-            float Ms;
-            const float ShiftedTZ = SampleSurfaceStructuralZ(WorldX + DirX * ShiftV, WorldY + DirY * ShiftV, S, Ms);
-            Density = FMath::Max(Density, ShiftedTZ - WorldZ);   // union: solid where uphill rock covers Z
-        }
-    }
-
-    // Structural fields (Z bounds, seal, base) are forced equal across biomes → S is safe.
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        S.StrateTopWorldZ, S.StrateBottomWorldZ,
-        S.BoundarySealThickness, S.BaseDensity, OriginSpineRadius);
-
-    ApplyBoundarySeal(Density, WorldZ,
-        S.StrateTopWorldZ, S.StrateBottomWorldZ,
-        S.BoundarySealThickness, S.BaseDensity);
-
-    if (StrateManager)
-    {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            S.BaseDensity, S.BoundarySealThickness);
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        S.StrateTopWorldZ, S.StrateBottomWorldZ,
-        S.BoundarySealThickness, S.BaseDensity, OriginSpineRadius);
-
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, S.BaseDensity);
-
-    return -Density;
-}
-
 void UVoxelGenerator::ResolveSurfaceChunkParams(const FIntVector& ChunkCoord,
     FSurfaceGenerationParams& OutSurface, FBiomeContext& OutBiomeCtx,
     TArray<FSurfaceGenerationParams>& OutBiomeParams) const
@@ -5934,10 +5407,9 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
 //=============================================================================
 // ~84 % des tuiles générées sortent VIDES (tout-roc sous le terrain, tout-air
 // au-dessus, cap solide) mais payaient quand même le pré-échantillonnage 33³+
-// complet (trace 2026-07-05 : 83 925 GenerateMesh pour 13 227 maillages réels).
-// Une 1re tentative (2026-06-26) a été REVERTÉE : borne analytique GLOBALE du
-// plafond pas assez conservative (cap bas ⇒ trous dans le toit). Ici on suit la
-// prescription du revert : les colonnes sont ÉCHANTILLONNÉES sur le treillis
+// complet (une trace : 83 925 GenerateMesh pour 13 227 maillages réels).
+// ⚠️ Pas de borne analytique GLOBALE du plafond : pas assez conservative (cap
+// bas ⇒ trous dans le toit). Les colonnes sont donc ÉCHANTILLONNÉES sur le treillis
 // exact du mesher (mêmes fonctions ⇒ mêmes floats ⇒ verdict exact, pas une
 // estimation), et le cas tout-solide porte des gardes spine/passages/
 // disturbances/diff. Tout ce qui n'est pas prouvable ⇒ Mixed (le seul coût d'un
@@ -6296,9 +5768,9 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             && (StructuralManager->AnyLandingFloorAtLattice(
                     Box, Context.LatticeOriginVoxels, Context.Step)
                 // The passage's authored D-floor is a final MC-space writer, not part of the
-                // interpreted stack. It was deliberately left out of the old support-floor query
-                // when the legacy slab was removed; omitting the native-floor reach here lets an
-                // exact core-lattice AllAir claim skip a tile whose final density is solid.
+                // interpreted stack, and no support-floor query covers it; omitting the
+                // native-floor reach here lets an exact core-lattice AllAir claim skip a tile
+                // whose final density is solid.
                 || StructuralManager->AnyPassageStructuralPostNearLattice(
                     Box, Context.LatticeOriginVoxels, Context.Step));
         const bool bHasStructuralCandidate = Whole == EVoxelTileClass::AllSolid
@@ -6828,7 +6300,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
     bool bCanSolid = true;   // "tout le treillis est solide" encore prouvable
     bool bCanAir   = true;   // "tout le treillis est air" encore prouvable
     // ── Catégorisation par Z du treillis : gap bedrock = solide ; hors layout = air constant ;
-    //    SurfaceWorld = test colonne ; un slot cave opt-in = verdict de pile sur sa sous-boîte. ──
+    //    SurfaceWorld = test colonne ; un slot cave = verdict de pile sur sa sous-boîte. ──
     struct FSurfSlot
     {
         int32 BotChunkZ = INT32_MAX;   // identité du slot (borne basse de la strate, en chunks)
@@ -6909,7 +6381,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
             // EST FAUX) et `IsGapChunk` rend false au-dessus du sommet (« open air, NOT a gap »).
             // Résultat : chaque tuile touchant l'air libre au-dessus du monde entrait dans la
             // BRANCHE DE CAVE, n'y trouvait aucun slot, et abandonnait — mesuré en jeu à 83 % des
-            // tuiles classées (`Cave Bail Not Op Stack No Layout` = 1.58 / 1.90).
+            // tuiles classées.
             //
             // La vérité est dans `GetGenerationParams` : hors layout il rend `BaseDensity = -1`,
             // `RoomDensity = 0`, `WormStrength = 0` — un champ CONSTANT, donc de l'air, sans salle
@@ -6992,38 +6464,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
                 // le pliage générique de la pile — mais SEULEMENT sous des conditions vérifiables,
                 // parce qu'un faux verdict ici est un trou (pas de géométrie, pas de collision).
                 //
-                // Condition 1 : la strate doit RÉELLEMENT être générée par la pile. Sinon on
-                // classerait un champ que le mesher ne produira pas. C'est le même drapeau, lu au
-                // même endroit, que `GetDensityAt`.
+                // Condition 1 : le slot doit avoir une pile (une définition d'archétype connue).
+                // Sinon on classerait un champ que le mesher ne produira pas.
                 if (!StrateManager->UsesOperatorStackForChunk(CC))
                 {
-                    // Attribution DIAGNOSTIQUE uniquement : l'ancien compteur mélangeait une
-                    // strate cave entièrement désactivée avec une tuile de frontière qui avait
-                    // rencontré un slot désactivé avant la garde « slot différent » ci-dessous.
-                    // On résout les bornes APRÈS l'échec du même prédicat ; elles ne changent ni
-                    // la condition, ni le point de retour, ni le verdict.
-                    // Diagnostic attribution only: the old counter mixed a wholly disabled cave
-                    // slot with a boundary tile that met a disabled slot before the different-slot
-                    // guard below. Resolve bounds only after the same predicate fails; classification
-                    // control flow and return value stay unchanged.
-                    int32 FailedTopCZ = 0, FailedBotCZ = 0;
-                    if (!StrateManager->GetStrateChunkZBounds(ChunkZ, FailedTopCZ, FailedBotCZ))
-                    {
-                        INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackNoLayout);
-                    }
-                    else
-                    {
-                        const int32 TileMinCZ = FloorDivC(MinZ, CHUNK_SIZE);
-                        const int32 TileMaxCZ = FloorDivC(MaxZ, CHUNK_SIZE);
-                        if (TileMinCZ >= FailedBotCZ && TileMaxCZ <= FailedTopCZ)
-                        {
-                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackSoleSlot);
-                        }
-                        else
-                        {
-                            INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackBoundaryTile);
-                        }
-                    }
+                    INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
                     return EVoxelTileClass::Mixed;
                 }
 
@@ -7143,8 +6588,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         bCanAir = false;
     }
     // Native passage D-floors are authored structural posts applied after the operator stack.
-    // They are not the removed legacy support slab, but they still add solid MC samples and
-    // therefore must kill the AllAir hypothesis before a tile can be skipped.
+    // They add solid MC samples and therefore must kill the AllAir hypothesis before a tile can
+    // be skipped.
     if (bHasPassageStructuralPostCandidate)
     {
         bCanAir = false;
@@ -7182,7 +6627,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         // `GetGenerationParams` et ses homologues BLENDENT les params dans les bandes de transition :
         // `Alpha` dépend du chunk Z pour `Gradient`, et du chunk XY EN PLUS pour `Interleaved`. Deux
         // chunks d'une même sous-boîte peuvent donc porter des params différents — c'est le constat de
-        // `AUDIT §C2`, confirmé par lecture le 2026-07-28 — et UNE pile ne peut pas représenter DEUX
+        // `AUDIT §C2` — et UNE pile ne peut pas représenter DEUX
         // champs. On construit donc les params pour CHAQUE coordonnée de chunk que la boîte touche et
         // on exige qu'ils soient identiques bit à bit.
         //
@@ -7228,16 +6673,11 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
                 return EVoxelTileClass::Mixed;   // la boîte déborde sur un autre archétype
             }
 
-            // Le drapeau doit tenir sur TOUS les chunks de la boîte, pas seulement sur celui qui a
-            // déclenché la tentative : un seul chunk hors pile invaliderait le verdict.
+            // Every chunk of the box must have a stack, not only the one that triggered the
+            // attempt (redundant with the Z pass today, kept hole-safe).
             if (!StrateManager->UsesOperatorStackForChunk(CC))
             {
-                // Le passage Z précédent a déjà accepté l'unique slot cave. Avec le layout actuel
-                // (prédicat indépendant de X/Y), ce recheck est redondant ; un hit nomme donc
-                // précisément cette garde tardive au lieu d'être agrégé aux opt-ins désactivés.
-                // The prior Z pass already accepted the sole cave slot. With the current X/Y-
-                // independent predicate this recheck is redundant, so attribute it separately.
-                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNotOpStackRecheck);
+                INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
                 return EVoxelTileClass::Mixed;
             }
 
@@ -7336,8 +6776,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         if (!VF_BuildOpStackForChunk(CaveType, Refs, Seed, OriginSpineRadius,
                                      StrateManager, TileStack, OpCtx))
         {
-            // Strate dégénérée ou archétype non porté : `GetDensityAt` retomberait sur le `switch`,
-            // donc la pile ne décrit pas ce que le mesher verra. Aucun verdict.
+            // Strate dégénérée : `GetDensityAt` y rend de l'air sans pile, donc la pile ne décrit
+            // pas ce que le mesher verra. Aucun verdict.
             INC_DWORD_STAT(STAT_VoxelForgeCaveBailNoStack);
             return EVoxelTileClass::Mixed;
         }
@@ -7428,7 +6868,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
 
     // ── Balayage des colonnes XY sur le treillis exact du mesher (marge incluse). Une colonne
     //    tranche chaque z intérieur : air côté MC ⇔ TerrainZ ≤ z ≤ CeilSurf (D = −interne ≥ 0,
-    //    cf. SurfaceDensityFromColumn ; spine/passages ne font QUE de l'air → gardés plus haut).
+    //    cf. FSurfaceColumnSource ; spine/passages ne font QUE de l'air → gardés plus haut).
     //    Pré-passe clairsemée ~5×5 pour tuer vite les tuiles traversées par la surface, puis
     //    passe complète — les colonnes recalculées par la pré-passe restent chaudes dans la boîte.
     auto TestColumn = [&](int32 gx, int32 gy) -> bool   // false ⇒ les deux hypothèses sont mortes
@@ -7497,27 +6937,6 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         else           { INC_DWORD_STAT(STAT_VoxelForgeTilesOpStackAir); }
     }
     return bCanSolid ? EVoxelTileClass::AllSolid : EVoxelTileClass::AllAir;
-}
-
-float UVoxelGenerator::GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
-                                         const FSurfaceGenerationParams& ParamsD,
-                                         const FSurfaceGenerationParams& ParamsN,
-                                         float NeighborWeight) const
-{
-    if (ParamsD.StrateTopWorldZ - ParamsD.StrateBottomWorldZ <= 0.0f) return 1.0f;
-
-    // Heightfield: dominant biome, OUTPUT-BLENDED toward the nearest neighbour in the
-    // border band. Blending heights (not params) keeps borders seamless across any param
-    // difference. ParamsD == ParamsN, weight 0 ⇒ single eval (bit-identical, no biomes).
-    float TerrainZ = ComputeSurfaceTerrainZ(WorldX, WorldY, ParamsD);
-    if (NeighborWeight > 0.0f)
-    {
-        TerrainZ = FMath::Lerp(TerrainZ, ComputeSurfaceTerrainZ(WorldX, WorldY, ParamsN), NeighborWeight);
-    }
-    const float CeilSurf = ComputeSurfaceCeiling(WorldX, WorldY, ParamsD);
-
-    return SurfaceDensityFromColumn(WorldX, WorldY, WorldZ, TerrainZ, CeilSurf,
-                                    /*OverhangAmp*/0.0f, /*DirX*/0.0f, /*DirY*/0.0f, ParamsD);
 }
 
 //=============================================================================
@@ -7932,594 +7351,4 @@ void UVoxelGenerator::GetBiomeMaterialAt(float WorldX, float WorldY, float World
             : OutDominantPalette;
         OutBlendWeight = S.NeighborWeight;   // 0 inside a cell → ~0.5 at the border
     }
-}
-
-//=============================================================================
-// VERTICAL-SHAFT GENERATOR  (ECaveGeneratorType::VerticalShafts)
-//=============================================================================
-// Solid rock carved by hash-placed full-height vertical shafts (cylinders), a deterministic
-// drainage tree of horizontal connector tunnels rooted at the origin spine, additive random
-// connector loops, and partial ledges inside them. Emphasises climbing and falling.
-
-float UVoxelGenerator::GetVerticalShaftDensity(float WorldX, float WorldY, float WorldZ,
-                                               const FVerticalShaftParams& Params) const
-{
-    const float StrateHeight = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    if (StrateHeight <= 0.0f) return 1.0f;
-
-    const float Spacing = FMath::Max(Params.ShaftSpacing, 1.0f);
-    const FVector Pos(WorldX, WorldY, WorldZ);
-    const uint32 S = (uint32)Seed ^ 0x53686674u;  // 'Shft'
-
-    float Density = Params.BaseDensity;  // start solid
-
-    const int32 CX = FMath::FloorToInt(WorldX / Spacing);
-    const int32 CY = FMath::FloorToInt(WorldY / Spacing);
-
-    // The shaft topology is pure, but it is deliberately split into two windows:
-    //   * COLLECT a deterministic halo once during this thread-local cache rebuild. This is the
-    //     source data needed to resolve every 5×5 parent window and the fixed ±3 fallback window.
-    //   * EVALUATE only the INNER 3×3 shaft cylinders. Tree links are collected from a wider
-    //     rebuild-only child window and culled to the current cell before the voxel loop sees
-    //     them. That matters: a capsule from a child to a parent two or three cells away must be
-    //     present in the cells along its segment, not only in the cache centred on the child.
-    struct FLocalShaft { float X, Y, R; int32 CellX, CellY; bool bOriginSpine; };
-    struct FLocalConn
-    {
-        FVector A, B;
-        float Radius = 0.0f;
-        float FloorZ = 0.0f;
-        bool bWalkableFloor = false;
-    };
-    thread_local TArray<FLocalShaft, TInlineAllocator<10>> Shafts;
-    thread_local TArray<FLocalConn, TInlineAllocator<32>> Conns;
-    thread_local TArray<FLocalShaft, TInlineAllocator<81>> TreeEmitShafts;
-    thread_local int32  VS_CX = INT32_MAX, VS_CY = INT32_MAX;
-    thread_local uint32 VS_Seed = 0xFFFFFFFFu;
-    thread_local float  VS_Spacing = -1.0f, VS_Dens = -1.0f, VS_MinR = -1.0f, VS_MaxR = -1.0f,
-                        VS_Cross = -1.0f, VS_ConnR = -1.0f, VS_Rough = -1.0f,
-                        VS_SpineR = -1.0f, VS_BotZ = FLT_MAX, VS_TopZ = FLT_MAX,
-                        VS_Seal = -1.0f, VS_LedgeSpacing = -1.0f, VS_LedgeDepth = -1.0f;
-
-    if (CX != VS_CX || CY != VS_CY || S != VS_Seed || Spacing != VS_Spacing ||
-        Params.ShaftDensity != VS_Dens || Params.ShaftMinRadius != VS_MinR || Params.ShaftMaxRadius != VS_MaxR ||
-        Params.CrossConnectChance != VS_Cross || Params.ConnectorRadius != VS_ConnR ||
-        Params.SurfaceRoughness != VS_Rough || OriginSpineRadius != VS_SpineR ||
-        Params.StrateBottomWorldZ != VS_BotZ || Params.StrateTopWorldZ != VS_TopZ ||
-        Params.BoundarySealThickness != VS_Seal
-        || Params.LedgeSpacing != VS_LedgeSpacing || Params.LedgeDepth != VS_LedgeDepth)
-    {
-        VS_CX = CX;  VS_CY = CY;  VS_Seed = S;  VS_Spacing = Spacing;
-        VS_Dens = Params.ShaftDensity;  VS_MinR = Params.ShaftMinRadius;  VS_MaxR = Params.ShaftMaxRadius;
-        VS_Cross = Params.CrossConnectChance;  VS_ConnR = Params.ConnectorRadius;
-        VS_Rough = Params.SurfaceRoughness;    VS_SpineR = OriginSpineRadius;
-        VS_BotZ = Params.StrateBottomWorldZ;  VS_TopZ = Params.StrateTopWorldZ;
-        VS_Seal = Params.BoundarySealThickness;
-        VS_LedgeSpacing = Params.LedgeSpacing;
-        VS_LedgeDepth = Params.LedgeDepth;
-        Shafts.Reset();
-        Conns.Reset();
-        TreeEmitShafts.Reset();
-
-        constexpr int32 EmitRadius = 1;      // 3×3: shaft cylinders and random links
-        constexpr int32 CandidateRadius = 2; // 5×5 parent window around an emitting shaft
-        constexpr int32 FallbackRadius = 3;  // fixed fallback window around an emitting shaft
-        constexpr uint32 TreeSalt = 0x7A11u;
-
-        const float BottomZ = Params.StrateBottomWorldZ + Params.BoundarySealThickness;
-        const float TopZ    = Params.StrateTopWorldZ    - Params.BoundarySealThickness;
-        const float RoughnessReach = FMath::Max(Params.SurfaceRoughness, 0.0f)
-                                    * VOXEL_NOISE_SCALE * 1.5f;
-        // A tree link must remain open at the centreline after the SDF roughness pass. The +1
-        // margin makes the radius strictly greater than the proven roughness supremum.
-        const float TreeConnectorRadius = FMath::Max(Params.ConnectorRadius, RoughnessReach + 1.0f);
-        // A tree capsule can affect a cell even when neither endpoint is in that cell. Keep a
-        // rebuild-only child halo for that geometric reach, then add the parent-search halo. The
-        // default is a 4-cell tree-emission radius + 3-cell collection pad = 7-cell radius
-        // (15×15 rolls; the emitted tree-child box itself is 9×9).
-        const int32 ConnectorCellPad = FMath::Max(
-            1, FMath::CeilToInt(TreeConnectorRadius / Spacing));
-        const int32 TreeEmitRadius = FallbackRadius + ConnectorCellPad;
-        const int32 CollectRadius = TreeEmitRadius + FallbackRadius;
-
-        const int32 CollectSide = CollectRadius * 2 + 1;
-        TArray<FLocalShaft, TInlineAllocator<225>> ShaftGrid;
-        TArray<uint8, TInlineAllocator<225>> ShaftPresent;
-        ShaftGrid.SetNum(CollectSide * CollectSide);
-        ShaftPresent.Init(0, CollectSide * CollectSide);
-        // Collect the wider deterministic neighbourhood once. Only the inner cells are retained
-        // in `Shafts` for the per-voxel cylinder/ledge work; `TreeEmitShafts` is still rebuilt
-        // before evaluation and its connectors are spatially culled below.
-        for (int32 dy = -CollectRadius; dy <= CollectRadius; dy++)
-        for (int32 dx = -CollectRadius; dx <= CollectRadius; dx++)
-        {
-            const int32 nx = CX + dx, ny = CY + dy;
-            const uint32 Hh = VoxelHash::Cell(nx, ny, S);
-            if (VoxelHash::ToFloat01(Hh) > Params.ShaftDensity) continue;
-
-            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
-            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
-            FLocalShaft Sh;
-            Sh.X = (nx + 0.15f + JX * 0.7f) * Spacing;
-            Sh.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
-            Sh.R = FMath::Lerp(Params.ShaftMinRadius, Params.ShaftMaxRadius,
-                               VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0xBEEFu)));
-            Sh.CellX = nx;
-            Sh.CellY = ny;
-            Sh.bOriginSpine = false;
-            const int32 GridIndex = (dy + CollectRadius) * CollectSide + (dx + CollectRadius);
-            ShaftGrid[GridIndex] = Sh;
-            ShaftPresent[GridIndex] = 1;
-            if (FMath::Abs(dx) <= EmitRadius && FMath::Abs(dy) <= EmitRadius)
-            {
-                Shafts.Add(Sh);
-            }
-            if (FMath::Abs(dx) <= TreeEmitRadius && FMath::Abs(dy) <= TreeEmitRadius)
-            {
-                TreeEmitShafts.Add(Sh);
-            }
-        }
-
-        auto FindCollectedShaft = [&](int32 CellX, int32 CellY) -> const FLocalShaft*
-        {
-            const int32 dx = CellX - CX;
-            const int32 dy = CellY - CY;
-            if (FMath::Abs(dx) > CollectRadius || FMath::Abs(dy) > CollectRadius)
-            {
-                return nullptr;
-            }
-            const int32 GridIndex = (dy + CollectRadius) * CollectSide + (dx + CollectRadius);
-            return ShaftPresent[GridIndex] ? &ShaftGrid[GridIndex] : nullptr;
-        };
-
-        // The structural (0,0) spine is not re-carved here. It participates only as a
-        // connector endpoint. The local 3x3 set is origin-adjacent when its centre cell is in
-        // the central 3x3; the structural post remains the sole owner of the vertical column.
-        const bool bOriginNearby = FMath::Abs(CX) <= 1 && FMath::Abs(CY) <= 1;
-        if (bOriginNearby && OriginSpineRadius > 0.0f)
-        {
-            Shafts.Add({0.0f, 0.0f, OriginSpineRadius, 0, 0, true});
-        }
-
-        const float CellMinX = static_cast<float>(CX) * Spacing;
-        const float CellMaxX = static_cast<float>(CX + 1) * Spacing;
-        const float CellMinY = static_cast<float>(CY) * Spacing;
-        const float CellMaxY = static_cast<float>(CY + 1) * Spacing;
-        auto ConnectorMayReachCell = [&](const FLocalConn& Conn)
-        {
-            const float MinX = FMath::Min(Conn.A.X, Conn.B.X) - Conn.Radius;
-            const float MaxX = FMath::Max(Conn.A.X, Conn.B.X) + Conn.Radius;
-            const float MinY = FMath::Min(Conn.A.Y, Conn.B.Y) - Conn.Radius;
-            const float MaxY = FMath::Max(Conn.A.Y, Conn.B.Y) + Conn.Radius;
-            const float GapX = FMath::Max3(CellMinX - MaxX, MinX - CellMaxX, 0.0f);
-            const float GapY = FMath::Max3(CellMinY - MaxY, MinY - CellMaxY, 0.0f);
-            return GapX == 0.0f && GapY == 0.0f;
-        };
-
-        auto EmitTreeConnector = [&](const FLocalShaft& Child, const FLocalShaft* Parent)
-        {
-            const float Zc = VoxelPassageGeometry::VerticalShaftConnectorCenterZ(
-                Params.StrateBottomWorldZ,
-                BottomZ,
-                TopZ,
-                Params.LedgeSpacing,
-                Params.LedgeDepth,
-                TreeConnectorRadius);
-            const float FloorZ = VoxelPassageGeometry::VerticalShaftConnectorFloorZ(
-                Params.StrateBottomWorldZ,
-                BottomZ,
-                TopZ,
-                Params.LedgeSpacing,
-                Params.LedgeDepth,
-                TreeConnectorRadius);
-            const FVector ParentPoint = Parent != nullptr
-                ? FVector(Parent->X, Parent->Y, Zc)
-                : FVector(0.0f, 0.0f, Zc);
-            const FLocalConn Conn{
-                FVector(Child.X, Child.Y, Zc), ParentPoint, TreeConnectorRadius,
-                FloorZ, true };
-            if (ConnectorMayReachCell(Conn))
-            {
-                Conns.Add(Conn);
-            }
-        };
-
-        // Structural drainage tree: every real shaft in the rebuild-only child window first
-        // selects one strictly more-central shaft from its complete 5×5 window. If that window
-        // has a local minimum, select the nearest shaft in the collected deterministic halo whose
-        // origin distance is lower; that shaft is already on a strictly descending path by the
-        // same rule. A shaft whose window reaches the origin uses the spine directly, and the
-        // final direct-spine fallback covers an unusually empty finite halo. Thus every emitted
-        // parent edge either strictly decreases origin distance or terminates at the spine: no
-        // cycles and no orphans. Spatial culling makes the same edge visible throughout its
-        // capsule, independent of which cache cell is evaluating it.
-        // The explicit cell-coordinate tie-break makes this independent of array iteration order;
-        // the synthetic spine is not a candidate shaft.
-        for (const FLocalShaft& Child : TreeEmitShafts)
-        {
-            if (Child.bOriginSpine) continue;
-
-            const float ChildOriginSq = FMath::Square(Child.X) + FMath::Square(Child.Y);
-            const FLocalShaft* Parent = nullptr;
-            float BestDistanceSq = FLT_MAX;
-            for (int32 dy = -CandidateRadius; dy <= CandidateRadius; ++dy)
-            for (int32 dx = -CandidateRadius; dx <= CandidateRadius; ++dx)
-            {
-                const FLocalShaft* Candidate = FindCollectedShaft(
-                    Child.CellX + dx, Child.CellY + dy);
-                if (Candidate == nullptr
-                    || (Candidate->CellX == Child.CellX && Candidate->CellY == Child.CellY))
-                {
-                    continue;
-                }
-
-                const float CandidateOriginSq = FMath::Square(Candidate->X)
-                                               + FMath::Square(Candidate->Y);
-                if (!(CandidateOriginSq < ChildOriginSq))
-                {
-                    continue;
-                }
-
-                const float DistanceSq = FMath::Square(Child.X - Candidate->X)
-                                       + FMath::Square(Child.Y - Candidate->Y);
-                const bool bLowerCell = Parent == nullptr
-                    || Candidate->CellY < Parent->CellY
-                    || (Candidate->CellY == Parent->CellY && Candidate->CellX < Parent->CellX);
-                if (DistanceSq < BestDistanceSq
-                    || (DistanceSq == BestDistanceSq && bLowerCell))
-                {
-                    BestDistanceSq = DistanceSq;
-                    Parent = Candidate;
-                }
-            }
-
-            if (Parent == nullptr
-                && !(FMath::Abs(Child.CellX) <= CandidateRadius
-                    && FMath::Abs(Child.CellY) <= CandidateRadius))
-            {
-                // This is the specified neighbour-shaft fallback. Restricting it to a lower
-                // origin distance makes the parent graph well-founded even though the fallback
-                // candidate need not be in the child's 5×5 window.
-                for (int32 dy = -FallbackRadius; dy <= FallbackRadius; ++dy)
-                for (int32 dx = -FallbackRadius; dx <= FallbackRadius; ++dx)
-                {
-                    const FLocalShaft* Candidate = FindCollectedShaft(
-                        Child.CellX + dx, Child.CellY + dy);
-                    if (Candidate == nullptr
-                        || (Candidate->CellX == Child.CellX && Candidate->CellY == Child.CellY))
-                    {
-                        continue;
-                    }
-
-                    const float CandidateOriginSq = FMath::Square(Candidate->X)
-                                                   + FMath::Square(Candidate->Y);
-                    if (!(CandidateOriginSq < ChildOriginSq))
-                    {
-                        continue;
-                    }
-
-                    const float DistanceSq = FMath::Square(Child.X - Candidate->X)
-                                           + FMath::Square(Child.Y - Candidate->Y);
-                    const bool bLowerCell = Parent == nullptr
-                        || Candidate->CellY < Parent->CellY
-                        || (Candidate->CellY == Parent->CellY
-                            && Candidate->CellX < Parent->CellX);
-                    if (DistanceSq < BestDistanceSq
-                        || (DistanceSq == BestDistanceSq && bLowerCell))
-                    {
-                        BestDistanceSq = DistanceSq;
-                        Parent = Candidate;
-                    }
-                }
-            }
-
-            EmitTreeConnector(Child, Parent);
-        }
-
-        // Existing probabilistic links remain as texture and loops. They intentionally stay on
-        // the cached inner 3×3 working set; only the structural tree build needs the 9×9/15×15 halo.
-        if (Params.CrossConnectChance > 0.0f && Shafts.Num() >= 2)
-        {
-            for (int32 i = 0; i < Shafts.Num(); i++)
-            for (int32 j = i + 1; j < Shafts.Num(); j++)
-            {
-                const FLocalShaft& A = Shafts[i];
-                const FLocalShaft& B = Shafts[j];
-                const bool bSpineConnector = A.bOriginSpine || B.bOriginSpine;
-                const float DSq = FMath::Square(A.X - B.X) + FMath::Square(A.Y - B.Y);
-                if (DSq > FMath::Square(Spacing * 1.6f)) continue;  // only neighbours
-
-                // Symmetric pair hash from quantised endpoints.
-                const uint32 PH = VoxelHash::Pair(
-                    FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y),
-                    FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y), S ^ 0xC04Eu);
-                if (VoxelHash::ToFloat01(PH) >= Params.CrossConnectChance) continue;
-
-                const float Zc = FMath::Lerp(BottomZ, TopZ, VoxelHash::ToFloat01(VoxelHash::Mix(PH)));
-                const float ConnectorR = bSpineConnector
-                    ? FMath::Max(
-                        Params.ConnectorRadius,
-                        RoughnessReach + 1.0f)
-                    : Params.ConnectorRadius;
-                const FLocalConn Conn{
-                    FVector(A.X, A.Y, Zc), FVector(B.X, B.Y, Zc), ConnectorR,
-                    0.0f, false };
-                if (ConnectorMayReachCell(Conn))
-                {
-                    Conns.Add(Conn);
-                }
-            }
-        }
-    }
-
-    float CaveSDF = FLT_MAX;
-
-    // Vertical shafts as infinite cylinders (boundary seal handles the ends).
-    for (const FLocalShaft& Sh : Shafts)
-    {
-        if (Sh.bOriginSpine) continue;  // VF_ApplyOriginSpine owns the structural column.
-        const float DX = WorldX - Sh.X;
-        const float DY = WorldY - Sh.Y;
-        CaveSDF = FMath::Min(CaveSDF, FMath::Sqrt(DX * DX + DY * DY) - Sh.R);
-    }
-    for (const FLocalConn& C : Conns)
-    {
-        CaveSDF = FMath::Min(CaveSDF, VoxelSDF::Capsule(Pos, C.A, C.B, C.Radius));
-    }
-
-    // Wall roughness.
-    if (Params.SurfaceRoughness > 0.0f && CaveSDF < Params.SurfaceRoughness + 4.0f)
-    {
-        CaveSDF += FractalNoise3D(FVector3f(WorldX * 0.1f, WorldY * 0.1f, WorldZ * 0.1f), VoxelGenLOD::Eff(3))
-                 * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
-    }
-
-    // Carve air inside shafts/connectors.
-    const float Blend = 2.0f;
-    if (CaveSDF < Blend)
-    {
-        float Carve = FMath::Clamp((Blend - CaveSDF) / (Blend * 2.0f), 0.0f, 1.0f);
-        Carve = SmoothStep01(Carve);
-        Density -= Carve * Params.BaseDensity * 2.0f;
-    }
-
-    // Partial ledges inside shafts: thin shelves on one side at LedgeSpacing intervals,
-    // leaving the opposite side open so the shaft stays traversable.
-    if (Params.LedgeSpacing > 0.0f && Params.LedgeDepth > 0.0f && CaveSDF < 0.0f && Shafts.Num() > 0)
-    {
-        const float Phase = FMath::Frac((WorldZ - Params.StrateBottomWorldZ) / Params.LedgeSpacing);
-        const float BandT = FMath::Min(Phase, 1.0f - Phase) * Params.LedgeSpacing;  // dist to nearest band
-        if (BandT < Params.LedgeDepth)
-        {
-            // Nearest shaft center → only shelf the +X/+Y half so a climb path remains.
-            const FLocalShaft* Near = nullptr; float BestSq = FLT_MAX;
-            for (const FLocalShaft& Sh : Shafts)
-            {
-                if (Sh.bOriginSpine) continue;  // ledges belong to real shafts, not the post.
-                const float D2 = FMath::Square(WorldX - Sh.X) + FMath::Square(WorldY - Sh.Y);
-                if (D2 < BestSq) { BestSq = D2; Near = &Sh; }
-            }
-            // The shaft axis is the structural tree's terminal point. Keep the mathematical
-            // half-plane boundary open: tiny cancellation error must not turn an exact axis
-            // landing into a solid ledge cap and sever the parent capsule.
-            if (Near && (WorldX - Near->X) + (WorldY - Near->Y) > 1.0e-3f)
-            {
-                float Shelf = 1.0f - SmoothStep01(BandT / Params.LedgeDepth);
-                Density = FMath::Max(Density, Shelf * Params.BaseDensity);
-            }
-        }
-    }
-
-    // The drainage tree is a walkable shaft network, not only a connected air SDF. Reassert its
-    // air core after partial shaft ledges, then emit support bands at the common first ledge level
-    // so every parent edge can be traversed by the player-fit stencil. This remains local to
-    // shaft edges; no landing-to-origin road is added.
-    for (const FLocalConn& C : Conns)
-    {
-        if (C.bWalkableFloor)
-        {
-            VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorAir(
-                Density, WorldX, WorldY, WorldZ,
-                C.A, C.B, C.Radius, C.FloorZ, Params.BaseDensity);
-        }
-    }
-    for (const FLocalConn& C : Conns)
-    {
-        if (C.bWalkableFloor)
-        {
-            VoxelPassageGeometry::VF_ApplyVerticalShaftConnectorFloor(
-                Density, WorldX, WorldY, WorldZ,
-                C.A, C.B, C.Radius, C.FloorZ, Params.BaseDensity);
-        }
-    }
-
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
-
-    if (StrateManager)
-    {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            Params.BaseDensity, Params.BoundarySealThickness);
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
-
-    return -Density;
-}
-
-//=============================================================================
-// FLOATING-ISLAND GENERATOR  (ECaveGeneratorType::FloatingIslands)
-//=============================================================================
-// A large open void with hash-placed island blobs (flattened-top ellipsoids, rough
-// undersides) floating at jittered heights. Top/bottom sealed so the void encloses.
-
-float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, float WorldZ,
-                                                const FFloatingIslandParams& Params) const
-{
-    const float H = Params.StrateTopWorldZ - Params.StrateBottomWorldZ;
-    if (H <= 0.0f) return 1.0f;
-
-    const float Spacing = FMath::Max(Params.IslandSpacing, 1.0f);
-    const uint32 S = (uint32)Seed ^ 0x49736C64u;  // 'Isld'
-    const float BlendK = FMath::Max(Params.SDFBlendRadius, 0.01f);
-
-    float Density = -Params.BaseDensity;  // start as open air (void)
-
-    const int32 CX = FMath::FloorToInt(WorldX / Spacing);
-    const int32 CY = FMath::FloorToInt(WorldY / Spacing);
-
-    const float MidZ = (Params.StrateTopWorldZ + Params.StrateBottomWorldZ) * 0.5f;
-
-    float IslandSDF = FLT_MAX;
-
-    // IRREGULAR OUTLINE: domain-warp the horizontal query so island edges are lobed and
-    // organic instead of perfect circles. Computed once per voxel and shared by all nearby
-    // islands (each samples a different part of the field → distinct silhouettes).
-    const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
-    // ⚠️ AUDIT §C1 — DERNIER SITE DU PLUGIN, trouvé en portant cet archétype (2026-07-28). Le
-    // balayage du 2026-07-27 cherchait le motif `SeedF * K` et celui-ci s'écrit `(float)S * K`, donc
-    // il a survécu : à Seed = 2e9 le terme atteint ~1.4e6, où l'ULP du float vaut 0.125 contre un pas
-    // de 0.04 par voxel — le warp s'aplatit et les îles redeviennent des cercles parfaits. Corrigé
-    // dans les DEUX chemins (ici et FIslandBlobSource) en une passe, pour que le test d'équivalence
-    // reste un oracle valable.
-    // NOTE : `SeedOffset` quantifie la clé de site par ×100, donc 0.0007 → site 0. Unique aujourd'hui
-    // (toutes les autres clés du plugin sont ≥ 0.19) ; la prochaine clé sous 0.005 devra en choisir
-    // une autre plutôt que de collisionner en silence.
-    const float WX = WorldX + FractalNoise3D(FVector3f(WorldX * 0.04f + VoxelHash::SeedOffset(S, 0.0007f), WorldY * 0.04f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
-                              * VOXEL_NOISE_SCALE * WarpAmp;
-    const float WY = WorldY + FractalNoise3D(FVector3f(WorldX * 0.04f + 31.0f, WorldY * 0.04f + 7.0f, WorldZ * 0.012f), VoxelGenLOD::Eff(3))
-                              * VOXEL_NOISE_SCALE * WarpAmp;
-
-    // Per-island constants (existence roll, jitter, radius, Z anchor, taper) are pure functions
-    // of (cell, seed, params) yet were re-hashed PER VOXEL. Bake the 3×3 neighbourhood's islands
-    // once per centre cell (thread_local); the per-voxel work keeps only the warped-frame
-    // distance / taper / top-surface math (those genuinely vary per voxel).
-    struct FLocalIsland { float X, Y, Rxy, TopHalf, TopZ, BotZ, TaperEnd; };
-    thread_local TArray<FLocalIsland, TInlineAllocator<9>> Islands;
-    thread_local int32  FI_CX = INT32_MAX, FI_CY = INT32_MAX;
-    thread_local uint32 FI_Seed = 0xFFFFFFFFu;
-    thread_local float  FI_Spacing = -1.0f, FI_Dens = -1.0f, FI_MinR = -1.0f, FI_MaxR = -1.0f,
-                        FI_Thick = -1.0f, FI_VJit = -1.0f, FI_BotZ = FLT_MAX, FI_TopZ = FLT_MAX,
-                        FI_Seal = -1.0f;
-
-    if (CX != FI_CX || CY != FI_CY || S != FI_Seed || Spacing != FI_Spacing ||
-        Params.IslandDensity != FI_Dens || Params.IslandMinRadius != FI_MinR || Params.IslandMaxRadius != FI_MaxR ||
-        Params.ThicknessRatio != FI_Thick || Params.VerticalJitter != FI_VJit ||
-        Params.StrateBottomWorldZ != FI_BotZ || Params.StrateTopWorldZ != FI_TopZ
-        || Params.BoundarySealThickness != FI_Seal)
-    {
-        FI_CX = CX;  FI_CY = CY;  FI_Seed = S;  FI_Spacing = Spacing;
-        FI_Dens = Params.IslandDensity;  FI_MinR = Params.IslandMinRadius;  FI_MaxR = Params.IslandMaxRadius;
-        FI_Thick = Params.ThicknessRatio;  FI_VJit = Params.VerticalJitter;
-        FI_BotZ = Params.StrateBottomWorldZ;  FI_TopZ = Params.StrateTopWorldZ;
-        FI_Seal = Params.BoundarySealThickness;
-        Islands.Reset();
-
-        for (int32 dy = -1; dy <= 1; dy++)
-        for (int32 dx = -1; dx <= 1; dx++)
-        {
-            const int32 nx = CX + dx, ny = CY + dy;
-            const uint32 Hh = VoxelHash::Cell(nx, ny, S);
-            if (VoxelHash::ToFloat01(Hh) > Params.IslandDensity) continue;
-
-            const float JX = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x12345678u));
-            const float JY = VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x9ABCDEF0u));
-
-            FLocalIsland& Isl = Islands.AddDefaulted_GetRef();
-            Isl.X = (nx + 0.15f + JX * 0.7f) * Spacing;
-            Isl.Y = (ny + 0.15f + JY * 0.7f) * Spacing;
-            Isl.Rxy = FMath::Lerp(Params.IslandMinRadius, Params.IslandMaxRadius,
-                                  VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x5A5Au)));
-
-            // ASYMMETRIC ISLAND PROFILE: a fairly flat land slab on TOP, and an underside that
-            // tapers DOWN to a rough point (the hanging "roots"). ThicknessRatio scales how deep
-            // the underside hangs. This is what reads as a floating island vs. a sphere.
-            Isl.TopHalf = Isl.Rxy * 0.20f;                                          // land slab above centre
-            const float UnderDepth = Isl.Rxy * FMath::Max(Params.ThicknessRatio, 0.25f); // tapering underside
-
-            const float SpreadZ = FMath::Max(H * 0.5f - FMath::Max(Isl.TopHalf, UnderDepth) - Params.BoundarySealThickness, 0.0f)
-                                  * Params.VerticalJitter;
-            const float Cz = MidZ + VoxelHash::ToFloatSigned(VoxelHash::Mix(Hh ^ 0xB17Du)) * SpreadZ;
-            Isl.TopZ = Cz + Isl.TopHalf;
-            Isl.BotZ = Cz - UnderDepth;
-
-            // Per-island taper sharpness (SmoothStep end point) for varied silhouettes.
-            Isl.TaperEnd = FMath::Lerp(0.45f, 0.7f, VoxelHash::ToFloat01(VoxelHash::Mix(Hh ^ 0x7A1Eu)));
-        }
-    }
-
-    for (const FLocalIsland& Isl : Islands)
-    {
-        // Horizontal distance in the WARPED (lobed) frame so the outline isn't a circle.
-        const float Dxw = WX - Isl.X, Dyw = WY - Isl.Y;
-        const float DistXY = FMath::Sqrt(Dxw * Dxw + Dyw * Dyw);
-
-        // Radius envelope by height: full width across the top, narrowing to a point at the
-        // bottom tip (SmoothStep taper).
-        const float Hgt = FMath::Clamp((WorldZ - Isl.BotZ) / FMath::Max(Isl.TopZ - Isl.BotZ, 1.0f), 0.0f, 1.0f);
-        const float Taper = SmoothStep01(FMath::Clamp(Hgt / Isl.TaperEnd, 0.0f, 1.0f));
-        const float Env = Isl.Rxy * Taper;
-
-        // Top surface: flat by default; dome the edges down when TopFlatten < 1.
-        float TopSurf = Isl.TopZ;
-        if (Params.TopFlatten < 1.0f)
-        {
-            const float Edge = FMath::Clamp(DistXY / FMath::Max(Isl.Rxy, 1.0f), 0.0f, 1.0f);
-            TopSurf = Isl.TopZ - (1.0f - Params.TopFlatten) * Isl.TopHalf * 2.0f * Edge * Edge;
-        }
-
-        // Pseudo-SDF: outside if beyond the radial envelope OR above the top surface.
-        const float Sdf = FMath::Max(DistXY - Env, WorldZ - TopSurf);
-
-        IslandSDF = VoxelSDF::SmoothMin(IslandSDF, Sdf, BlendK);
-    }
-
-    // Craggy shells.
-    if (Params.SurfaceRoughness > 0.0f && IslandSDF < Params.SurfaceRoughness + BlendK + 2.0f)
-    {
-        IslandSDF += FractalNoise3D(FVector3f(WorldX * 0.08f, WorldY * 0.08f, WorldZ * 0.08f), VoxelGenLOD::Eff(4))
-                   * VOXEL_NOISE_SCALE * Params.SurfaceRoughness;
-    }
-
-    // Fill solid inside islands.
-    const float Blend = BlendK;
-    if (IslandSDF < Blend)
-    {
-        float Fill = FMath::Clamp((Blend - IslandSDF) / (Blend * 2.0f), 0.0f, 1.0f);
-        Fill = SmoothStep01(Fill);
-        Density += Fill * Params.BaseDensity * 2.0f;
-    }
-
-    ApplyOriginSpine(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    ApplyBoundarySeal(Density, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity);
-
-    if (StrateManager)
-    {
-        StrateManager->ApplyPassageModifier(
-            Density, WorldX, WorldY, WorldZ,
-            Params.BaseDensity, Params.BoundarySealThickness);
-    }
-    ApplyOriginLandingFloor(Density, WorldX, WorldY, WorldZ,
-        Params.StrateTopWorldZ, Params.StrateBottomWorldZ,
-        Params.BoundarySealThickness, Params.BaseDensity, OriginSpineRadius);
-
-    VF_ApplyXYEdgeSeal(Density, WorldX, WorldY,
-        WorldRadiusVoxels, EdgeSealThickness, Params.BaseDensity);
-
-    return -Density;
 }

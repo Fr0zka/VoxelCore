@@ -160,7 +160,6 @@ struct FVoxelTileHashDumpRecord
     int32 Cells = 0;
     int32 BandChunkLo = MIN_int32;
     int32 BandChunkHi = MAX_int32;
-    bool bSheetTile = false;
     bool bEmpty = true;
     int32 NumTriangles = 0;
     FString GeometryHash;
@@ -567,7 +566,7 @@ private:
     void LogReadyTransitionVisibilityMeasure();
     void RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                         int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
-                        bool bSheetTile, const FVoxelMeshData& MeshData);
+                        const FVoxelMeshData& MeshData);
     void WriteTileHashDump();
 
     // Packed shader params, recomputed each Tick. ALL meaningful data is in .xyz — a material Vector
@@ -761,7 +760,7 @@ public:
                   EVoxelTileWorkPriority WorkPriority = EVoxelTileWorkPriority::Horizon);
 
     /**
-     * Worker-side gen for one tile: classify → GenerateMesh/GenerateSheetMesh → BuildTileStreamSet.
+     * Worker-side gen for one tile: classify → GenerateMesh → BuildTileStreamSet.
      * Fills Result (no enqueue, no bookkeeping). Called from the async ChunkGen task AND from the
      * synchronous carve path (SyncRemeshTile) — reads Generator/Mesher only, so it's safe on either
      * thread. See LoadTile for how the parameters are derived.
@@ -769,8 +768,6 @@ public:
     void GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                             int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
                             int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
-                            bool bSheetTile, int32 SheetChunkZ,
-                            int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
                             FChunkResult& Result,
                             const std::atomic<bool>* ObsoleteFlag = nullptr);
 
@@ -933,15 +930,6 @@ public:
     // result cannot publish and the post-carve result is admitted immediately.
     TSet<FVoxelTileKey> DirtyRemeshQueue;
 
-    // F18 — TROU XY de l'anneau feuille (voxels ; Max EXCLUSIF ; sentinelles MAX/MIN = pas de
-    // trou) : la zone couverte par les coquilles MC (boîte niveau-MaxClipLevel autour du joueur,
-    // rétrécie d'une tuile pour garder un anneau de recouvrement au raccord) est DÉCOUPÉE des
-    // feuilles — sinon une feuille partiellement couverte recouvre le terrain proche avec son
-    // échantillonnage grossier. Mis à jour par crossing ; changement ⇒ re-queue des feuilles
-    // chevauchantes via BandRemeshQueue (re-gen en place).
-    int32 SheetHoleMinXVox = MAX_int32, SheetHoleMinYVox = MAX_int32;
-    int32 SheetHoleMaxXVox = MIN_int32, SheetHoleMaxYVox = MIN_int32;
-
     // Set to true during EndPlay — async tasks check this before accessing UObjects
     std::atomic<bool> bShuttingDown{false};
 
@@ -1018,8 +1006,7 @@ public:
     TArray<FReadyTransitionVisibilitySample> ReadyTransitionVisibilitySamples;
     TArray<FFarFieldSubmitSample> FarFieldSubmitSamples;
 
-    // Clean performance accounting. LOD 0..8 covers every marching-cubes clip level; sheet tiles
-    // above the configured MC range never enter the outer classifier.
+    // Clean performance accounting. LOD 0..8 covers every marching-cubes clip level.
     static constexpr int32 TrackedClassifierLODCount = 9;
     std::atomic<uint64> TotalWorkerGenerationCycles{0};
     std::atomic<uint64> TotalWorkerGenerationTasks{0};
@@ -1259,8 +1246,8 @@ public:
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
     // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp
     // périmé sont les "leavers" (retirées + renvoyées). Le cull ne considère que ces leavers + la
-    // TransitionHold — fini le scan O(toutes-les-tuiles-chargées) à chaque crossing (le spike
-    // CullTiles ~1.6 ms/crossing de la trace 2026-07-05).
+    // TransitionHold — pas de scan O(toutes-les-tuiles-chargées) à chaque crossing (un tel scan
+    // coûtait ~1.6 ms/crossing dans CullTiles).
     TMap<FVoxelTileKey, uint32> DesiredStamped;
     uint32 DesiredStamp = 0;
     bool IsDesired(const FVoxelTileKey& T) const

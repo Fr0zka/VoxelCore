@@ -314,7 +314,6 @@ struct FExploreArguments
     bool bRender = true;
     bool bWalk = true;
     bool bExport = true;
-    bool bUseOperatorStack = true;
     bool bWormsEnabledOverride = false;
     bool bWormsEnabled = true;
     bool bWormStrengthOverride = false;
@@ -431,9 +430,6 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         }
         ModesText.TrimQuotesInline();
     }
-    int32 UseOperatorStack = 1;
-    FParse::Value(*Params, TEXT("opstack="), UseOperatorStack);
-    OutArguments.bUseOperatorStack = UseOperatorStack != 0;
     int32 WormsEnabled = 1;
     if (FParse::Value(*Params, TEXT("wormsenabled="), WormsEnabled))
     {
@@ -739,7 +735,7 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         OutError = TEXT("rendermaxdistance must be finite and in (0,2048] voxels.");
         return false;
     }
-    // Render no longer budgets density samples: pixels are rasterised from the one canonical
+    // Render does not budget density samples: pixels are rasterised from the one canonical
     // mesh. Keep the legacy renderstep/maxdistance arguments for compatible invocations and use
     // only maxdistance as the raster depth clip.
     if (OutArguments.ExportSize < CHUNK_SIZE
@@ -1218,9 +1214,6 @@ struct FExploreWorld
                 Definition->GeneratorType = Index == Arguments.Slot
                     ? Arguments.Archetype
                     : ECaveGeneratorType::TunnelNetwork;
-                // Explicitly select the production switch so the same synthetic layout, seed and
-                // mesher invocation can be measured through both density branches.
-                Definition->bUseOperatorStack = Arguments.bUseOperatorStack;
                 if (Arguments.bWormsEnabledOverride)
                 {
                     Definition->bEnableWorms = Arguments.bWormsEnabled;
@@ -1376,7 +1369,7 @@ struct FExploreWorld
         const FStrateGenerationParams& ReportParams = Target.Definition->GenerationParams;
         UE_LOG(LogTemp, Display,
             TEXT("[VoxelForgeExplore][OwnerAssets] strate=%s settings=%s slot=%d "
-                 "seed=%d height_chunks=%d archetype=%s opstack=%d "
+                 "seed=%d height_chunks=%d archetype=%s "
                  "floor_switch_ignored=1 floor_terracing=%d floor_step=%.9g max_ledge=%.9g "
                  "gentle_slope_degrees=%.9g gentle_gradient=%.9g route_cap=%.9g "
                  "wind_wave_cap=%d "
@@ -1385,7 +1378,7 @@ struct FExploreWorld
             bUseAuthoredStrate ? *Arguments.StrateReference : TEXT("synthetic"),
             bUseAuthoredSettings ? *Arguments.SettingsReference : TEXT("synthetic"),
             Arguments.Slot, Settings->Seed, Target.Definition->StrateHeightInChunks,
-            ArchetypeName(TargetArchetype), Target.Definition->bUseOperatorStack ? 1 : 0,
+            ArchetypeName(TargetArchetype),
             ReportParams.bTunnelFloorTerracingEnabled ? 1 : 0,
             ReportParams.TunnelFloorTerraceStepHeight,
             ReportParams.TunnelFloorMaxLedgeHeight,
@@ -3610,57 +3603,6 @@ bool RunWalk(
     OutOutput.bHasArrival = true;
     OutOutput.bHasDeparture = true;
 
-    // Temporary seed-14 probe while diagnosing the fitted VerticalShafts junction. This is
-    // intentionally narrow and will be removed after the floor/tree seam is corrected.
-    if (Arguments.Archetype == ECaveGeneratorType::VerticalShafts && Arguments.Seed == 14)
-    {
-        const FVector ProbeA = OutOutput.ArrivalVoxels;
-        const FVector ProbeB(-100.8f, -26.9f, ProbeA.Z);
-        for (int32 Index = 0; Index <= 10; ++Index)
-        {
-            const float T = static_cast<float>(Index) / 10.0f;
-            const FVector P = FMath::Lerp(ProbeA, ProbeB, T);
-            const float Dm704 = World.Generator->GetDensityAt(P.X, P.Y, -704.0f);
-            const float Dm702 = World.Generator->GetDensityAt(P.X, P.Y, -702.0f);
-            const float Dm7005 = World.Generator->GetDensityAt(P.X, P.Y, -700.5f);
-            const float Dm700 = World.Generator->GetDensityAt(P.X, P.Y, -700.0f);
-            const float Dm6995 = World.Generator->GetDensityAt(P.X, P.Y, -699.5f);
-            const float Dm697 = World.Generator->GetDensityAt(P.X, P.Y, -697.0f);
-            float MinBody = FLT_MAX;
-            int32 NumSolidBody = 0;
-            int32 SolidOffsetX = 0;
-            int32 SolidOffsetY = 0;
-            int32 SolidBodyRow = -1;
-            for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
-            {
-                for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
-                {
-                    for (int32 BodyRow = 0; BodyRow < 8; ++BodyRow)
-                    {
-                        const float BodyDensity = World.Generator->GetDensityAt(
-                            P.X + static_cast<float>(OffsetX),
-                            P.Y + static_cast<float>(OffsetY),
-                            -699.5f + static_cast<float>(BodyRow));
-                        if (BodyDensity < MinBody)
-                        {
-                            MinBody = BodyDensity;
-                            SolidOffsetX = OffsetX;
-                            SolidOffsetY = OffsetY;
-                            SolidBodyRow = BodyRow;
-                        }
-                        NumSolidBody += BodyDensity <= 0.0f ? 1 : 0;
-                    }
-                }
-            }
-            UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeExplore][TemporaryShaftProbe] t=%.2f xy=(%.2f,%.2f) "
-                     "d[-704,-702,-700.5,-700,-699.5,-697]=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] "
-                     "bodyMin=%.3f bodySolid=%d/72 firstMinOffset=(%d,%d) row=%d"),
-                T, P.X, P.Y, Dm704, Dm702, Dm7005, Dm700, Dm6995, Dm697,
-                MinBody, NumSolidBody, SolidOffsetX, SolidOffsetY, SolidBodyRow);
-        }
-    }
-
     FVoxelStrateMeasureSettings Settings;
     Settings.SampleStep = 1;
     Settings.MaxCells = Arguments.MaxWalkCells;
@@ -4243,76 +4185,6 @@ bool WriteObjHeader(FArchive& Archive)
     return bOk && !Archive.IsError();
 }
 
-bool WriteObjTile(
-    FArchive& Archive,
-    const FVoxelMeshData& MeshData,
-    int32 VertexOffset,
-    FString& OutError)
-{
-    if (!ValidateCanonicalTile(MeshData, OutError))
-    {
-        return false;
-    }
-    bool bOk = true;
-    for (const FVector& Vertex : MeshData.Vertices)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("v %.9f %.9f %.9f\n"),
-            Vertex.X / 100.0,
-            Vertex.Y / 100.0,
-            Vertex.Z / 100.0));
-    }
-    for (const FVector2D& UV : MeshData.UVs)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("vt %.9f %.9f\n"), UV.X, UV.Y));
-    }
-    for (const FVector& Normal : MeshData.Normals)
-    {
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("vn %.9f %.9f %.9f\n"), Normal.X, Normal.Y, Normal.Z));
-    }
-
-    const int32 NumTriangles = MeshData.Triangles.Num() / 3;
-    const int32 FirstCeilingTriangle = FMath::Clamp(
-        NumTriangles - MeshData.NumCeilingTriangles, 0, NumTriangles);
-    if (NumTriangles > 0)
-    {
-        bOk = bOk && WriteUtf8(Archive, TEXT("usemtl VoxelGround\n"));
-    }
-    for (int32 Triangle = 0; Triangle < NumTriangles; ++Triangle)
-    {
-        if (Triangle == FirstCeilingTriangle)
-        {
-            bOk = bOk && WriteUtf8(Archive, TEXT("usemtl VoxelCeiling\n"));
-        }
-        const int32 Base = Triangle * 3;
-        const int32 SourceA = MeshData.Triangles[Base];
-        const int32 SourceB = MeshData.Triangles[Base + 1];
-        const int32 SourceC = MeshData.Triangles[Base + 2];
-        if (SourceA < 0 || SourceB < 0 || SourceC < 0
-            || SourceA >= MeshData.Vertices.Num()
-            || SourceB >= MeshData.Vertices.Num()
-            || SourceC >= MeshData.Vertices.Num())
-        {
-            OutError = TEXT("Canonical mesher returned an out-of-range triangle index.");
-            return false;
-        }
-        const int32 A = SourceA + 1 + VertexOffset;
-        const int32 B = SourceB + 1 + VertexOffset;
-        const int32 C = SourceC + 1 + VertexOffset;
-        bOk = bOk && WriteUtf8(Archive, FString::Printf(
-            TEXT("f %d/%d/%d %d/%d/%d %d/%d/%d\n"),
-            A, A, A, B, B, B, C, C, C));
-    }
-    if (!bOk || Archive.IsError())
-    {
-        OutError = TEXT("Could not write a canonical OBJ tile.");
-        return false;
-    }
-    return true;
-}
-
 bool WriteObjMesh(
     FArchive& Archive,
     const FVoxelMeshData& MeshData,
@@ -4574,7 +4446,6 @@ FString BuildManifestJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
     if (Arguments.bWormsEnabledOverride)
     {
@@ -6256,7 +6127,6 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("worms_enabled_override"), Arguments.bWormsEnabledOverride);
     if (Arguments.bWormsEnabledOverride)
     {
@@ -6337,12 +6207,11 @@ FString BuildExploreJson(
     Writer->WriteValue(TEXT("out_directory"), Arguments.OutDirectory);
     Writer->WriteValue(TEXT("canonical_invocation"), FString::Printf(
         TEXT("UnrealEditor-Cmd VoxelM.uproject -run=VoxelForgeExplore -seed=%d -archetype=%s "
-             "-slot=%d -opstack=%d -modes=%s -blockearlyout=%d "
+             "-slot=%d -modes=%s -blockearlyout=%d "
              "-out=<ABSOLUTE_PLUGIN_SAVED_PATH>"),
         Arguments.Seed,
         ArchetypeName(Arguments.Archetype),
         Arguments.Slot,
-        Arguments.bUseOperatorStack ? 1 : 0,
         *Arguments.CanonicalModes(),
         Arguments.bBlockEarlyOut ? 1 : 0));
     Writer->WriteObjectEnd();
@@ -7091,29 +6960,6 @@ FString BuildExploreJson(
     return Writer->Close() ? Json : FString();
 }
 
-const TCHAR* ExploreEffectName(EVoxelOpEffect Effect)
-{
-    switch (Effect)
-    {
-    case EVoxelOpEffect::Identity:  return TEXT("Identity");
-    case EVoxelOpEffect::CarveOnly: return TEXT("CarveOnly");
-    case EVoxelOpEffect::FillOnly:  return TEXT("FillOnly");
-    case EVoxelOpEffect::Both:      return TEXT("Both");
-    default:                        return TEXT("Unknown");
-    }
-}
-
-const TCHAR* ExploreTileClassName(EVoxelTileClass Class)
-{
-    switch (Class)
-    {
-    case EVoxelTileClass::AllSolid: return TEXT("AllSolid");
-    case EVoxelTileClass::AllAir:   return TEXT("AllAir");
-    case EVoxelTileClass::Mixed:    return TEXT("Mixed");
-    default:                        return TEXT("Unknown");
-    }
-}
-
 // Density-bound APIs use FLT_MAX as the documented "unknown/unbounded" sentinel.  It is finite
 // according to IEEE-754, so FMath::IsFinite alone would misreport the very failure this audit is
 // intended to expose as a real numeric envelope.
@@ -7347,7 +7193,6 @@ bool WriteExploreOpBoundsReport(
     Writer->WriteValue(TEXT("seed"), Arguments.Seed);
     Writer->WriteValue(TEXT("archetype"), ArchetypeName(Arguments.Archetype));
     Writer->WriteValue(TEXT("slot"), Arguments.Slot);
-    Writer->WriteValue(TEXT("operator_stack"), Arguments.bUseOperatorStack);
     Writer->WriteValue(TEXT("sample_step"), 1);
     Writer->WriteValue(TEXT("block_cells"), 8);
     Writer->WriteValue(TEXT("classifier_blocks_tested"), BlocksTested);
@@ -7455,10 +7300,9 @@ bool RunOpBounds(
     FExploreBudget& Budget,
     FString& OutError)
 {
-    if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork
-        || !Arguments.bUseOperatorStack)
+    if (Arguments.Archetype != ECaveGeneratorType::TunnelNetwork)
     {
-        OutError = TEXT("opbounds requires archetype=TunnelNetwork and opstack=1.");
+        OutError = TEXT("opbounds requires archetype=TunnelNetwork.");
         return false;
     }
 
@@ -8406,8 +8250,6 @@ bool BuildBatchCaseParams(
 
     FString Modes = TEXT("export");
     JsonString(Case, TEXT("modes"), Modes);
-    bool bOperatorStack = true;
-    JsonBool(Case, TEXT("operator_stack"), bOperatorStack);
     bool bProfileDensity = false;
     JsonBool(Case, TEXT("profile_density"), bProfileDensity);
     bool bProfileDensityFull = false;
@@ -8437,11 +8279,11 @@ bool BuildBatchCaseParams(
         Case, TEXT("tunnel_floor_terracing"), bTunnelFloorTerracing);
 
     OutParams = FString::Printf(
-        TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s -opstack=%d "
+        TEXT("-seed=%d -archetype=%s -slot=%d -modes=%s "
              "-exportsize=%d -exportstep=%d -densitygridreuse=%d "
              "-blockearlyout=%d -meshminbatch=%d "
              "-failurefocus=%d -out=\"%s\""),
-        Seed, *Archetype, Slot, *Modes, bOperatorStack ? 1 : 0,
+        Seed, *Archetype, Slot, *Modes,
         ExportSize, ExportStep, bReuseDensityGrid ? 1 : 0,
         bBlockEarlyOut ? 1 : 0, MeshMinBatchSize,
         bFailureFocus ? 1 : 0, *CaseOutDirectory);

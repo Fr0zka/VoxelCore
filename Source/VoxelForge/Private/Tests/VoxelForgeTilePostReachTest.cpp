@@ -154,72 +154,50 @@ bool FVoxelForgeTilePostReachProofTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    FTestWorld NativeWorld;
-    NativeWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/false);
-    FTestWorld FusedWorld;
-    FusedWorld.Build(/*Seed*/1337, /*GapChunks*/2, /*bUseOperatorStack*/true);
-    if (!NativeWorld.IsValid() || !FusedWorld.IsValid())
+    FTestWorld World;
+    World.Build(/*Seed*/1337, /*GapChunks*/2);
+    if (!World.IsValid())
     {
-        AddError(NativeWorld.IsValid() && FusedWorld.IsValid()
-            ? TEXT("Unexpected invalid reach-proof fixture")
-            : (!NativeWorld.IsValid() ? NativeWorld.WhyInvalid() : FusedWorld.WhyInvalid()));
+        AddError(World.WhyInvalid());
         return false;
     }
 
-    TArray<FIntVector> NativeOrigins;
-    TArray<FIntVector> FusedOrigins;
-    AppendWorldReachTiles(NativeWorld, NativeOrigins);
-    AppendWorldReachTiles(FusedWorld, FusedOrigins);
-    TestTrue(TEXT("the representative native tile set is non-empty"), NativeOrigins.Num() > 0);
-    TestTrue(TEXT("the representative fused tile set is non-empty"), FusedOrigins.Num() > 0);
+    TArray<FIntVector> Origins;
+    AppendWorldReachTiles(World, Origins);
+    TestTrue(TEXT("the representative tile set is non-empty"), Origins.Num() > 0);
 
-    TStrongObjectPtr<UVoxelMarchingCubesMesher> NativeMesher(
+    TStrongObjectPtr<UVoxelMarchingCubesMesher> Mesher(
         NewObject<UVoxelMarchingCubesMesher>(GetTransientPackage(), NAME_None, RF_Transient));
-    TStrongObjectPtr<UVoxelMarchingCubesMesher> FusedMesher(
-        NewObject<UVoxelMarchingCubesMesher>(GetTransientPackage(), NAME_None, RF_Transient));
-    NativeMesher->SetGenerator(NativeWorld.Generator.Get());
-    FusedMesher->SetGenerator(FusedWorld.Generator.Get());
+    Mesher->SetGenerator(World.Generator.Get());
 
     VoxelGenLOD::ResetTilePostReachDiagnostics();
     CVarGuard.SetScale(1.0f);
-    const FReachSnapshot NativeFull = RunReachTiles(*NativeMesher, NativeOrigins);
-    const FReachSnapshot FusedFull = RunReachTiles(*FusedMesher, FusedOrigins);
-    const uint64 FullFinalComparisons = NativeFull.FinalComparisons + FusedFull.FinalComparisons;
-    const uint64 FullFinalDifferences = NativeFull.FinalDifferences + FusedFull.FinalDifferences;
+    const FReachSnapshot Full = RunReachTiles(*Mesher, Origins);
     TestTrue(TEXT("normal reach compares final fields on the representative tiles"),
-             FullFinalComparisons > 0);
-    TestEqual(TEXT("normal reach has no final-field differences"), FullFinalDifferences, 0ull);
-    TestEqual(TEXT("normal reach has no skipped-post differences"),
-              NativeFull.AllDifferences + FusedFull.AllDifferences, 0ull);
+             Full.FinalComparisons > 0);
+    TestEqual(TEXT("normal reach has no final-field differences"), Full.FinalDifferences, 0ull);
+    TestEqual(TEXT("normal reach has no skipped-post differences"), Full.AllDifferences, 0ull);
 
     VoxelGenLOD::ResetTilePostReachDiagnostics();
     // Use a deliberately tiny but valid scale so at least one envelope is rejected while the same
     // final-field samples remain exercised; this is the negative control, not a supported setting.
     CVarGuard.SetScale(0.01f);
-    const FReachSnapshot NativeShrunk = RunReachTiles(*NativeMesher, NativeOrigins);
-    const FReachSnapshot FusedShrunk = RunReachTiles(*FusedMesher, FusedOrigins);
-    const uint64 ShrunkFinalComparisons =
-        NativeShrunk.FinalComparisons + FusedShrunk.FinalComparisons;
-    const uint64 ShrunkFinalDifferences =
-        NativeShrunk.FinalDifferences + FusedShrunk.FinalDifferences;
+    const FReachSnapshot Shrunk = RunReachTiles(*Mesher, Origins);
     TestTrue(TEXT("shrunk reach still executes final-field comparisons"),
-             ShrunkFinalComparisons > 0);
+             Shrunk.FinalComparisons > 0);
     TestTrue(TEXT("shrunk reach demonstrably fails the final-field proof"),
-             ShrunkFinalDifferences > 0);
+             Shrunk.FinalDifferences > 0);
 
     AddInfo(FString::Printf(
-        TEXT("tile_post_reach_proof: native_tiles=%llu fused_tiles=%llu full_final=%llu/%llu "
-             "shrunk_final=%llu/%llu native_samples=%lld/%lld fused_samples=%lld/%lld."),
-        static_cast<unsigned long long>(NativeFull.Tiles),
-        static_cast<unsigned long long>(FusedFull.Tiles),
-        static_cast<unsigned long long>(FullFinalComparisons),
-        static_cast<unsigned long long>(FullFinalDifferences),
-        static_cast<unsigned long long>(ShrunkFinalComparisons),
-        static_cast<unsigned long long>(ShrunkFinalDifferences),
-        static_cast<long long>(NativeFull.DensitySamples),
-        static_cast<long long>(NativeShrunk.DensitySamples),
-        static_cast<long long>(FusedFull.DensitySamples),
-        static_cast<long long>(FusedShrunk.DensitySamples)));
+        TEXT("tile_post_reach_proof: tiles=%llu full_final=%llu/%llu shrunk_final=%llu/%llu "
+             "samples=%lld/%lld."),
+        static_cast<unsigned long long>(Full.Tiles),
+        static_cast<unsigned long long>(Full.FinalComparisons),
+        static_cast<unsigned long long>(Full.FinalDifferences),
+        static_cast<unsigned long long>(Shrunk.FinalComparisons),
+        static_cast<unsigned long long>(Shrunk.FinalDifferences),
+        static_cast<long long>(Full.DensitySamples),
+        static_cast<long long>(Shrunk.DensitySamples)));
     return true;
 }
 

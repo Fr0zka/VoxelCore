@@ -761,14 +761,13 @@ namespace
             const float SimulatedCarvedFinalDensity = -SimulatedCarvedInternalDensity;
             UE_LOG(LogTemp, Display,
                 TEXT("[VoxelForgeDescentWriterContext] seed=0 sample=(%.3f,%.3f,%.3f) "
-                     "chunk=(%d,%d,%d) archetype=%s asset_stack_flag=%d effective_op_stack=%d "
+                     "chunk=(%d,%d,%d) archetype=%s effective_op_stack=%d "
                      "passage_sdf=%.6f simulated_passage_carve_density=%.6f "
                      "terrain_ops='%s' terrain_op_paths='%s' "
                      "base=%.3f tunnel_columns=(%.3f,%.3f,%.3f) slab_columns=(%.3f,%.3f,%.3f)"),
                 OutSamples.FirstSolidPosition.X, OutSamples.FirstSolidPosition.Y,
                 OutSamples.FirstSolidPosition.Z, ChunkCoord.X, ChunkCoord.Y, ChunkCoord.Z,
-                *GeneratorName, Definition != nullptr && Definition->bUseOperatorStack ? 1 : 0,
-                bUsesOperatorStack ? 1 : 0, PassageSDF, SimulatedCarvedFinalDensity,
+                *GeneratorName, bUsesOperatorStack ? 1 : 0, PassageSDF, SimulatedCarvedFinalDensity,
                 *TerrainOps, *TerrainOpPaths, Params.BaseDensity, Params.ColumnDensity,
                 Params.ColumnMinRadius, Params.ColumnMaxRadius,
                 Definition != nullptr ? Definition->SlabParams.ColumnDensity : -1.0f,

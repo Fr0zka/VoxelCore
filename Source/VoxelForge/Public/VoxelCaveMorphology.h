@@ -243,7 +243,7 @@ namespace VoxelHash
      * collident donneraient un bruit identique PARTOUT. Salé par site, il faudrait qu'ils
      * collident sur les ~50 sites à la fois — c'est-à-dire jamais.
      *
-     * The multiplier no longer decorrelates by amplifying — it IDENTIFIES the site, and the hash
+     * The multiplier does not decorrelate by amplifying — it IDENTIFIES the site, and the hash
      * decorrelates. Output is already in final units and bounded, so the ULP is 10% of a voxel step.
      *
      * @param SiteKey  la constante littérale d'origine (`7.3f`, `97.7f`, …). Gardée VISIBLE au site
@@ -439,10 +439,10 @@ namespace VoxelMazeTopology
 // le motif qui a produit `AUDIT §C1` (un correctif appliqué à une copie sur deux). Il monte donc au
 // point le plus bas qui voit déjà le hash, et le générateur comme la pile d'opérateurs l'appellent.
 //
-// Ce corps était `static float CellularNoise3D(const FVector&)` dans VoxelGenerator.cpp, invisible
-// à la pile d'opérateurs. Il vit ici pour que les deux chemins partagent la même implémentation.
+// Il vit ici pour que le générateur et la pile d'opérateurs partagent la même implémentation.
 // The hot overload uses FVector3f: noise coordinates are floats, so no double round-trip is paid
-// before the hash/lattice arithmetic. Output compatibility with the old field is not a contract.
+// before the hash/lattice arithmetic. Output compatibility with a double-precision evaluation is
+// not a contract.
 //
 // Algorithme : distance au point-feature le plus proche dans une grille hachée.
 //   1. cellule entière du point   2. voisinage 3×3×3   3. rendre (F2 − F1), normalisé ~[-1, 1]
@@ -520,7 +520,7 @@ namespace VoxelNoise
 // PER-CHUNK SDF CACHE
 //=============================================================================
 // The room list and tunnel connections are IDENTICAL for all voxels in a chunk.
-// Without caching, EvaluateSDF rebuilds these 32,768 times per 32³ chunk:
+// Without caching, a per-voxel evaluation would rebuild these 32,768 times per 32³ chunk:
 //   - Hash every grid cell in the search area
 //   - Determine room existence, position, size
 //   - Run O(N²) nearest-neighbor backbone
@@ -604,9 +604,9 @@ struct FCachedRoom
     float RoomOpWeight = 1.0f;
 
     // PRE-BAKED SHAPE (BuildChunkCache). The shape roll, variety thresholds and the capsule's
-    // Cos/Sin direction used to be re-derived PER VOXEL per room inside EvaluateSDFCached — hash
-    // mixes + trig in the hottest loop of the plugin for values that are constants of the room.
-    // Bit-identical to the old per-voxel roll (same hashes, same math, done once per chunk).
+    // Cos/Sin direction are constants of the room: re-deriving them PER VOXEL inside
+    // EvaluateSDFCached would put hash mixes + trig in the hottest loop of the plugin.
+    // Bit-identical to a per-voxel roll (same hashes, same math, done once per chunk).
     //   0 = ellipsoid    → ShapeA = radii (x=y=RadiusXY, z=RadiusZ)
     //   1 = rounded box  → ShapeA = half-extents, ShapeR = corner rounding
     //   2 = capsule      → ShapeA/ShapeB = world endpoints, ShapeR = tube radius
@@ -637,9 +637,8 @@ struct FCachedRoomFloorJoin
 
 // One immutable floor segment authored while the tunnel chain is built. The floor is continuous
 // unless bLedgeTransition is set; that marker means the segment terminates at a deliberate
-// dramatic ledge and the vertical riser is placed at the next control-point boundary. NumSteps is
-// retained as a compatibility/diagnostic field and is always zero for newly authored tunnels: a
-// steep floor is never quantised into a staircase. ReliefScale is baked with a derivative bound,
+// dramatic ledge and the vertical riser is placed at the next control-point boundary. A steep
+// floor is never quantised into a staircase. ReliefScale is baked with a derivative bound,
 // so evaluation only reads this profile and never decides a floor shape per voxel.
 struct FTunnelFloorSegmentProfile
 {
@@ -652,9 +651,6 @@ struct FTunnelFloorSegmentProfile
     float NaturalEndFloorZ = 0.0f;
     float ReliefScale = 0.0f;
     bool bLedgeTransition = false;
-    // Deprecated staircase count. New profiles leave this at zero; keep the member so old
-    // diagnostic consumers can still compile while the authored representation has one meaning.
-    int32 NumSteps = 0;
 };
 
 // A pre-computed wandering tunnel chain — all connection decisions and hash-derived properties
@@ -933,13 +929,10 @@ struct FChunkSDFCache
     VoxelDensityProfile::FCacheMemoryBreakdown GetAllocatedSizeBreakdown() const;
 };
 
-/** World-space tunnel shape query. Legacy support-floor fields remain source-compatible but are
- * no longer produced or consumed by the graph-tunnel generation path. */
+/** World-space tunnel shape query. */
 struct FTunnelCoreWorldEvaluation
 {
     float SDF = FLT_MAX;
-    // Deprecated compatibility output. The separate graph-tunnel support slab was removed.
-    bool bSupportFloor = false;
     // Room geometry owns the lower side while the world-space tunnel is inside a room. The
     // tunnel SDF may still reopen air there, but its swept bottom must not turn that room air back
     // into a shelf or wall.
@@ -955,7 +948,6 @@ struct FTunnelCoreWorldEvaluation
 // CAVE MORPHOLOGY EVALUATOR
 //=============================================================================
 // Two-phase evaluation: BuildChunkCache (once per chunk) + EvaluateSDFCached (per voxel).
-// The original EvaluateSDF is kept as a convenience wrapper for backward compatibility.
 
 namespace VoxelCaveMorphology
 {
@@ -1065,15 +1057,6 @@ namespace VoxelCaveMorphology
         bool* OutRoomOwnsBottom = nullptr
     );
 
-    // Evaluate the raw union of cached graph-tunnel capsules. This is intentionally separate from
-    // the SmoothMin morphology: the generator uses it after terrain/passage posts to reassert the
-    // tunnel's walkable air core without reintroducing a connector or changing room ownership.
-    VOXELFORGE_API float EvaluateTunnelCoreSDF(
-        float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache,
-        bool bUseSpatialIndex = true
-    );
-
     // Evaluate the final structural air contract against the world-space wandering chain. Room
     // SDFs remain evaluated in warped coordinates; only this post uses world coordinates so its
     // walkable floor follows the authored chain exactly.
@@ -1106,46 +1089,6 @@ namespace VoxelCaveMorphology
         float ReachScale = 1.0f
     );
 
-    // Deprecated compatibility query for the removed graph-tunnel support slab. Production
-    // generation does not call this predicate; the tunnel's own swept shape owns its floor.
-    VOXELFORGE_API bool IsTunnelSupportFloorWorldPoint(
-        float WorldX, float WorldY, float WorldZ,
-        const FChunkSDFCache& Cache,
-        bool bUseSpatialIndex = true
-    );
-
-    // Deprecated compatibility helper for callers that still inspect the old support-band
-    // diagnostic. It is detached from production density generation.
-    VOXELFORGE_API void BuildTunnelSupportFloorColumn(
-        float WorldX, float WorldY,
-        const FChunkSDFCache& Cache,
-        FTunnelSupportFloorColumn& OutColumn,
-        bool bUseSpatialIndex = true
-    );
-
-    VOXELFORGE_API bool IsTunnelSupportFloorColumnZ(
-        float WorldZ,
-        const FTunnelSupportFloorColumn& Column
-    );
-
-    // Returns the legacy projected band for one tunnel at this XY column. The world evaluator no
-    // longer uses it to write a support slab.
-    VOXELFORGE_API bool GetTunnelSupportFloorColumnBand(
-        int32 TunnelIndex,
-        const FTunnelSupportFloorColumn& Column,
-        float& OutFloorZ,
-        float& OutMinZ,
-        float& OutMaxZ
-    );
-
-    // CONVENIENCE WRAPPER: builds a temporary cache and evaluates in one call.
-    // Use this for one-off queries (debug visualization, single-point sampling).
-    // For chunk generation, use BuildChunkCache + EvaluateSDFCached instead.
-    float EvaluateSDF(
-        float WorldX, float WorldY, float WorldZ,
-        const FStrateGenerationParams& Params,
-        uint32 Seed, int32 StrateIndex
-    );
 }
 
 /**

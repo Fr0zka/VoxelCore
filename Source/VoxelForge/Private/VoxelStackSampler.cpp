@@ -863,12 +863,6 @@ void FVoxelStackSampler::Shutdown()
     StopAndWrite();
 }
 
-bool FVoxelStackSampler::IsRunning() const
-{
-    FScopeLock LifecycleLock(&LifecycleMutex);
-    return Impl != nullptr;
-}
-
 bool FVoxelStackSampler::RegisterCurrentThread(int32 LODLevel)
 {
     // Keep this as the first and only operation in the disabled fast path.  In particular, do not

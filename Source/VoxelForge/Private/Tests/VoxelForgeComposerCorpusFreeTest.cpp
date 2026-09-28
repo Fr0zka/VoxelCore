@@ -356,7 +356,7 @@ bool FVoxelForgeComposerCorpusFreeTest::RunTest(const FString& Parameters)
               Corpus.GetEntries().Num(), 12);
 
     FTestWorld World;
-    World.Build(1337, 2, true);
+    World.Build(1337, 2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

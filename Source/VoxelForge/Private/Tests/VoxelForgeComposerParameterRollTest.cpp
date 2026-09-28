@@ -955,7 +955,7 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
     }
 
     FTestWorld World;
-    World.Build(1337, 2, true);
+    World.Build(1337, 2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -1117,7 +1117,6 @@ bool FVoxelForgeComposerParameterRollTest::RunTest(const FString& Parameters)
         CandidateDefinition->SurfaceParams = Roll.ArchetypeParams.SurfaceParams;
         CandidateDefinition->VerticalShaftParams = Roll.ArchetypeParams.VerticalShaftParams;
         CandidateDefinition->FloatingIslandParams = Roll.ArchetypeParams.FloatingIslandParams;
-        CandidateDefinition->bUseOperatorStack = true;
         CandidateDefinition->TransitionType = EVoxelStrateTransition::Hard;
         World.Reinitialize();
 
@@ -1342,123 +1341,109 @@ bool FVoxelForgeTerrainDetailLivenessTest::RunTest(const FString& Parameters)
     constexpr int32 ExpectedLatticeSamples = 16 * 16 * 16;
     FString Table = TEXT(
         "TERRAIN DETAIL LIVENESS (same 4096-point lattice; only one group changed per row)\n"
-        "path | group | samples | baseline digest | variant digest | baseline mean | variant mean | "
+        "group | samples | baseline digest | variant digest | baseline mean | variant mean | "
         "changed | sign changes | sum abs delta | max abs delta | verdict\n");
     int32 TotalRows = 0;
     int32 FailedRows = 0;
 
-    for (const bool bUseOperatorStack : { false, true })
+    FTestWorld World;
+    World.Build(1337, 2);
+    if (!World.IsValid())
     {
-        FTestWorld World;
-        World.Build(1337, 2, bUseOperatorStack);
-        if (!World.IsValid())
+        AddError(World.WhyInvalid());
+        return false;
+    }
+
+    UVoxelStrateDefinition* Definition =
+        World.Definitions[FTestWorld::SlotTunnelNetwork].Get();
+    if (Definition == nullptr)
+    {
+        AddError(TEXT("The fixture has no TunnelNetwork definition for the liveness experiment."));
+        return false;
+    }
+    Definition->TerrainOperations.Reset();
+    TestEqual(TEXT("fixture has no terrain-op asset pool"), Definition->TerrainOperations.Num(), 0);
+
+    TArray<FVector> Points;
+    VF_BuildTerrainDetailLattice(World, Points);
+    TestEqual(TEXT("experiment uses the fixed lattice"), Points.Num(), ExpectedLatticeSamples);
+
+    FStrateGenerationParams BaselineParams = Definition->GenerationParams;
+    VF_ClearTerrainDetailFields(BaselineParams);
+    TArray<float> FirstBaseline;
+    bool bHaveFirstBaseline = false;
+
+    for (const FTerrainDetailProbeSpec& Spec : GTerrainDetailProbeSpecs)
+    {
+        Definition->GenerationParams = BaselineParams;
+        World.Reinitialize();
+
+        TArray<float> BaselineSamples;
+        const FTerrainDetailDensitySummary BaselineSummary =
+            VF_SampleTerrainDetailLattice(World, Points, BaselineSamples);
+        if (!bHaveFirstBaseline)
         {
-            AddError(World.WhyInvalid());
-            return false;
+            FirstBaseline = BaselineSamples;
+            bHaveFirstBaseline = true;
         }
-
-        UVoxelStrateDefinition* Definition =
-            World.Definitions[FTestWorld::SlotTunnelNetwork].Get();
-        if (Definition == nullptr)
+        else
         {
-            AddError(TEXT("The fixture has no TunnelNetwork definition for the liveness experiment."));
-            return false;
-        }
-        Definition->TerrainOperations.Reset();
-        TestEqual(
-            FString::Printf(TEXT("%s fixture has no terrain-op asset pool"),
-                            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")),
-            Definition->TerrainOperations.Num(), 0);
-
-        TArray<FVector> Points;
-        VF_BuildTerrainDetailLattice(World, Points);
-        TestEqual(
-            FString::Printf(TEXT("%s experiment uses the fixed lattice"),
-                            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")),
-            Points.Num(), ExpectedLatticeSamples);
-
-        FStrateGenerationParams BaselineParams = Definition->GenerationParams;
-        VF_ClearTerrainDetailFields(BaselineParams);
-        TArray<float> FirstBaseline;
-        bool bHaveFirstBaseline = false;
-
-        for (const FTerrainDetailProbeSpec& Spec : GTerrainDetailProbeSpecs)
-        {
-            Definition->GenerationParams = BaselineParams;
-            World.Reinitialize();
-
-            TArray<float> BaselineSamples;
-            const FTerrainDetailDensitySummary BaselineSummary =
-                VF_SampleTerrainDetailLattice(World, Points, BaselineSamples);
-            if (!bHaveFirstBaseline)
+            bool bSameBaseline = FirstBaseline.Num() == BaselineSamples.Num();
+            for (int32 SampleIndex = 0; bSameBaseline && SampleIndex < FirstBaseline.Num(); ++SampleIndex)
             {
-                FirstBaseline = BaselineSamples;
-                bHaveFirstBaseline = true;
-            }
-            else
-            {
-                bool bSameBaseline = FirstBaseline.Num() == BaselineSamples.Num();
-                for (int32 SampleIndex = 0; bSameBaseline && SampleIndex < FirstBaseline.Num(); ++SampleIndex)
-                {
-                    bSameBaseline = BitEqual(FirstBaseline[SampleIndex], BaselineSamples[SampleIndex]);
-                }
-                TestTrue(
-                    FString::Printf(TEXT("%s baseline is stable before %s probe"),
-                                    bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
-                                    Spec.Name),
-                    bSameBaseline);
-            }
-
-            FStrateGenerationParams VariantParams = BaselineParams;
-            VF_SetTerrainDetailProbe(VariantParams, Spec.Group);
-            Definition->GenerationParams = VariantParams;
-            World.Reinitialize();
-
-            TArray<float> VariantSamples;
-            const FTerrainDetailDensitySummary VariantSummary =
-                VF_SampleTerrainDetailLattice(World, Points, VariantSamples);
-            const FTerrainDetailDensityDelta Delta =
-                VF_CompareTerrainDetailSamples(BaselineSamples, VariantSamples);
-
-            const bool bObservedLive = Delta.Changed > 0;
-            const bool bVerdictMatches = bObservedLive == Spec.bExpectedLive;
-            ++TotalRows;
-            if (!bVerdictMatches)
-            {
-                ++FailedRows;
+                bSameBaseline = BitEqual(FirstBaseline[SampleIndex], BaselineSamples[SampleIndex]);
             }
             TestTrue(
-                FString::Printf(TEXT("%s %s field group has the measured liveness verdict"),
-                                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
-                                Spec.Name),
-                bVerdictMatches);
-
-            Table += FString::Printf(
-                TEXT("%s | %s | %d | 0x%08x | 0x%08x | %.9g | %.9g | %d | %d | %.9g | %.9g | %s\n"),
-                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
-                Spec.Name,
-                Points.Num(),
-                BaselineSummary.Digest,
-                VariantSummary.Digest,
-                BaselineSummary.Mean,
-                VariantSummary.Mean,
-                Delta.Changed,
-                Delta.SignChanged,
-                Delta.SumAbs,
-                Delta.MaxAbs,
-                bObservedLive ? TEXT("LIVE") : TEXT("DEAD"));
+                FString::Printf(TEXT("baseline is stable before %s probe"), Spec.Name),
+                bSameBaseline);
         }
+
+        FStrateGenerationParams VariantParams = BaselineParams;
+        VF_SetTerrainDetailProbe(VariantParams, Spec.Group);
+        Definition->GenerationParams = VariantParams;
+        World.Reinitialize();
+
+        TArray<float> VariantSamples;
+        const FTerrainDetailDensitySummary VariantSummary =
+            VF_SampleTerrainDetailLattice(World, Points, VariantSamples);
+        const FTerrainDetailDensityDelta Delta =
+            VF_CompareTerrainDetailSamples(BaselineSamples, VariantSamples);
+
+        const bool bObservedLive = Delta.Changed > 0;
+        const bool bVerdictMatches = bObservedLive == Spec.bExpectedLive;
+        ++TotalRows;
+        if (!bVerdictMatches)
+        {
+            ++FailedRows;
+        }
+        TestTrue(
+            FString::Printf(TEXT("%s field group has the measured liveness verdict"), Spec.Name),
+            bVerdictMatches);
+
+        Table += FString::Printf(
+            TEXT("%s | %d | 0x%08x | 0x%08x | %.9g | %.9g | %d | %d | %.9g | %.9g | %s\n"),
+            Spec.Name,
+            Points.Num(),
+            BaselineSummary.Digest,
+            VariantSummary.Digest,
+            BaselineSummary.Mean,
+            VariantSummary.Mean,
+            Delta.Changed,
+            Delta.SignChanged,
+            Delta.SumAbs,
+            Delta.MaxAbs,
+            bObservedLive ? TEXT("LIVE") : TEXT("DEAD"));
     }
 
     AddInfo(Table);
     AddInfo(FString::Printf(
-        TEXT("Terrain detail liveness: %d group/path rows measured, %d mismatches; LIVE groups "
+        TEXT("Terrain detail liveness: %d group rows measured, %d mismatches; LIVE groups "
              "must have at least one bit-changed density and DEAD groups must have none. No "
              "terrain-operation assets were present in the fixture pool."),
         TotalRows, FailedRows));
     TestEqual(TEXT("all terrain detail liveness rows matched their measured verdict"), FailedRows, 0);
-    TestEqual(TEXT("both density paths measured every terrain detail group"), TotalRows,
-              static_cast<int32>(2 * UE_ARRAY_COUNT(GTerrainDetailProbeSpecs)));
+    TestEqual(TEXT("every terrain detail group was measured"), TotalRows,
+              static_cast<int32>(UE_ARRAY_COUNT(GTerrainDetailProbeSpecs)));
     return FailedRows == 0;
 }
 

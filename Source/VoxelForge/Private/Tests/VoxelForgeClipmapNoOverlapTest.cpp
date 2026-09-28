@@ -122,22 +122,15 @@ namespace
         const int32 MaxLevel = FMath::Clamp(Parameters.MaxClipLevel, 0, 8);
         const int32 OuterRadius = VoxelClipmapDesiredTiles::OuterShellRadius(
             Parameters, Radius, MaxLevel);
-        int32 SheetLevel = MaxLevel;
-        int32 SheetRadius = OuterRadius;
-        VoxelClipmapDesiredTiles::OuterShell(
-            Parameters, Radius, MaxLevel, SheetLevel, SheetRadius);
-        const bool bSheetRing = SheetLevel > MaxLevel;
-        const int32 MaxMCRingLevel = bSheetRing ? SheetLevel - 1 : MaxLevel;
 
-        for (int32 Level = 0; Level <= MaxMCRingLevel; ++Level)
+        for (int32 Level = 0; Level <= MaxLevel; ++Level)
         {
             const int32 Pow = 1 << Level;
             const FIntVector CenterLevel = VoxelClipmapDesiredTiles::FloorDiv(Center, Pow);
             const FIntVector CenterFiner = Level > 0
                 ? VoxelClipmapDesiredTiles::FloorDiv(Center, Pow >> 1)
                 : FIntVector::ZeroValue;
-            const int32 LevelRadius = (Level == MaxLevel && !bSheetRing)
-                ? OuterRadius : Radius;
+            const int32 LevelRadius = (Level == MaxLevel) ? OuterRadius : Radius;
 
             int32 DeltaZMin = -LevelRadius;
             int32 DeltaZMax = LevelRadius;
@@ -178,50 +171,6 @@ namespace
                 OutTiles.Emplace(Tile, Level);
             }
         }
-
-        if (bSheetRing)
-        {
-            const int32 SheetPow = 1 << SheetLevel;
-            const FIntVector CenterSheet = VoxelClipmapDesiredTiles::FloorDiv(Center, SheetPow);
-            const FIntVector CenterMC = VoxelClipmapDesiredTiles::FloorDiv(
-                Center, 1 << MaxMCRingLevel);
-            const int32 LevelDelta = SheetLevel - MaxMCRingLevel;
-
-            int32 DeltaZMin = -SheetRadius;
-            int32 DeltaZMax = SheetRadius;
-            if (MinChunkZ != MIN_int32)
-            {
-                DeltaZMin = FMath::Max(DeltaZMin,
-                    VoxelClipmapDesiredTiles::FloorDiv(MinChunkZ, SheetPow) - CenterSheet.Z);
-                DeltaZMax = FMath::Min(DeltaZMax,
-                    VoxelClipmapDesiredTiles::FloorDiv(MaxChunkZ, SheetPow) - CenterSheet.Z);
-            }
-
-            for (int32 DeltaZ = DeltaZMin; DeltaZ <= DeltaZMax; ++DeltaZ)
-            for (int32 DeltaY = -SheetRadius; DeltaY <= SheetRadius; ++DeltaY)
-            for (int32 DeltaX = -SheetRadius; DeltaX <= SheetRadius; ++DeltaX)
-            {
-                const FIntVector Tile = CenterSheet + FIntVector(DeltaX, DeltaY, DeltaZ);
-                const int32 TileMinZ = Tile.Z << SheetLevel;
-                const int32 TileMaxZ = ((Tile.Z + 1) << SheetLevel) - 1;
-                if (TileMaxZ < MinChunkZ || TileMinZ > MaxChunkZ)
-                {
-                    continue;
-                }
-
-                const bool bCovered =
-                    ((Tile.X << LevelDelta) >= CenterMC.X - Radius)
-                    && ((((Tile.X + 1) << LevelDelta) - 1) <= CenterMC.X + Radius)
-                    && ((Tile.Y << LevelDelta) >= CenterMC.Y - Radius)
-                    && ((((Tile.Y + 1) << LevelDelta) - 1) <= CenterMC.Y + Radius)
-                    && ((Tile.Z << LevelDelta) >= CenterMC.Z - Radius)
-                    && ((((Tile.Z + 1) << LevelDelta) - 1) <= CenterMC.Z + Radius);
-                if (!bCovered)
-                {
-                    OutTiles.Emplace(Tile, SheetLevel);
-                }
-            }
-        }
     }
 
     static FString DescribeMeasure(const FOverlapMeasure& Measure)
@@ -245,7 +194,6 @@ bool FVoxelForgeClipmapNoOverlapTest::RunTest(const FString& Parameters)
     Owner.ClipRadius = 3;
     Owner.MaxClipLevel = 5;
     Owner.RenderDistanceChunks = 768;
-    Owner.bFarSheetRing = false;
 
     FParameters Defaults;
 
@@ -291,16 +239,13 @@ bool FVoxelForgeClipmapNoOverlapTest::RunTest(const FString& Parameters)
         int32 Radius;
         int32 MaxLevel;
         int32 RenderDistance;
-        bool bSheet;
-        int32 SheetSpan;
     };
     static const FSweepSettings SweepSettings[] = {
-        {1, 0, 0, false, 2},
-        {2, 2, 0, false, 2},
-        {3, 4, 0, false, 2},
-        {2, 3, 49, false, 2},
-        {2, 3, 49, true, 2},
-        {2, 4, 87, true, 3},
+        {1, 0, 0},
+        {2, 2, 0},
+        {3, 4, 0},
+        {2, 3, 49},
+        {2, 4, 87},
     };
 
     int32 SweptCases = 0;
@@ -319,8 +264,6 @@ bool FVoxelForgeClipmapNoOverlapTest::RunTest(const FString& Parameters)
         P.ClipRadius = Sweep.Radius;
         P.MaxClipLevel = Sweep.MaxLevel;
         P.RenderDistanceChunks = Sweep.RenderDistance;
-        P.bFarSheetRing = Sweep.bSheet;
-        P.FarSheetSpanLevels = Sweep.SheetSpan;
 
         // Exercise the unbounded view, a tight local clamp, and a clamp crossing a tile boundary.
         for (int32 ClampCase = 0; ClampCase < 3; ++ClampCase)
@@ -353,9 +296,9 @@ bool FVoxelForgeClipmapNoOverlapTest::RunTest(const FString& Parameters)
                 if (FirstFailure.IsEmpty())
                 {
                     FirstFailure = FString::Printf(
-                        TEXT("overlap center=(%d,%d,%d) radius=%d level=%d distance=%d sheet=%d clamp=%d: %s"),
+                        TEXT("overlap center=(%d,%d,%d) radius=%d level=%d distance=%d clamp=%d: %s"),
                         X, Y, Z, Sweep.Radius, Sweep.MaxLevel, Sweep.RenderDistance,
-                        Sweep.bSheet ? 1 : 0, ClampCase, *DescribeMeasure(CurrentOverlap));
+                        ClampCase, *DescribeMeasure(CurrentOverlap));
                 }
             }
             if (!CoversEveryLegacyTile(Legacy, Current, MinZ, MaxZ))
@@ -364,9 +307,9 @@ bool FVoxelForgeClipmapNoOverlapTest::RunTest(const FString& Parameters)
                 if (FirstFailure.IsEmpty())
                 {
                     FirstFailure = FString::Printf(
-                        TEXT("coverage center=(%d,%d,%d) radius=%d level=%d distance=%d sheet=%d clamp=%d"),
+                        TEXT("coverage center=(%d,%d,%d) radius=%d level=%d distance=%d clamp=%d"),
                         X, Y, Z, Sweep.Radius, Sweep.MaxLevel, Sweep.RenderDistance,
-                        Sweep.bSheet ? 1 : 0, ClampCase);
+                        ClampCase);
                 }
             }
         }

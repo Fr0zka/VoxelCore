@@ -100,65 +100,45 @@ bool FVoxelForgeMazeSeamTest::RunTest(const FString& Parameters)
 {
     using namespace VoxelForgeTest;
 
-    FTestWorld LegacyWorld;
-    LegacyWorld.Build(7331, 2, false, 4);
-    FTestWorld StackWorld;
-    StackWorld.Build(7331, 2, true, 4);
-    if (!LegacyWorld.IsValid() || !StackWorld.IsValid())
+    FTestWorld World;
+    World.Build(7331, 2, 4);
+    if (!World.IsValid())
     {
-        AddError(LegacyWorld.IsValid() ? StackWorld.WhyInvalid() : LegacyWorld.WhyInvalid());
+        AddError(World.WhyInvalid());
         return false;
     }
 
-    int32 LegacyTop = 0, LegacyBottom = 0;
-    int32 StackTop = 0, StackBottom = 0;
-    if (!LegacyWorld.GetSlotVoxelZRange(FTestWorld::SlotMaze, LegacyTop, LegacyBottom)
-        || !StackWorld.GetSlotVoxelZRange(FTestWorld::SlotMaze, StackTop, StackBottom))
+    int32 MazeTopZ = 0, MazeBottomZ = 0;
+    if (!World.GetSlotVoxelZRange(FTestWorld::SlotMaze, MazeTopZ, MazeBottomZ))
     {
         AddError(TEXT("The seam fixture has no Maze slot."));
         return false;
     }
-    const int32 LegacyMidChunkZ = ((LegacyTop + LegacyBottom) / 2) / CHUNK_SIZE;
-    const int32 StackMidChunkZ = ((StackTop + StackBottom) / 2) / CHUNK_SIZE;
-    const FMazeGenerationParams LegacyParams = LegacyWorld.StrateManager->GetMazeParamsForChunk(
-        FIntVector(0, 0, LegacyMidChunkZ));
-    const FMazeGenerationParams StackParams = StackWorld.StrateManager->GetMazeParamsForChunk(
-        FIntVector(0, 0, StackMidChunkZ));
+    const int32 MazeMidChunkZ = ((MazeTopZ + MazeBottomZ) / 2) / CHUNK_SIZE;
+    const FMazeGenerationParams MazeParams = World.StrateManager->GetMazeParamsForChunk(
+        FIntVector(0, 0, MazeMidChunkZ));
 
-    TArray<FVector> LegacyProbes;
-    TArray<FVector> StackProbes;
-    AddMazeBoundaryProbes(LegacyParams, LegacyBottom, LegacyTop, LegacyProbes);
-    AddMazeBoundaryProbes(StackParams, StackBottom, StackTop, StackProbes);
-    TestEqual(TEXT("legacy and operator seam tests have the same probe count"),
-              LegacyProbes.Num(), StackProbes.Num());
+    TArray<FVector> SeamProbes;
+    AddMazeBoundaryProbes(MazeParams, MazeBottomZ, MazeTopZ, SeamProbes);
 
-    int32 LegacyFirst = INDEX_NONE, StackFirst = INDEX_NONE;
-    float LegacyBefore = 0.0f, LegacyAfter = 0.0f;
-    float StackBefore = 0.0f, StackAfter = 0.0f;
-    const int32 LegacyMismatches = CountContextMismatches(
-        LegacyWorld, LegacyProbes, LegacyFirst, LegacyBefore, LegacyAfter);
-    const int32 StackMismatches = CountContextMismatches(
-        StackWorld, StackProbes, StackFirst, StackBefore, StackAfter);
+    int32 FirstProbe = INDEX_NONE;
+    float FirstBefore = 0.0f, FirstAfter = 0.0f;
+    const int32 NumMismatches = CountContextMismatches(
+        World, SeamProbes, FirstProbe, FirstBefore, FirstAfter);
 
-    TestEqual(TEXT("legacy Maze has no chunk-context seam mismatches"), LegacyMismatches, 0);
-    TestEqual(TEXT("operator-stack Maze has no chunk-context seam mismatches"), StackMismatches, 0);
-    TestTrue(TEXT("Maze seam test sampled cell-boundary probes"), LegacyProbes.Num() > 0);
+    TestEqual(TEXT("Maze has no chunk-context seam mismatches"), NumMismatches, 0);
+    TestTrue(TEXT("Maze seam test sampled cell-boundary probes"), SeamProbes.Num() > 0);
 
-    if (LegacyFirst != INDEX_NONE)
+    if (FirstProbe != INDEX_NONE)
     {
-        AddError(FString::Printf(TEXT("Legacy Maze seam mismatch at probe %d: %.9g -> %.9g"),
-                                 LegacyFirst, LegacyBefore, LegacyAfter));
-    }
-    if (StackFirst != INDEX_NONE)
-    {
-        AddError(FString::Printf(TEXT("Operator Maze seam mismatch at probe %d: %.9g -> %.9g"),
-                                 StackFirst, StackBefore, StackAfter));
+        AddError(FString::Printf(TEXT("Maze seam mismatch at probe %d: %.9g -> %.9g"),
+                                 FirstProbe, FirstBefore, FirstAfter));
     }
 
     AddInfo(FString::Printf(
-        TEXT("Maze seam freedom: %d boundary probes, legacy mismatches=%d, operator mismatches=%d; "
+        TEXT("Maze seam freedom: %d boundary probes, mismatches=%d; "
              "local window=2x2x2 child nodes ({-1,0}^3), no wide collect."),
-        LegacyProbes.Num(), LegacyMismatches, StackMismatches));
+        SeamProbes.Num(), NumMismatches));
     return true;
 }
 
@@ -175,7 +155,7 @@ bool FVoxelForgeCaveWarpTileLodSeamTest::RunTest(const FString& Parameters)
     using namespace VoxelForgeTest;
 
     FTestWorld World;
-    World.Build(1337, 2, true, 4);
+    World.Build(1337, 2, 4);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

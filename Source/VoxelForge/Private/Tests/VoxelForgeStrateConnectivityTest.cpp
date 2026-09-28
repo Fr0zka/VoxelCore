@@ -1325,54 +1325,38 @@ bool FVoxelForgeVerticalShaftSeamTest::RunTest(const FString& Parameters)
 {
     using namespace VoxelForgeTest;
 
-    bool bAllChecksPassed = true;
-    FString Summary = TEXT("VerticalShafts seam-freedom check (cell-boundary probes with two "
-                          "neighbouring chunk-context orders):\n");
-    for (const bool bUseOperatorStack : { false, true })
+    FTestWorld World;
+    World.Build(/*InSeed=*/1337, /*InGapChunks=*/2);
+    if (!World.IsValid())
     {
-        FTestWorld World;
-        World.Build(/*InSeed=*/1337, /*InGapChunks=*/2, bUseOperatorStack);
-        if (!World.IsValid())
-        {
-            AddError(FString::Printf(
-                TEXT("HARD FAILURE: could not build the %s seam-test fixture."),
-                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")));
-            bAllChecksPassed = false;
-            continue;
-        }
-
-        int32 Checked = 0;
-        int32 Mismatches = 0;
-        FString FirstMismatch;
-        if (!CheckVerticalShaftSeams(World, Checked, Mismatches, FirstMismatch))
-        {
-            AddError(FString::Printf(
-                TEXT("HARD FAILURE: the %s seam test sampled no VerticalShafts positions."),
-                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy")));
-            bAllChecksPassed = false;
-            continue;
-        }
-
-        Summary += FString::Printf(
-            TEXT("  %s path: %d same-position re-evaluations, %d bit mismatches%s%s.\n"),
-            bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
-            Checked,
-            Mismatches,
-            Mismatches > 0 ? TEXT("; first ") : TEXT(""),
-            Mismatches > 0 ? *FirstMismatch : TEXT(""));
-        if (Mismatches != 0)
-        {
-            AddError(FString::Printf(
-                TEXT("SEAM: %s VerticalShafts density changed after different chunk-context "
-                     "orders: %s"),
-                bUseOperatorStack ? TEXT("operator-stack") : TEXT("legacy"),
-                *FirstMismatch));
-            bAllChecksPassed = false;
-        }
+        AddError(TEXT("HARD FAILURE: could not build the seam-test fixture."));
+        return false;
     }
 
-    AddInfo(Summary);
-    return bAllChecksPassed;
+    int32 Checked = 0;
+    int32 Mismatches = 0;
+    FString FirstMismatch;
+    if (!CheckVerticalShaftSeams(World, Checked, Mismatches, FirstMismatch))
+    {
+        AddError(TEXT("HARD FAILURE: the seam test sampled no VerticalShafts positions."));
+        return false;
+    }
+
+    AddInfo(FString::Printf(
+        TEXT("VerticalShafts seam-freedom check (cell-boundary probes with two neighbouring "
+             "chunk-context orders): %d same-position re-evaluations, %d bit mismatches%s%s."),
+        Checked,
+        Mismatches,
+        Mismatches > 0 ? TEXT("; first ") : TEXT(""),
+        Mismatches > 0 ? *FirstMismatch : TEXT("")));
+    if (Mismatches != 0)
+    {
+        AddError(FString::Printf(
+            TEXT("SEAM: VerticalShafts density changed after different chunk-context orders: %s"),
+            *FirstMismatch));
+        return false;
+    }
+    return true;
 }
 
 bool FVoxelForgeStrateConnectivityTest::RunTest(const FString& Parameters)

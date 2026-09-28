@@ -249,15 +249,6 @@ public:
      *  live edit) can never serve a stale strate index or passage shortlist. */
     uint32 GetLayoutVersion() const { return PassagesVersion; }
 
-    /**
-     * Fingerprint of the immutable density inputs used by the generator.
-     *
-     * Returns zero when the manager has dynamic inputs that this compact cache key intentionally
-     * does not serialize (seasons, composer recipes, biome maps, or terrain-op assets). Zero is a
-     * fail-closed answer: callers must skip verdict reuse rather than risk an old all-air proof.
-     */
-    uint64 GetGenerationParamsFingerprint() const;
-
     /** Diagnostic-only switch for isolating the inter-strate support writer. */
     void SetPassageSupportFloorWritesEnabledForDiagnostics(bool bEnabled)
     {
@@ -289,7 +280,7 @@ public:
      * Get generation params for a chunk, with boundary blending.
      *
      * BLENDING CONCEPT:
-     * When a chunk is near a strate boundary (within BlendChunks of the edge),
+     * When a chunk is near a strate boundary (within the definition's TransitionBlendChunks of the edge),
      * the params are lerped between the two adjacent strates. This prevents
      * hard visual seams where one strate ends and another begins.
      *
@@ -303,7 +294,7 @@ public:
      *
      * Returns TunnelNetwork if the chunk is outside all strates or if the
      * strate definition is null. The generator uses this to pick which
-     * density function to call (GetDensityWithParams vs GetSlabDensity).
+     * operator stack to build for the chunk.
      *
      * @param ChunkCoord - The chunk position
      * @return The ECaveGeneratorType for the strate containing this chunk
@@ -311,12 +302,9 @@ public:
     ECaveGeneratorType GetGeneratorTypeForChunk(const FIntVector& ChunkCoord) const;
 
     /**
-     * True when this chunk's strate opts into the density OPERATOR STACK instead of the hardcoded
-     * archetype switch (`UVoxelStrateDefinition::bUseOperatorStack`).
-     *
-     * Returns false for archetypes that have no port yet, so the flag can be set on any strate
-     * without changing its output until that archetype lands. Only `Maze` is ported today — this
-     * predicate is where that list grows, and it is deliberately the ONLY place it is written down.
+     * True when this chunk lies in a strate slot whose archetype has an operator stack (all eight
+     * do). False outside the layout or for a slot without a definition. This predicate is the ONLY
+     * place the archetype list is written down.
      */
     bool UsesOperatorStackForChunk(const FIntVector& ChunkCoord) const;
 
@@ -418,14 +406,6 @@ public:
     /** Reassert the default walkable tunnel's clear air in internal density after any post. */
     void ApplyPassageTunnelAir(float& Density, float WorldX, float WorldY, float WorldZ,
                                float BaseDensity, float SealThickness) const;
-
-    /** Re-assert landing air after MC-space disturbances, still before the final XY seal. */
-    void ApplyPassageLandingAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
-                                  float BaseDensity, float SealThickness) const;
-
-    /** Re-assert walkable tunnel air after MC-space disturbances, still before the final XY seal. */
-    void ApplyPassageTunnelAirMC(float& Density, float WorldX, float WorldY, float WorldZ,
-                                 float BaseDensity, float SealThickness) const;
 
     /** Apply the landing/tunnel MC post in one cached passage scan after disturbances. */
     void ApplyPassageStructuralPostsMC(float& Density, float WorldX, float WorldY, float WorldZ,
@@ -529,9 +509,6 @@ protected:
     // Never reused for the lifetime of the process. This is deliberately not a UObject pointer:
     // allocator address reuse must not make a stale worker-local stack look current.
     uint64 CacheLifetimeId = 0;
-
-    // How many chunks at strate boundaries are blended (transition zone)
-    int32 BlendChunks = 2;
 
     // World seed (stored for passage generation)
     int32 CachedSeed = 0;

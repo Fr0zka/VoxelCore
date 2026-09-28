@@ -549,7 +549,7 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
         }
 
         FTestWorld World;
-        World.Build(Seed, 2, false);
+        World.Build(Seed, 2);
         int32 TopWorldZ = 0;
         int32 BottomWorldZ = 0;
         FVoxelStrateRegionManifest Manifest;
@@ -612,7 +612,7 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
         }
 
         FTestWorld World;
-        World.Build(Seed, 2, false);
+        World.Build(Seed, 2);
         int32 TopWorldZ = 0;
         int32 BottomWorldZ = 0;
         FVoxelStrateRegionManifest Manifest;
@@ -661,7 +661,7 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("found a single-region recipe identity case"), bRecipeIdentityChecked);
 
     FTestWorld World;
-    World.Build(MultiSeed, 2, false);
+    World.Build(MultiSeed, 2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());
@@ -955,7 +955,7 @@ bool FVoxelForgeLateralRegionsTest::RunTest(const FString& Parameters)
         }
 
         FTestWorld LawWorld;
-        LawWorld.Build(Seed, 2, false);
+        LawWorld.Build(Seed, 2);
         FVoxelStrateRegionManifest LawManifest;
         FVoxelOpStack LawStack;
         FVoxelOpContext LawContext;

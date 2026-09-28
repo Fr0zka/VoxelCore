@@ -3800,55 +3800,6 @@ bool FVoxelStrateCorpus::LoadFromAssetRegistry(
     return bLoaded && NumUnresolved == 0 && bPromotedLoaded;
 }
 
-bool FVoxelStrateCorpus::LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport)
-{
-    // Compatibility/audit entry point. It intentionally does not load any soft reference: the
-    // Asset Registry is the corpus source, while the settings pool is reported as the reason the
-    // first Tier 4a run saw only one vector.
-    TArray<FString> SettingsPaths;
-    if (Settings != nullptr)
-    {
-        TSet<FString> UniquePaths;
-        for (const TPair<int32, TSoftObjectPtr<UVoxelStrateDefinition>>& Pair : Settings->FixedStrates)
-        {
-            const FString Path = Pair.Value.ToSoftObjectPath().ToString();
-            if (!Path.IsEmpty())
-            {
-                UniquePaths.Add(Path);
-            }
-        }
-        for (const TSoftObjectPtr<UVoxelStrateDefinition>& Reference : Settings->StratePool)
-        {
-            const FString Path = Reference.ToSoftObjectPath().ToString();
-            if (!Path.IsEmpty())
-            {
-                UniquePaths.Add(Path);
-            }
-        }
-        for (const FString& Path : UniquePaths)
-        {
-            SettingsPaths.Add(Path);
-        }
-        SettingsPaths.Sort();
-    }
-
-    FString RegistryReport;
-    const bool bLoaded = LoadFromAssetRegistry(RegistryReport);
-    OutReport = FString::Printf(
-        TEXT("Settings audit: %d unique fixed/pool soft paths"), SettingsPaths.Num());
-    for (const FString& Path : SettingsPaths)
-    {
-        OutReport += FString::Printf(TEXT(" [%s]"), *Path);
-    }
-    if (Settings == nullptr)
-    {
-        OutReport += TEXT(" [settings object was null]");
-    }
-    OutReport += TEXT("; settings references are diagnostic only. ");
-    OutReport += RegistryReport;
-    return bLoaded;
-}
-
 int32 FVoxelStrateCorpus::NumForArchetype(ECaveGeneratorType Archetype) const
 {
     int32 Count = 0;
@@ -4921,7 +4872,7 @@ FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpu
                        Repeat.ArchetypeParams, Result.ArchetypeParams, Result.Archetype)
                    && Repeat.ParentEntryIndices == Result.ParentEntryIndices
                    && Repeat.ParentWeights == Result.ParentWeights,
-               TEXT("VF_RollStrateParams lost determinism for the same corpus/seed/index."));
+               TEXT("VF_RollStrateParamsDetailed lost determinism for the same corpus/seed/index."));
     }
 #endif
     return Result;
@@ -5301,12 +5252,6 @@ bool VF_ValidateStrateCorpusFreeConstraints(
     return false;
 }
 
-FStrateGenerationParams VF_RollStrateParams(const FVoxelStrateCorpus& Corpus,
-                                             int32 Seed, int32 Index)
-{
-    return VF_RollStrateParamsDetailed(Corpus, Seed, Index).Params;
-}
-
 namespace
 {
     const TCHAR* VF_RecipeOpCode(EVoxelStrateOpClass OpClass)
@@ -5531,15 +5476,6 @@ FVoxelStrateRegionManifest VF_RollStrateRegionManifest(
         ECaveGeneratorType::SurfaceWorld,
         ECaveGeneratorType::VerticalShafts,
         ECaveGeneratorType::FloatingIslands,
-    };
-    static const EVoxelStrateParamBlock BlockIds[] =
-    {
-        EVoxelStrateParamBlock::TunnelNetwork,
-        EVoxelStrateParamBlock::Slab,
-        EVoxelStrateParamBlock::Maze,
-        EVoxelStrateParamBlock::Surface,
-        EVoxelStrateParamBlock::VerticalShaft,
-        EVoxelStrateParamBlock::FloatingIsland,
     };
     static const uint32 BlockSalts[] = { 0x1001u, 0x1003u, 0x1005u,
                                         0x1007u, 0x1009u, 0x100Bu };

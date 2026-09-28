@@ -123,21 +123,6 @@ public:
 		return FMath::Clamp(FMath::Max(StrateContentCutMinLevel, 1), 1, 9);
 	}
 
-	// Open-world SKY reach: the sky-cap ceiling of an open strate (SurfaceWorld / FloatingIslands)
-	// is FAR, so the ceiling BAND is streamed across a wider horizontal radius = ViewDistanceXY ×
-	// this, so the sky reaches toward the horizon instead of being a patch over the player's head.
-	// Only the ceiling band (top CeilingBandChunks of the strate) gets the wide radius — the empty
-	// air below it stays at base XY. Cost grows ~ multiplier² (more far chunks/draws; gen is cheap
-	// and batching keeps the game-thread cost low). 1 = off. Live-tunable on the asset — push to 4
-	// if the draw budget allows; a proper to-the-horizon view (terrain too) is the chunk-LOD clipmap.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "1"))
-	int32 CeilingViewMultiplier = 2;
-
-	// How many chunks down from the strate top get the wide CeilingViewMultiplier radius (covers
-	// the sky-cap slab). Bigger = no gaps if the ceiling surface dips, but more far chunks.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Streaming", meta = (ClampMin = "1"))
-	int32 CeilingBandChunks = 4;
-
 	//=========================================================================
 	// CLIPMAP (chunked-LOD streaming — supersedes the ViewDistance box above)
 	//=========================================================================
@@ -182,25 +167,6 @@ public:
 	// Ship default: 768 chunks (about 6.1 km at 8 m/chunk). 0 = off (natural reach).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0"))
 	int32 RenderDistanceChunks = 768;
-
-	// F18 — the render-distance ring streams per-surface SHEETS instead of MC tiles: in an open
-	// strate the far field is exactly two heightfields (TerrainZ + sky-cap CeilSurf, both already
-	// computed per column), so each far tile becomes two displaced grids (ground polygroup 0 /
-	// cap polygroup 1 — same materials), ~3-6× cheaper to generate and far fewer components (one
-	// sheet spans 2^FarSheetSpanLevels MC-tile footprints per axis). Non-open strates produce
-	// empty sheets (their far ring was enclosed rock anyway). Carved features (passages, chasms,
-	// spine) don't show at sheet distance. Needs the strate band armed (StrateContentCutMinLevel
-	// active); in the inter-strate gap the sheet ring blanks until you land. The ship default is OFF:
-	// the ring stays real MC tiles at level MaxClipLevel (pre-F18 behaviour). Only matters when
-	// RenderDistanceChunks > 0.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap")
-	bool bFarSheetRing = false;
-
-	// Sheet tile size = MaxClipLevel + this many levels (2 → one sheet covers 4×4 MC-tile
-	// footprints → ~16× fewer far components). Sampling density stays that of the MaxClipLevel
-	// MC ring (cell count grows instead), capped at 128 cells/axis (beyond, cells coarsen).
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "1", ClampMax = "4", EditCondition = "bFarSheetRing"))
-	int32 FarSheetSpanLevels = 2;
 
 	// SKIRTS — seal the thin cracks where neighbouring clipmap shells (different resolutions) meet.
 	// A short wall is extruded into the solid from each surface edge on the tile's outer faces.
@@ -344,12 +310,6 @@ public:
 	// Res·(1<<L) voxels. 3 levels at Res=128 → near 32 m (full-res) out to ~128 m (coarse).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "1", ClampMax = "5"))
 	int32 DensityVolumeLevels = 3;
-
-	// DEPRECATED / unused: the volume fill no longer runs on the shared UE::Tasks pool (where it
-	// starved behind mesh-gen). It now runs on ONE dedicated thread off the pool, so there's no task
-	// budget to cap. Kept only so existing saved assets don't error; safe to ignore.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Lighting", meta = (ClampMin = "1", ClampMax = "16"))
-	int32 DensityVolumeMaxTasks = 4;
 
 	// A fill box is split into Z-slabs of at most this many cells per task, so no single task is
 	// huge (a full level refill on startup/teleport fans out across workers). Lower = more, smaller

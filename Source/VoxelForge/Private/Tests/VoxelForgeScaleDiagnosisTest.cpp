@@ -140,7 +140,6 @@ namespace
         Definition->SurfaceParams = Candidate.ArchetypeParams.SurfaceParams;
         Definition->VerticalShaftParams = Candidate.ArchetypeParams.VerticalShaftParams;
         Definition->FloatingIslandParams = Candidate.ArchetypeParams.FloatingIslandParams;
-        Definition->bUseOperatorStack = true;
         Definition->TransitionType = EVoxelStrateTransition::Hard;
         World.Reinitialize();
     }
@@ -869,7 +868,7 @@ bool FVoxelForgeScaleDiagnosisTest::RunTest(const FString& Parameters)
     // Resolve every probe from the current corpus. This keeps the diagnosis attached to real
     // single-region candidates without making a corpus asset edit look like a geometry failure.
     FTestWorld World;
-    World.Build(DiagnosisSeed, 2, true, 8);
+    World.Build(DiagnosisSeed, 2, 8);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

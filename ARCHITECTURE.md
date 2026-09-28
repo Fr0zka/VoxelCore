@@ -36,7 +36,7 @@ radius, **0.300** against the Maze corridor radius, **0.469/0.625** against shaf
 **0.234** against the minimum island radius (**0.484** including its 6-voxel blend), and
 **0.625/0.938** against slab column radius for floor/ceiling roughness. SurfaceWorld is a
 heightfield, so its **0.047** ratio is against its 80-voxel relief scale, not a fictitious radial
-feature. FlatPlain and CrystalChamber intentionally share `GetSlabDensity` and the same slab
+feature. FlatPlain and CrystalChamber intentionally share `BuildSlabStack` and the same slab
 parameter block; they cannot acquire separate scale geometry without a generator change.
 
 This scale contract is informed by [Epic's Unreal level-blockout guidance](https://dev.epicgames.com/documentation/en-us/unreal-engine/designer-01-project-setup-and-level-blockout-in-unreal-engine), which recommends a player-sized reference and gives 2-3 m hall / 3-4 m height starting guidance. The
@@ -62,22 +62,23 @@ are not landing or box-verdict violations.
 
 ### 8.1 Archetypes (`ECaveGeneratorType`, VoxelStrateTypes.h)
 Each archetype has its own param `USTRUCT` (on `UVoxelStrateDefinition`, EditCondition-gated
-by `GeneratorType`) and its own density function in `VoxelGenerator.cpp`, dispatched by the
-`switch` in `GetDensityAt`.
+by `GeneratorType`) and its own **operator stack** builder in `VoxelDensityOpStack.cpp`, selected per
+chunk by `VF_BuildOpStackForChunk` in `GetDensityAt` (the same factory `ClassifyTile` uses). The stack
+is the only density path; a degenerate (zero-height) strate has none and is open air.
 
-| Archetype | Params struct | Density fn | Idea |
+| Archetype | Params struct | Stack builder | Idea |
 |-----------|---------------|------------|------|
-| TunnelNetwork | `FStrateGenerationParams` | `GetDensityWithParams` | rooms+tunnels (original) |
-| FlatPlain / CrystalChamber | `FSlabGenerationParams` | `GetSlabDensity` | floor/ceiling void (original) |
-| Maze | `FMazeGenerationParams` | `GetMazeDensity` | origin-directed spanning-tree corridors on a 3D lattice, with capped loop edges and a thread-local per-cell capsule cache |
-| SurfaceWorld | `FSurfaceGenerationParams` | `GetSurfaceDensity` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, **F20 heightfield terrain ops** (`Surface|Ops` — all default off ⇒ byte-identical): **Cliff** (slope-gated steepening — where the analytic structural slope > `CliffSlopeThreshold`, push the height away from the local mean by `CliffSharpness` ⇒ gentle slopes become sheer walls/canyon faces that hug real steep ground, gentle areas untouched; 4 structural resamples only when enabled), **Terrace** (relief-gated plateau quantize + `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed) — pure per-column height remaps in the single oracle `ComputeSurfaceTerrainZ` (`SampleSurfaceStructuralZ` = pre-op raw height, re-sampled at an XY offset for Cliff's slope), biome-selected + border-blended for free via each biome's `SurfaceParams` + the height output-lerp; plus **phase-2 Overhang** (the first VOLUMETRIC op — real jutting shelves like a cliff lip): in `SurfaceDensityFromColumn`, for AIR voxels in the window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height and unioned in. Low in the window the shift is ~0 (borrows nearby low rock ⇒ stays air over the void); high up it reaches the far cliff (solid) ⇒ a shelf attached to the cliff, tapering out over the void with air underneath. Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill dir `(DirX,DirY)` are resolved once in `ComputeSurfaceColumn` — the gradient sampled at the REACH scale (`OverhangReach`) so a point out over the void can "see" the cliff to know which way is uphill — and cached on `FSurfaceColumn`. It's genuine 3D (per-voxel structural re-eval), so it's gated hard to steep overhang columns; the union only ADDS rock (never removes), capped at `TerrainZ+OverhangHeight`, so `ClassifyTile` forces Mixed only in `(TerrainZ, TerrainZ+OverhangMargin]` (upward-only; margin = max `OverhangHeight`) — a shelf never holes a trivially-skipped tile, and only the thin cliff-edge band of air tiles is woken (NOT far-field like phase-3 spikes/holes). Overhang undersides classify as ground rock by the F17 rule (down-facing but below `TerrainZ`). Known v1 limit: applies at all LODs (Step-agnostic) — may alias far; gate to fine tiles later. Beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap vs ground is a PER-TRIANGLE surface class (F17), not a per-tile verdict**: the mesher classifies each unique vertex on the **worker** — only down-facing verts (`N.Z<-0.1`) pay a memoized `GetSurfaceHeightAt` column query; nearer `CeilSurf` ⇒ sky-cap, nearer `TerrainZ` ⇒ terrain overhang stays ground (a future SurfaceWorld cave roof — down-facing but below `TerrainZ` — also lands ground by the same rule; non-surface strates always ground). Triangles take the majority class of their 3 verts and are packed as **two contiguous index runs** (ground then cap, `FVoxelMeshData::NumCeilingTriangles`; skirts inherit their source triangle's run) → RMC **polygroups 0/1** → one **section per non-empty group** (`ApplyMeshToTile`, material slot = group index): slot 0 = strate `OverrideMaterial`/default (min-corner chunk), slot 1 = `CeilingMaterial` resolved at the tile's **TOP chunk** (mid as gap fallback, then min; fallback: ground material) — a coarse tile is 2^level chunks tall, so its min corner can sit in a lower strate/gap while the cap belongs to the strate above (this was the "far cap = ground material" residue), so the shadowless overhead rock is tinted separately instead of reading flat/bright. Shadow is **per section** via `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired): ground casts at level≤1, the cap section never casts, so the rock ceiling never shadows the terrain below it. History: v1 was a game-thread centre height-oracle (misclassified coarse far tiles → terrain material on the cap underside); v2 a whole-tile worker normal VOTE — which painted **mixed coarse tiles** (one far tile spanning terrain AND cap) entirely with the winner's material, and put sky material under terrain overhangs. The per-triangle class fixes both and is the identity channel caves/F8 will reuse. |
-| VerticalShafts | `FVerticalShaftParams` | `GetVerticalShaftDensity` | full-height shafts + horizontal connectors + partial ledges |
-| FloatingIslands | `FFloatingIslandParams` | `GetFloatingIslandDensity` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
-| Underwater | `FStrateGenerationParams` + water | (reuses `GetDensityWithParams`) | tunnel rock + high water table |
+| TunnelNetwork | `FStrateGenerationParams` | `BuildTunnelNetworkStack` (fused evaluator: `GetDensityWithParams`) | rooms+tunnels (original) |
+| FlatPlain / CrystalChamber | `FSlabGenerationParams` | `BuildSlabStack` | floor/ceiling void (original) |
+| Maze | `FMazeGenerationParams` | `BuildMazeStack` | origin-directed spanning-tree corridors on a 3D lattice, with capped loop edges and a thread-local per-cell capsule cache |
+| SurfaceWorld | `FSurfaceGenerationParams` | `BuildSurfaceStack` | heightfield terrain: domain-warped continents+ridged mtns+detail, a low-freq **relief map** (`M`) that scales mountains/elevation for plains↔highland variety, **F20 heightfield terrain ops** (`Surface|Ops` — all default off ⇒ byte-identical): **Cliff** (slope-gated steepening — where the analytic structural slope > `CliffSlopeThreshold`, push the height away from the local mean by `CliffSharpness` ⇒ gentle slopes become sheer walls/canyon faces that hug real steep ground, gentle areas untouched; 4 structural resamples only when enabled), **Terrace** (relief-gated plateau quantize + `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed) — pure per-column height remaps in the single oracle `ComputeSurfaceTerrainZ` (`SampleSurfaceStructuralZ` = pre-op raw height, re-sampled at an XY offset for Cliff's slope), biome-selected + border-blended for free via each biome's `SurfaceParams` + the height output-lerp; plus **phase-2 Overhang** (the first VOLUMETRIC op — real jutting shelves like a cliff lip): in `FOverhangShelfMod`, for AIR voxels in the window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height and unioned in. Low in the window the shift is ~0 (borrows nearby low rock ⇒ stays air over the void); high up it reaches the far cliff (solid) ⇒ a shelf attached to the cliff, tapering out over the void with air underneath. Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill dir `(DirX,DirY)` are resolved once in `ComputeSurfaceColumn` — the gradient sampled at the REACH scale (`OverhangReach`) so a point out over the void can "see" the cliff to know which way is uphill — and cached on `FSurfaceColumn`. It's genuine 3D (per-voxel structural re-eval), so it's gated hard to steep overhang columns; the union only ADDS rock (never removes), capped at `TerrainZ+OverhangHeight`, so `ClassifyTile` forces Mixed only in `(TerrainZ, TerrainZ+OverhangMargin]` (upward-only; margin = max `OverhangHeight`) — a shelf never holes a trivially-skipped tile, and only the thin cliff-edge band of air tiles is woken (NOT far-field like phase-3 spikes/holes). Overhang undersides classify as ground rock by the F17 rule (down-facing but below `TerrainZ`). Known v1 limit: applies at all LODs (Step-agnostic) — may alias far; gate to fine tiles later. Beaches at water line, high sky-cap ceiling. The cap is shapeable terrain in its own right (`ComputeSurfaceCeiling`, `Surface|Sky` params: `CeilingUndulation` broad inverted hills/valleys, `CeilingRidgeStrength` hanging ridgelines, `CeilingRoughness`+freq fine bumps, `CeilingWarp*`) — defaults (strengths 0, freq 0.04) = old flat-ish cap. (`Surface|Macro` params = the cheap precursor to biomes; `ReliefStrength=0` ⇒ old uniform terrain.) **Sky-cap vs ground is a PER-TRIANGLE surface class (F17), not a per-tile verdict**: the mesher classifies each unique vertex on the **worker** — only down-facing verts (`N.Z<-0.1`) pay a memoized `GetSurfaceHeightAt` column query; nearer `CeilSurf` ⇒ sky-cap, nearer `TerrainZ` ⇒ terrain overhang stays ground (a future SurfaceWorld cave roof — down-facing but below `TerrainZ` — also lands ground by the same rule; non-surface strates always ground). Triangles take the majority class of their 3 verts and are packed as **two contiguous index runs** (ground then cap, `FVoxelMeshData::NumCeilingTriangles`; skirts inherit their source triangle's run) → RMC **polygroups 0/1** → one **section per non-empty group** (`ApplyMeshToTile`, material slot = group index): slot 0 = strate `OverrideMaterial`/default (min-corner chunk), slot 1 = `CeilingMaterial` resolved at the tile's **TOP chunk** (mid as gap fallback, then min; fallback: ground material) — a coarse tile is 2^level chunks tall, so its min corner can sit in a lower strate/gap while the cap belongs to the strate above (this was the "far cap = ground material" residue), so the shadowless overhead rock is tinted separately instead of reading flat/bright. Shadow is **per section** via `FRealtimeMeshSectionConfig::bCastsShadow` (NOT the component `SetCastShadow` — RMC's proxy ignores the component flag; this is also why level≥2 far tiles only stopped casting once the section flag was wired): ground casts at level≤1, the cap section never casts, so the rock ceiling never shadows the terrain below it. History: v1 was a game-thread centre height-oracle (misclassified coarse far tiles → terrain material on the cap underside); v2 a whole-tile worker normal VOTE — which painted **mixed coarse tiles** (one far tile spanning terrain AND cap) entirely with the winner's material, and put sky material under terrain overhangs. The per-triangle class fixes both and is the identity channel caves/F8 will reuse. |
+| VerticalShafts | `FVerticalShaftParams` | `BuildVerticalShaftStack` | full-height shafts + horizontal connectors + partial ledges |
+| FloatingIslands | `FFloatingIslandParams` | `BuildFloatingIslandStack` | asymmetric islands: flat land top + underside tapering to a point, lobed (domain-warped) outline, in an open void |
+| Underwater | `FStrateGenerationParams` + water | (reuses `BuildTunnelNetworkStack`) | tunnel rock + high water table |
 
-All density fns share the convention: internal **positive=solid**, apply origin spine →
-vertical boundary seal → inter-strate passage tube + landing/floor → XY edge seal, then `return -Density` (MC:
-negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
+All stacks share the convention: internal **positive=solid**, and `AppendStructuralPost` ends every
+stack with origin spine → vertical boundary seal → inter-strate passage tube + landing/floor → XY
+edge seal; `EvalMC` negates once (MC: negative=solid). The final MC-facing edge pass in `GetDensityAt` is repeated after disturbances so
 the global rim cannot be reopened by a post-process; the diff layer remains the explicit player
 override.
 StrateManager provides params per chunk via `GetMaze/Surface/VerticalShaft/FloatingIslandParamsForChunk`
@@ -127,12 +128,9 @@ threshold** before the law gate. No corridor or threshold tuning was added. The 
 gate is therefore retained as a design blocker; see `COMPOSER-NOTES.md §3.2b` and the validation log
 in §10.
 
-⚠️ **The `switch` above is no longer the only density path.** All 8 archetypes also exist as
-**operator stacks**, selected per strate by
-`bUseOperatorStack` and evaluated instead of the `switch`; each is bit-identical to the function in
-its row. The design lives in `OPSTACK-PLAN.md` / `OPSTACK-DECOMPOSITION.md`, the symbol index in
-`CODEMAP §3.2d` — not repeated here. What matters for *this* document: the archetype table describes
-what the world IS, and both paths compute it.
+The operator-stack design lives in `Docs/archive/OPSTACK-PLAN.md` /
+`Docs/archive/OPSTACK-DECOMPOSITION.md`, the symbol index in `CODEMAP §3.2d` — not repeated here.
+What matters for *this* document: the archetype table describes what the world IS.
 
 ### 8.2 (0,0) spine & hybrid connections
 - `ApplyOriginSpine` (VoxelGenerator.cpp, static helper) builds a finite, rounded landing room with
@@ -230,8 +228,8 @@ they are never needed for the connectivity proof.
 
 The evaluation window is exactly the lower nodes in `{-1,0}³`, an 8-node / 2×2×2 local halo. The
 edge predicate checks the adjacent `+1` endpoint's parent locally, so it does not need a wider
-collect region and cannot disagree at a chunk boundary. Both `GetMazeDensity` and
-`MakeLatticeCorridorSource` rebuild those decisions in their thread-local per-cell cache; the
+collect region and cannot disagree at a chunk boundary. `MakeLatticeCorridorSource` rebuilds those
+decisions in its thread-local per-cell cache; the
 voxel loop evaluates only cached capsule SDFs. This is deliberately independent of
 `WorldRadiusVoxels` (which remains `0`) and the still-gated lateral-region system.
 
@@ -291,9 +289,11 @@ when close (separate HISMs → crossing the near boundary never touches the far 
 (per grid, sharing ONE `MaxConcurrentDecorationTasks` budget — each throttles against the other's in-flight count):
 snapshot the update's decoration palette (built once on the GAME thread — biome, see below) then fire an async `UE::Tasks` march
 (`BuildCellSpawns`, `BackgroundNormal`, capped at `MaxConcurrentDecorationTasks` in flight via `InFlightCells`).
-**(3)** `ProcessDecoResults`: drain finished tasks' results (`Mpsc` queue → `ReadyResults`), epoch-guarded
-(`DecoEpoch`, bumped on clear/strate-change so stale in-flight results are discarded) + range-checked, and
-**apply (spawn) budgeted** (`MaxDecorationCellsPerFrame` — the only game-thread cost, SpawnActor/AddInstance).
+**(3)** `ProcessDecoResults`: drain finished cell marches (`DecoResults`, `Mpsc`) and fold each into its
+grid's region build (`MergeCellResult`; a result whose build is gone or whose `BuildId` no longer matches —
+region cleared + re-marched — is discarded), then **apply completed regions budgeted**
+(`MaxDecorationCellsPerFrame` regions/frame via `ApplyRegion` — the only game-thread cost; a region that left
+range while it marched is dropped unbuilt).
 `BuildCellSpawns` (worker) finds each column's surface point(s) and rolls the entries there (shared
 `PlaceAtCrossing`). Candidate columns are **snapped to INTEGER voxel XY** (integer jitter) so the generator's
 surface-column cache (T1.a, §8.10) applies — FRACTIONAL XY bypasses it and recomputes the noise-heavy
@@ -321,7 +321,7 @@ result's `Entries` snapshot. `DecorationMaxCrossingsPerColumn` caps cave columns
 task count before UObject teardown (tasks read the Generator); `BeginDestroy` is the backstop. **Determinism:**
 pure hash of (cell, column, crossing, entry, seed) + the density surface snap. **Decorations exist ONLY in
 the player's current strate** (march is strate-bounded) → a strate change wipes + rebuilds them, and there
-is **no cross-strate light bleed to cull** (the old `SetActiveStrate` light-culling pass is SUBSUMED — gone).
+is **no cross-strate light bleed to cull**.
 **Render paths:** `ActorClass` → real actors (lights/logic, pricey game-thread spawn); `InstancedMesh` → HISM
 (no tick/actor/collision, emissive glows far), per-cell-per-entry. **Per-entry HISM tuning for dense groundcover**
 (`FStrateDecoration`, only the InstancedMesh path): `CullDistance` (cm; 0 = no cull — the lever that makes dense
@@ -332,8 +332,8 @@ grass affordable: placed thickly, drawn only near → GPU cost bounded by area-w
 `MinSlopeAngle` (lower companion to Max — band a prop onto a tilt range, e.g. 30..70 = slopes only),
 `bWallExcludeOverhangs` (wall-only-upright: drop normals with N.Z < 0 so downward overhangs don't take wall props).
 **Shared vocabulary (2026-07-06):** these gates + spawn/transform/render fields now live on `FPlacementProfile`
-(embedded as `Profile` on `FStrateDecoration`, `FStrateLandmark`, and the coming `FStrateSetPiece`), so all three
-scatter primitives are authored identically. Rotation unified to `RotationOffset` (fixed) + `RandomRotation`
+(embedded as `Profile` on `FStrateDecoration` and `FStrateLandmark`), so both scatter primitives are
+authored identically. Rotation unified to `RotationOffset` (fixed) + `RandomRotation`
 (per-axis hash-random) — decoration's ctor defaults `RandomRotation.Yaw = 360` (full random heading, replacing the
 old `bRandomYaw`/`MinYaw`/`MaxYaw`; banded yaw = offset + a smaller random range). Distribution is unchanged; the
 exact per-instance yaw values reshuffle once (different hash mix).
@@ -345,7 +345,7 @@ SampleMoisture / SampleBiomeAt) on demand, so it's deterministic + worker-safe (
 strate's already-resolved `FBiomeContext`, so no re-resolve). Opt-in per entry (empty list = zero cost);
 wired into both the deco worker (`BuildCellSpawns`) and landmark placement (`SpawnLandmarkInstance`). This
 is the shared core of the coming quest `FindFeature` locator (same predicate, run as an outward search) and
-the anchor gate for `FStrateSetPiece`. The BP bridge `AVoxelWorld::GetVoxelSurfaceHeightAt` exposes the
+the landmark anchor gate. The BP bridge `AVoxelWorld::GetVoxelSurfaceHeightAt` exposes the
 trace-free deterministic ground/ceiling height so authored ruin/set-piece Blueprints self-arrange on the
 real surface before it meshes. Next types (water-edge band, relief-peak local-max, slope) are additive.
 **F7 COMPANIONS (relational decoration, `FDecoCompanion`):** each `FStrateDecoration` may list `Companions`
@@ -397,12 +397,12 @@ Static-mobility HISM re-caches its proxy — fine for player-paced digging.) Not
 grass on a freshly-exposed ledge / regrowth after fill-back — both self-correct on the next natural re-stream. **Freeze note:** a huge set-piece mesh hitches on register (game-thread proxy/distance-field build —
 NOT async-fixable; the spawn is game-thread by engine rule; the asset is a hard ref so already resident) →
 mitigate ASSET-side (Nanite on the mesh, bake distance fields), optionally budget spawns across frames.
-`ApplyDecoResult` buckets spawns per entry and builds each HISM with ONE batched `AddInstances`
-(single cluster-tree build, set cull/shadow BEFORE `RegisterComponent`) — the game-thread hitch-killer for dense cells.
+`ApplyRegion` buckets a region's spawns per mesh (all its cells merged) and builds each HISM with ONE batched
+`AddInstances` (single cluster-tree build, set cull/shadow BEFORE `RegisterComponent`) — the game-thread
+hitch-killer for dense cells.
 **Per-entry tier (`StreamTier`, default Far)** picks NearGrid or FarGrid; radius + column spacing are PER-GRID
 settings, never per-entry (a per-entry radius would re-introduce the in-place re-stream flicker — see the two-grid
-rationale above). This REPLACES the vestigial `MaxLODLevel`; the dead `DecorationActorRadiusChunks` setting is
-repurposed as `DecorationNearRadiusChunks`. `CullDistance` still bounds GPU draw on top (orthogonal to which grid
+rationale above). `CullDistance` still bounds GPU draw on top (orthogonal to which grid
 streams the entry). **No LOD area-density compensation** (placement is per real
 surface point, density-stable with distance). **SpawnDensity semantics CHANGED** vs the old vertex scatter: it
 rolls per column surface-point (not per mesh vertex) → expect a one-time density re-tune. **Settings
@@ -436,22 +436,23 @@ null entry = "evaluated, nothing placed" so it isn't retried). Deterministic (ha
 Strate-bounded (wiped on strate change, like decorations). This is the real home for "rare prop at all
 distances" — the job the decoration FarGrid could approximate at moderate range but not at extreme radius.
 
-**(B) WATER — tile-driven, level-0 only (continuous plane, never pops).** `PopulateTileWater(tile)` in
-`ApplyMeshToTile` (level-0 tiles), `ClearTileWater(tile)` in `UnloadTile`. One scaled engine plane
-(`/Engine/BasicShapes/Plane`) per water-surface chunk (per-chunk-Z plane logic assumes a single chunk's
-vertical span — hence level-0 only), keyed `TMap<FIntVector, UStaticMeshComponent*>` (reflected UPROPERTY).
-Water Z: `bHasWater` + `WaterLevelRelative` → `StrateManager::GetWaterLevelWorldZForChunk`. Biome
-`WaterMaterial` overrides `UVoxelStrateDefinition::WaterMaterial` (level stays strate-global).
+**(B) WATER — ONE strate-global ocean plane that follows the player (`UpdateWater`, from `Tick`).** A single
+scaled engine plane (`/Engine/BasicShapes/Plane`, no collision, no shadow) snapped to a coarse cell around the
+player, so it only repositions when the player crosses a cell; terrain pokes through it, so it reads as water at
+every LOD and to the horizon with no per-tile gaps (one draw). Water Z: `bHasWater` + `WaterLevelRelative` →
+`StrateManager::GetWaterLevelWorldZForChunk` (no water in the current strate ⇒ plane hidden). Material:
+`UVoxelStrateDefinition::WaterMaterial`. ⚠️ OPEN: `UVoxelBiomeDefinition::WaterMaterial` (the biome
+content profile's water override, §8.14) is not read by the single-plane path — owner to decide whether
+the biome override should come back (REVIEW_FINDINGS, *Owner decisions*).
 
 `ClearAll`/`SetSeed` on `ChangeSeed`/regenerate clears both subsystems (decorations re-stream on the next
 Tick via the INT_MIN sentinels). **Per-biome content (§8.14):** decorations resolve the dominant biome **PER COLUMN** on the worker
 (`ResolveBiomeSampleAt` via the strate's `FBiomeContext`, box-cached → one rebuild per chunk footprint). The
-update builds ONE flat decoration palette (every biome's list concatenated; `CurrentEntryBiome[i]` tags entry
+update builds ONE flat decoration palette per grid (every biome's list concatenated; `EntryBiome[i]` tags entry
 `i` with its context-biome index, -1 = strate fallback), and `PlaceAtCrossing` rolls only the entries the
-column's biome owns. This replaced the old per-CELL `GetDominantBiomeAt` (one biome for a whole 8 m cell →
-axis-aligned border snapping); borders now follow the warped-Voronoi field at column resolution, no straight
-lines. Water still uses the chunk-centre `GetDominantBiomeAt` for its material. `Initialize` now also takes
-`UVoxelSettings*` (for the grid tunables). `ContentMaxLevel` is now legacy/dead for decorations.
+column's biome owns. Borders follow the warped-Voronoi field at column resolution, no straight lines (a
+per-CELL biome would snap borders to the 8 m cell grid). `Initialize` also takes `UVoxelSettings*` (for the
+grid tunables).
 
 ### 8.6 Atmosphere — `VoxelAtmosphereManager.h/.cpp` (NEW)
 `UVoxelAtmosphereManager` (owned by `AVoxelWorld`, gated by `bManageAtmosphere`).
@@ -521,7 +522,7 @@ flat floor. **There is no connector to the origin landing room at `(0,0)`.** The
 those radial roads after a playtest (`d97373c`, 2026-09-08: they cut straight through everything);
 room joins are flattened to walkable height instead. A source-fit landing therefore stays local to
 the room it was fitted into (`GeneratePassages`, the `VF_BuildPassageLanding` calls).
-⚠️ Open gap (Sol's code review, `DESIGN-SOL-2026-09-15-CODE.md` §1.3/§2.4): when the footing query
+⚠️ Open gap (Sol's code review, `Docs/archive/DESIGN-SOL-2026-09-15-CODE.md` §1.3/§2.4): when the footing query
 declines, the landing falls back to the historical random reach, and nothing proves that pose joins
 the walk network. The canonical capability gate covers one scenario, not every seed or mix.
 Proposed fix, not built: retry deterministically at other candidate spots instead of falling back.
@@ -554,8 +555,8 @@ The landing is part of the structural post, in the fixed order
 after the passage carve and after MC-space disturbances as a support backstop, still before the
 final XY edge seal. Room/floor Z is clamped inside the vertical seal; the XY edge seal is last and
 wins over every landing or tube near the rim. Thus no landing can breach a strate boundary or the
-world edge. The op-stack `FPassageCarveOp` calls the same manager operation as the legacy path,
-including the floor, and `ClassifyTile` kills both uniform hypotheses around the bidirectional
+world edge. The op-stack `FPassageCarveOp` calls the manager's `ApplyPassageModifier`, including
+the floor, and `ClassifyTile` kills both uniform hypotheses around the bidirectional
 landing floor (`Both` in the stack), so an air proof cannot delete support.
 
 The query remains pure — it does not construct an operator stack, touch a cache, or call back into
@@ -621,8 +622,7 @@ driven by `EditorBrush*` props.
   inner 3×3 shafts and their capsules for the per-voxel loop, while spatial culling selects cached
   connectors. The complete ±2 parent and ±3 fallback windows plus connector reach are contained
   by that halo, so no parent decision depends on the evaluation cell. No cell or pair hash, widened
-  neighbourhood scan, or tree construction may move into the per-voxel loop; the operator-stack
-  source follows the same cache contract.
+  neighbourhood scan, or tree construction may move into the per-voxel loop (`FShaftFieldSource`).
 - **Maze field cache**: parent/loop decisions are rebuilt only when the thread-local cell, seed, or
   loop parameters change. The rebuild evaluates the 24 canonical lower-node/axis edges in the
   local `{-1,0}³` window and emits at most 24 capsules; the per-voxel loop performs no hash,
@@ -684,13 +684,13 @@ driven by `EditorBrush*` props.
   position → seamless across chunk borders (both sides use identical pure samples). NO per-vertex
   `GetDensityAt` (was ~6/vertex, often as costly as the whole grid). `ComputeGradientNormal` is now
   unused. Only NORMALS changed vs the old path; geometry is identical.
-- **Surface column cache (T1.a)** (`FSurfaceColumnCache` = LRU of `FSurfaceColumnBox`, `GetDensityAt`
-  SurfaceWorld branch): the heightfield + sky-cap + biome blend are a PURE function of (XY, seed,
+- **Surface column cache (T1.a)** (density path: the surface stack's `FSurfaceColumnSource` memo;
+  `ClassifyTile`: `FSurfaceColumnCache` = LRU of `FSurfaceColumnBox`): the heightfield + sky-cap + biome blend are a PURE function of (XY, seed,
   strate) — **ZERO Z dependence** (climate/Voronoi are pure-XY; surface params are per-strate constant
   under Hard transitions) — yet sampled ~33× per column (once per Z grid-point). Cached per integer XY
-  (box-valid, like the SDF cache) and reused down the column. **Keyed by (XY box, StrateKey, Seed), NOT
-  ChunkZ** (`StrateKey = round(StrateBottomWorldZ)`, taken from the params so it can't disagree with
-  them) and held as a small **LRU of 6 boxes** so the WHOLE vertical view-distance stack — and XY
+  (box-valid, like the SDF cache) and reused down the column. **Keyed by XY box + strate identity + seed
+  (plus layout version / params fingerprint), NOT ChunkZ** (the strate identity is derived from
+  `StrateBottomWorldZ`, taken from the params so it can't disagree with them) and held as a small **LRU of 6 boxes** so the WHOLE vertical view-distance stack — and XY
   neighbours the scheduler interleaves — share one another's heavy column noise instead of each
   recomputing it ~once per vertical chunk (this was the dominant `GenerateMesh` cost: the same 2D
   heightfield recomputed per altitude). It also makes pure-air / pure-solid chunks cheap (they hit the
@@ -764,28 +764,14 @@ driven by `EditorBrush*` props.
   inside a strate band), then the OUTERMOST shell keeps generating tiles outward until it covers
   the requested distance (`VF_OuterShell`, shared by `BuildDesiredTiles` and `IsTileInClipRange`
   so the cull sees the same horizon; the ring's dz sweep is pre-clamped to the vertical strate
-  band). As MC tiles the ring cost grows with (distance/2^MaxClipLevel)² — which is why the ring
-  defaults to **F18 SHEETS** (`bFarSheetRing`): in an open strate the far field is exactly two
-  heightfields (TerrainZ + CeilSurf, per-column oracle), so the ring streams tiles at level
-  `MaxClipLevel + FarSheetSpanLevels` (one sheet = 2^span MC footprints per axis → 4-16× fewer
-  components) meshed by `GenerateSheetMesh` as two displaced grids — ground polygroup 0 / cap
-  polygroup 1, tags true by construction, same materials/UVs/F6 masks, ~3-6× cheaper gen per
-  area than band-cut MC. **XY hole**: a partially-covered sheet renders its whole footprint, so
-  the MC-covered box around the player (level-MaxClipLevel box, shrunk 1 tile for a seam-overlap
-  ring) is CUT out of the sheet at cell granularity (`SheetHole*Vox`, passed to
-  `GenerateSheetMesh`); when the player crosses a MaxClipLevel tile the hole moves and the
-  overlapping sheets re-queue via `BandRemeshQueue` — the shrink means the newly-cut area's MC
-  tiles were already desired one crossing earlier (loaded before uncovered). Sheet tiles take
-  the strate from the BAND (mid chunk): band unarmed
-  (inter-strate gap) ⇒ empty ring until landing; non-open strates ⇒ empty sheets (their far
-  ring was enclosed rock anyway); carved features (passages/spine/chasms/diff) don't show at
-  sheet distance — the MC shells keep them near. (A "step cap" variant — raising CoarseTileCells
-  per level so far levels keep a fine Step — was tried and rejected 2026-07-06.)
+  band). The ring is made of level-MaxClipLevel MC tiles, so its cost grows with
+  (distance/2^MaxClipLevel)². The far "sheet" ring (heightfield tiles past `MaxClipLevel`) was
+  dropped by the owner's decision; it no longer exists in the selector or the settings.
+  (A "step cap" variant — raising CoarseTileCells per level so far levels keep a fine Step — was
+  tried and rejected 2026-07-06.)
   Trade-offs accepted: other strates simply don't render at far LOD (they're sealed/enclosed —
   invisible except through passage mouths, which read as dark holes); passage tubes crossing the gap
   are cut at coarse levels only (near levels mesh full).
-  `GetLODForChunk` / `LODToStep` / `IsChunkInRange` / `GetStrateChunkZBounds` and the
-  ViewDistance/LOD/strate-Z/ceiling settings are now DEAD/unused (left in place).
 - **SKIRTS — LOD-seam crack filler** (`GenerateMesh`, after the cell loop; `VoxelSettings::bGenerateSkirts`
   + `SkirtCells`, wired onto the mesher at setup). Neighbouring shells mesh at different resolutions so
   their iso-surfaces don't meet along the shared face → a thin see-through crack. After meshing, every
@@ -818,9 +804,8 @@ driven by `EditorBrush*` props.
   drain; `VoxelSettings::MaxUnloadsPerFrame`): the cull APPROVES removals (strict load-before-unload) but
   doesn't destroy in place — it queues them. `ProcessUnloadQueue` runs at most `MaxUnloadsPerFrame`
   `UnloadTile`s/frame (scaled up to 4× with backlog, capped so a huge backlog can't re-spike). WHY: a
-  fast traversal culls a whole shell's worth of tiles in ONE frame, and each `UnloadTile` does
-  `DestroyComponent` + (level 0) `ContentManager::ClearChunk` → `Destroy()` of every decoration actor —
-  an unbudgeted burst = a game-thread spike ("stuff torn down behind you" at speed). Mesh APPLIES were
+  fast traversal culls a whole shell's worth of tiles in ONE frame, and each `UnloadTile` strips and
+  parks its component (T2.c pool) — an unbudgeted burst = a game-thread spike ("stuff torn down behind you" at speed). Mesh APPLIES were
   already budgeted; this matches it for DESTROYS. Re-desired tiles are cancelled out of the queue (still
   loaded → no reload). `PendingUnload` is cleared in `RegenerateAllChunks`/`EndPlay` (tiles already gone).
 - **Collision only at LEVEL 0** (`ApplyMeshToTile`): `UpdateSectionConfig(..., Tile.Level==0)`. Far tiles
@@ -833,7 +818,7 @@ driven by `EditorBrush*` props.
   = 0; `=1` restores it as an A/B instrument). Measured on the headless game path with nested
   refinement off, the classifier plus its exact validation cost more than they saved. Mode 0 had
   ready p95 182 vs 190-195 ms, generation p95 125-127 vs 139-141 ms, and 18% fewer density calls,
-  with 841/841 tiles triangle-identical (WORK-NEXT.md). Proving a 33³ core uniform costs almost
+  with 841/841 tiles triangle-identical (Docs/archive/WORK-NEXT.md). Proving a 33³ core uniform costs almost
   as much as meshing 35³. The history below explains why it existed. Its soundness tests still
   guard it.
 - **Trivial-empty tile reject (T1.d) — v2 SHIPPED (2026-07-05); v1 was reverted 2026-06-26.**
@@ -844,9 +829,11 @@ driven by `EditorBrush*` props.
   wasted) and gen throughput had become the felt gameplay limit ("standing waiting for generation").
   **Why v1 failed & how v2 avoids it:** v1 used a GLOBAL analytic ceiling bound — not conservative when
   the cap hangs low (`CeilingRoughness`/`RidgeStrength`) → holes in the roof. v2 makes NO amplitude
-  guesses: it evaluates `ComputeSurfaceColumn` (the SAME function as the density path, via the SHARED
-  `GSurfColCache`) **on the exact lattice the mesher would sample** (margin ring included) — same
-  functions + same inputs ⇒ the same floats ⇒ the verdict is exact at the lattice, not an estimate.
+  guesses: it evaluates `ComputeSurfaceColumn` (cached per thread in `GSurfColCache`) — the column
+  the surface stack's height operators reproduce (ground height pinned bit for bit by
+  `VoxelForge.OpStack.SurfaceHeightEquivalence`) — **on the exact lattice the mesher would sample**
+  (margin ring included) — same inputs ⇒ the same floats ⇒ the verdict is exact at the lattice, not
+  an estimate.
   Per-z rules: gap chunk = solid; surface seal band (ApplyBoundarySeal inequalities, `BaseDensity>0`)
   = solid; surface interior z: air ⇔ `TerrainZ ≤ z ≤ CeilSurf` (MC `D ≥ 0`); ANY other archetype /
   out-of-layout chunkZ ⇒ `Mixed` (cave interiors are not provable in v1 of this classifier — a future
@@ -860,7 +847,7 @@ driven by `EditorBrush*` props.
   A false `Mixed` only costs CPU; the code must NEVER emit a false AllSolid/AllAir (that's a hole).
   Capture tiles (`bWantCapture`, density-volume shadow window) always generate — the volume wants the
   grid even for uniform cells. A sparse ~5×5 column pre-pass exits Mixed fast on surface-crossing
-  tiles; a Mixed verdict leaves its columns warm in `GSurfColCache` for the GenerateMesh that follows.
+  tiles; the columns stay warm in `GSurfColCache` for the full pass and for neighbouring tiles.
 - **Worker-built StreamSet (T1.f)** (`BuildTileStreamSet`, `LoadTile` task → `FChunkResult::Streams`):
   the RMC vertex/index buffers (`FRealtimeMeshStreamSet`) are built ON THE GEN WORKER, not on the game
   thread. The per-vertex builder loop was the dominant game-thread streaming cost (measured: game
@@ -981,9 +968,9 @@ change *anything*, e.g. frequencies, which scalar multipliers couldn't.)
 - **Consumption — SURFACE (output-blend).** Per chunk, `CP_SurfaceBiomeParams[]` holds each biome's
   resolved surface params (its override when `bOverrideTerrain` + GeneratorType matches, else the
   strate's) with **structural fields forced from the strate** (Z bounds, seal, base density, water
-  level). Per voxel: `ResolveBiomeSampleAt` → dominant `PD` (+ neighbour `PN`); `GetSurfaceDensity`
-  computes `ComputeSurfaceTerrainZ` for `PD` and, in the border band, for `PN`, and **lerps the
-  resulting HEIGHTS**. Blending heights (not params) is seamless across *any* difference (frequencies
+  level). Per voxel: `ResolveBiomeSampleAt` → dominant `PD` (+ neighbour `PN`); the surface stack's
+  biome-blend height source (and `ComputeSurfaceColumn`) computes the terrain height for `PD` and, in
+  the border band, for `PN`, and **lerps the resulting HEIGHTS**. Blending heights (not params) is seamless across *any* difference (frequencies
   included) — what per-param blend never could. `PD==PN`, weight 0 ⇒ bit-identical, no biomes.
 - **Consumption — CAVES: structural overrides are NOT applied (determinism).** Rooms/tunnels are
   decided over a wide COLLECT region spanning chunks (§8.4); making room params vary by region would
@@ -1117,7 +1104,7 @@ pending).** `AVoxelWorld::RegisterStreamingAnchor(Actor, Policy, RadiusChunks)` 
 (BlueprintCallable) add an actor to `StreamingAnchors`. `UpdateChunksAroundPosition` prunes dead anchors +
 detects chunk crossings (rebuilds the desired set when any anchor crosses a level-0 boundary — same cadence
 as player movement, coalesced into one rebuild). `AddAnchorDesiredTiles` (inside `BuildDesiredTiles`, after
-the player clipmap + sheet ring) folds each anchor's Chebyshev box of **level-0** tiles into the SAME
+the player clipmap) folds each anchor's Chebyshev box of **level-0** tiles into the SAME
 `DesiredStamped`/`DesiredSorted` set (deduped vs the clipmap by stamp) → the existing delta cull releases an
 anchor's tiles automatically when it moves away / unregisters. Zero cost when no anchors (empty loop). The box
 defaults to a THIN shape (its chunk + 1 horizontal ring + 1 chunk below for ground safety, nothing above —

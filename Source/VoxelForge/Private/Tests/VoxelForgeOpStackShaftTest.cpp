@@ -1,21 +1,15 @@
 // VoxelForgeOpStackShaftTest.cpp
-// VerticalShafts — le portage qui teste la RÉUTILISATION et le contrat de l'opérateur courant.
-// VerticalShafts — the port that tests REUSE and the current operator contract.
+// VerticalShafts — la RÉUTILISATION d'opérateurs et le contrat de la pile.
+// VerticalShafts — operator REUSE and the stack's contract.
 //
-// CE QUE CELUI-CI PROUVE EN PLUS DES AUTRES
-// Les portages précédents demandaient « la décomposition reproduit-elle l'original ? ». Celui-ci
-// demande **« les opérateurs se RÉUTILISENT-ils vraiment entre archétypes ? »**, qui est la thèse
-// de `OPSTACK-PLAN §2.5` et la seule raison de faire ce refactor plutôt que de nettoyer le `switch`.
+// Trois des cinq opérateurs de VerticalShafts sont ceux de Maze, repris tels quels :
+// `ConstantRock`, `SdfRoughness`, `SdfCarve` — mêmes ops, autre source et autres réglages
+// (fréquence 0.1 au lieu de 0.12, fenêtre `rough + 4` au lieu de `R + rough + 2`). C'est la thèse
+// de `OPSTACK-PLAN §2.5` : les opérateurs se réutilisent entre archétypes.
 //
-// Trois des cinq opérateurs de VerticalShafts sont ceux de Maze, **repris sans une ligne de
-// changement** : `ConstantRock`, `SdfRoughness`, `SdfCarve`. Dans le `switch`, `GetMazeDensity` et
-// `GetVerticalShaftDensity` sont deux fonctions de ~100 lignes qui n'ont rien en commun à l'œil.
-// En opérateurs, ce sont les mêmes trois ops avec une source différente et d'autres réglages
-// (fréquence 0.1 au lieu de 0.12, fenêtre `rough + 4` au lieu de `R + rough + 2`).
-//
-// The direct helper remains useful migration telemetry, but it is not the owner path after the
-// structural-post split. The assertions below target the operator stack actually used in-game:
-// current channel count/order, feature liveness, cache isolation and box-proof soundness.
+// Three of the five VerticalShafts ops are Maze's, reused unchanged. The assertions below target
+// the stack used in-game: channel count/order, feature liveness, window invariance, cache cost and
+// box-proof soundness.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -93,8 +87,8 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
 
     if (P.StrateTopWorldZ - P.StrateBottomWorldZ <= 0.0f)
     {
-        AddError(TEXT("The VerticalShafts strate has degenerate Z bounds, which sends ")
-                 TEXT("GetVerticalShaftDensity down its early-out. The op stack has none by design."));
+        AddError(TEXT("The VerticalShafts strate has degenerate Z bounds; GetDensityAt builds no ")
+                 TEXT("stack for it. The op stack has no degenerate-strate early-out by design."));
         return false;
     }
 
@@ -128,49 +122,17 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
     }
 
     //=========================================================================
-    // 1. CURRENT-OWNER DIAGNOSTIC
-    // GetVerticalShaftDensity is the retired direct path. Its delta is reported so a future
-    // port can be audited, but it is not an owner-path failure: the game evaluates Stack plus
-    // the common MC tail.
+    // 1. LIVENESS — des échantillons tombent dans l'air des puits / samples land in shaft air
     //=========================================================================
-    int32 NumDiff = 0, NumSideDisagree = 0, WorstIdx = -1, NumInsideShaft = 0;
-    float WorstDelta = 0.0f;
-
+    int32 NumInsideShaft = 0;
     for (int32 i = 0; i < NumShaftSamples; ++i)
     {
         const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
-
-        const float Old = Gen->GetVerticalShaftDensity(X, Y, Z, P);
-        const float New = EvalStackMCForTest(Stack, X, Y, Z);
-
-        if (Old >= 0.0f) { ++NumInsideShaft; }   // air ⇒ dans un puits/connecteur/étagère
-
-        if (!BitEqual(Old, New))
-        {
-            ++NumDiff;
-            const float D = FMath::Abs(Old - New);
-            if (D > WorstDelta) { WorstDelta = D; WorstIdx = i; }
-        }
-        if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
+        // air ⇒ dans un puits/connecteur/étagère / air ⇒ inside a shaft, connector or ledge
+        if (EvalStackMCForTest(Stack, X, Y, Z) >= 0.0f) { ++NumInsideShaft; }
     }
-
-    if (NumDiff == 0)
-    {
-        AddInfo(FString::Printf(
-            TEXT("VerticalShafts: bit-identical across %d samples (%d of them inside a shaft, so ")
-            TEXT("the cylinders, connectors, roughness, carve and ledges were all exercised). ")
-            TEXT("THREE of the five ops here are Maze's, reused unchanged -- operator reuse across ")
-            TEXT("archetypes is now measured rather than intended (OPSTACK-PLAN 2.5)."),
-            NumShaftSamples, NumInsideShaft));
-    }
-    AddInfo(FString::Printf(
-        TEXT("VerticalShafts legacy diagnostic: %d of %d samples differ (largest |delta| %.9g at "
-             "(%.0f, %.0f, %.0f)); %d cross the isosurface; %d samples are air in the stack."),
-        NumDiff, NumShaftSamples, WorstDelta,
-        WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-        WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-        WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
-        NumSideDisagree, NumInsideShaft));
+    AddInfo(FString::Printf(TEXT("VerticalShafts: %d of %d samples are air in the stack."),
+                            NumInsideShaft, NumShaftSamples));
     TestTrue(TEXT("shaft feature sampling exercised the operator stack"), NumInsideShaft > 0);
 
     if (NumInsideShaft == 0)
@@ -268,14 +230,14 @@ bool FVoxelForgeOpStackShaftTest::RunTest(const FString& Parameters)
             const int32 CellY = (i / 16) - 8;
             LastX = (static_cast<float>(CellX) + 0.37f) * PerfSpacing;
             LastY = (static_cast<float>(CellY) + 0.61f) * PerfSpacing;
-            Sink += Gen->GetVerticalShaftDensity(LastX, LastY, PerfZ, P);
+            Sink += EvalStackMCForTest(Stack, LastX, LastY, PerfZ);
         }
         const double RebuildSeconds = FPlatformTime::Seconds() - RebuildStart;
 
         const double HotStart = FPlatformTime::Seconds();
         for (int32 i = 0; i < NumHotSamples; ++i)
         {
-            Sink += Gen->GetVerticalShaftDensity(LastX, LastY, PerfZ, P);
+            Sink += EvalStackMCForTest(Stack, LastX, LastY, PerfZ);
         }
         const double HotSeconds = FPlatformTime::Seconds() - HotStart;
 

@@ -262,7 +262,7 @@ bool FVoxelForgeComposerStructureRollTest::RunTest(const FString& Parameters)
     }
 
     FTestWorld World;
-    World.Build(1337, 2, true);
+    World.Build(1337, 2);
     if (!World.IsValid())
     {
         AddError(World.WhyInvalid());

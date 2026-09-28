@@ -411,14 +411,4 @@ namespace VoxelGenLOD
         Density = Before;
     }
 
-    /** Compare a scalar proof input such as EvaluateModifierSDF without changing the field. */
-    FORCEINLINE void CompareSkippedPostValue(
-        float Candidate, float Canonical,
-        ETilePostComparisonKind Kind = ETilePostComparisonKind::Other)
-    {
-        if (bTilePostReachDebug && !bTilePostReachBypass)
-        {
-            RecordSkippedPostComparison(Kind, !SameFloatBits(Candidate, Canonical));
-        }
-    }
 }

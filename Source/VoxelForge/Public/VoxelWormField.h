@@ -17,14 +17,6 @@ namespace VoxelWormField
     };
 
     /** Evaluate the exact two-noise field, retaining the N1 threshold short-circuit. */
-    VOXELFORGE_API float EvaluateExact(
-        float WorldX,
-        float WorldY,
-        float WorldZ,
-        float Threshold,
-        const FParameters& Parameters);
-
-    /** Evaluate the exact two-noise field. */
     VOXELFORGE_API float Evaluate(
         float WorldX,
         float WorldY,

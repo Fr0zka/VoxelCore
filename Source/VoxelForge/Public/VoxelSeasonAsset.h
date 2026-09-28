@@ -32,7 +32,6 @@ public:
     int32 GetSeasonSeed() const { return SeasonSeed; }
     float GetOriginSpineRadius() const { return OriginSpineRadius; }
     float GetWorldRadiusVoxels() const { return WorldRadiusVoxels; }
-    const FString& GetManifestContentHash() const { return ManifestContentHash; }
 
     /** Create the asset in Content Browser, choose a JSON file, then press this button. */
     UFUNCTION(CallInEditor, Category = "Season")

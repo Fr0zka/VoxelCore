@@ -90,9 +90,8 @@ bool FVoxelForgeOpStackChannelTest::RunTest(const FString& Parameters)
         TestTrue(*FString::Printf(TEXT("%s shipping stack has a legal channel DAG"), Name), bValid);
     };
 
-    // These are the eight builders currently shipped behind bUseOperatorStack. Keep the
-    // archetype list explicit so adding a builder without adding its validator assertion is
-    // visible in this test.
+    // These are the eight shipped archetype builders. Keep the archetype list explicit so adding
+    // a builder without adding its validator assertion is visible in this test.
     int32 MidChunkZ = 0;
 
     if (MidChunkForSlot(FTestWorld::SlotTunnelNetwork, TEXT("TunnelNetwork"), MidChunkZ))

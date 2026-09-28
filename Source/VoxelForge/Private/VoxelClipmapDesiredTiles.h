@@ -9,8 +9,6 @@ namespace VoxelClipmapDesiredTiles
         int32 ClipRadius = 3;
         int32 MaxClipLevel = 4;
         int32 RenderDistanceChunks = 0;
-        bool bFarSheetRing = true;
-        int32 FarSheetSpanLevels = 2;
     };
 
     FORCEINLINE int32 FloorDiv(int32 Value, int32 Divisor)
@@ -60,12 +58,6 @@ namespace VoxelClipmapDesiredTiles
     {
         OutLevel = MaxLevel;
         OutRadius = OuterShellRadius(Parameters, Radius, MaxLevel);
-        if (Parameters.bFarSheetRing && OutRadius > Radius)
-        {
-            OutLevel = MaxLevel + FMath::Clamp(Parameters.FarSheetSpanLevels, 1, 4);
-            OutRadius = FMath::Max(1,
-                (Parameters.RenderDistanceChunks + (1 << OutLevel) - 1) >> OutLevel);
-        }
     }
 
     FORCEINLINE void ResolveVerticalBounds(
@@ -97,37 +89,21 @@ namespace VoxelClipmapDesiredTiles
         const int32 Radius = FMath::Max(1, Parameters.ClipRadius);
         const int32 MaxLevel = FMath::Clamp(Parameters.MaxClipLevel, 0, 8);
         const int32 OuterRadius = OuterShellRadius(Parameters, Radius, MaxLevel);
-        int32 SheetLevel = MaxLevel;
-        int32 SheetRadius = OuterRadius;
-        OuterShell(Parameters, Radius, MaxLevel, SheetLevel, SheetRadius);
-        const bool bSheetRing = SheetLevel > MaxLevel;
-        const int32 MaxMCRingLevel = bSheetRing ? SheetLevel - 1 : MaxLevel;
         FIntVector PreviousRingMin = FIntVector::ZeroValue;
         FIntVector PreviousRingMax = FIntVector::ZeroValue;
-        FIntVector MCRingMin = FIntVector::ZeroValue;
-        FIntVector MCRingMax = FIntVector::ZeroValue;
 
-        for (int32 Level = 0; Level <= MaxMCRingLevel; ++Level)
+        for (int32 Level = 0; Level <= MaxLevel; ++Level)
         {
             const int32 Pow = 1 << Level;
             const FIntVector CenterLevel = FloorDiv(Center, Pow);
-            const int32 LevelRadius = (Level == MaxLevel && !bSheetRing)
-                ? OuterRadius : Radius;
+            const int32 LevelRadius = (Level == MaxLevel) ? OuterRadius : Radius;
 
             // Every finer shell must end on a complete child-pair boundary so a coarser tile is
-            // either wholly inside it or wholly outside it. The final MC ring uses the sheet's
-            // grouping width when a sheet ring follows it; otherwise the ordinary LOD boundary
-            // only needs pair alignment.
-            const int32 RingAlignment = Level < MaxMCRingLevel
-                ? 2
-                : (bSheetRing ? (1 << (SheetLevel - MaxMCRingLevel)) : 1);
+            // either wholly inside it or wholly outside it. The outermost ring has no coarser
+            // neighbour and needs no alignment.
+            const int32 RingAlignment = Level < MaxLevel ? 2 : 1;
             FIntVector RingMin, RingMax;
             AlignedRingBounds(CenterLevel, LevelRadius, RingAlignment, RingMin, RingMax);
-            if (Level == MaxMCRingLevel)
-            {
-                MCRingMin = RingMin;
-                MCRingMax = RingMax;
-            }
 
             int32 DeltaZMin = RingMin.Z - CenterLevel.Z;
             int32 DeltaZMax = RingMax.Z - CenterLevel.Z;
@@ -171,49 +147,6 @@ namespace VoxelClipmapDesiredTiles
 
             PreviousRingMin = RingMin;
             PreviousRingMax = RingMax;
-        }
-
-        if (bSheetRing)
-        {
-            const int32 SheetPow = 1 << SheetLevel;
-            const FIntVector CenterSheet = FloorDiv(Center, SheetPow);
-            const int32 LevelDelta = SheetLevel - MaxMCRingLevel;
-            const int32 MCPerSheet = 1 << LevelDelta;
-
-            int32 DeltaZMin = -SheetRadius;
-            int32 DeltaZMax = SheetRadius;
-            if (MinChunkZ != MIN_int32)
-            {
-                DeltaZMin = FMath::Max(DeltaZMin,
-                    FloorDiv(MinChunkZ, SheetPow) - CenterSheet.Z);
-                DeltaZMax = FMath::Min(DeltaZMax,
-                    FloorDiv(MaxChunkZ, SheetPow) - CenterSheet.Z);
-            }
-
-            for (int32 DeltaZ = DeltaZMin; DeltaZ <= DeltaZMax; ++DeltaZ)
-            for (int32 DeltaY = -SheetRadius; DeltaY <= SheetRadius; ++DeltaY)
-            for (int32 DeltaX = -SheetRadius; DeltaX <= SheetRadius; ++DeltaX)
-            {
-                const FIntVector Tile = CenterSheet + FIntVector(DeltaX, DeltaY, DeltaZ);
-                const int32 TileMinZ = Tile.Z << SheetLevel;
-                const int32 TileMaxZ = ((Tile.Z + 1) << SheetLevel) - 1;
-                if (TileMaxZ < MinChunkZ || TileMinZ > MaxChunkZ)
-                {
-                    continue;
-                }
-
-                const bool bCovered =
-                    (Tile.X * MCPerSheet >= MCRingMin.X)
-                    && ((Tile.X + 1) * MCPerSheet - 1 <= MCRingMax.X)
-                    && (Tile.Y * MCPerSheet >= MCRingMin.Y)
-                    && ((Tile.Y + 1) * MCPerSheet - 1 <= MCRingMax.Y)
-                    && (Tile.Z * MCPerSheet >= MCRingMin.Z)
-                    && ((Tile.Z + 1) * MCPerSheet - 1 <= MCRingMax.Z);
-                if (!bCovered)
-                {
-                    OutTiles.Emplace(Tile, SheetLevel);
-                }
-            }
         }
     }
 }

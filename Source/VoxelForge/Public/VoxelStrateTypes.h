@@ -207,7 +207,7 @@ enum class ECaveGeneratorType : uint8
  * is defined on the UPPER strate's definition and controls the boundary between
  * itself and the strate below it.
  *
- * Gradient:    Smooth linear interpolation of generation params across BlendChunks.
+ * Gradient:    Smooth linear interpolation of generation params across TransitionBlendChunks.
  *              This is the classic approach — no seam visible, but also no dramatic
  *              geological feature at the boundary. Best for similar-looking strates.
  *
@@ -228,7 +228,7 @@ UENUM(BlueprintType)
 enum class EVoxelStrateTransition : uint8
 {
     // Smooth linear interpolation of all generation params across the blend zone.
-    // No visible boundary — params change gradually over BlendChunks distance.
+    // No visible boundary — params change gradually over TransitionBlendChunks distance.
     Gradient    UMETA(DisplayName = "Gradient (smooth blend)"),
 
     // No blending — params switch instantly at the boundary.
@@ -2256,7 +2256,7 @@ enum class ELandmarkAnchor : uint8
 
 /**
  * FStrateLandmark — a RARE, deliberately-placed object: mini-suns, ruins, shrines, monuments (§8.5, F7).
- * The one placement primitive for "notable things you navigate by" (set-pieces folded in here 2026-07-06).
+ * The one placement primitive for "notable things you navigate by" (set-pieces included).
  *
  * This is the right primitive for things like the underground "mini-suns" (in-lore light sources): one
  * object per ~`SpacingChunks` lattice cell, so the work scales with how MANY landmarks are in range

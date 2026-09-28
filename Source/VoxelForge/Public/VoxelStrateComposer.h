@@ -594,11 +594,6 @@ public:
         const FString& PromotedStorePath = FString(),
         const IVoxelStratePromotionVerifier* PromotionVerifier = nullptr);
 
-    /**
-     * Compatibility alias retained for callers compiled against the first Tier 4a pass. The
-     * settings argument is audited only for diagnostics; it is not a corpus input.
-     */
-    bool LoadFromSettings(const UVoxelSettings* Settings, FString& OutReport);
     bool LoadFromDefinitions(const TArray<UVoxelStrateDefinition*>& Definitions, FString& OutReport);
 
     /** Add an already-resolved vector, primarily for offline tools and focused tests. */
@@ -625,7 +620,6 @@ public:
     int32 Num() const { return Entries.Num(); }
     const TArray<FVoxelStrateCorpusEntry>& GetEntries() const { return Entries; }
     const TArray<FVoxelStrateFieldSpread>& GetFieldSpreads() const { return FieldSpreads; }
-    const TArray<FString>& GetSkippedDefinitions() const { return SkippedDefinitions; }
 
     int32 NumForArchetype(ECaveGeneratorType Archetype) const;
     int32 NumForProvenance(EVoxelStrateCorpusProvenance Provenance) const;
@@ -803,10 +797,6 @@ VOXELFORGE_API FString VF_FormatStrateStructureRecipe(const FVoxelOpStackRecipe&
 VOXELFORGE_API uint32 VF_HashStrateStructureRecipe(const FVoxelOpStackRecipe& Recipe);
 VOXELFORGE_API bool VF_AreStrateStructureRecipesIdentical(
     const FVoxelOpStackRecipe& A, const FVoxelOpStackRecipe& B);
-
-/** The compact API requested by the composer design. */
-VOXELFORGE_API FStrateGenerationParams VF_RollStrateParams(
-    const FVoxelStrateCorpus& Corpus, int32 Seed, int32 Index);
 
 /** Bitwise comparison over exactly the fields in FStrateGenerationParams::Lerp. */
 VOXELFORGE_API bool VF_AreStrateParamsBitIdentical(

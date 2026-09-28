@@ -45,10 +45,6 @@ namespace VoxelPassageGeometry
     // ownership band: the floor writer owns the plane, while the air writer owns the capsule
     // volume above it even when two overlapping passage projections differ by a fraction.
     constexpr float WalkableTunnelFloorAirClearanceVoxels = 0.5f;
-    // The graph-tunnel post owns the interior above its floor after terrain and passage-floor
-    // writers have run. The support-floor predicate is also an exclusion mask for the air post,
-    // so overlapping graph tubes cannot erase one another's walkable support band.
-    constexpr float CaveTunnelAirCoreInsetVoxels = 0.5f;
 
     // A 15 degree ramp is comfortably below the 44 degree engine walkability ceiling.  The
     // latter is a scramble limit, not a sensible default for a tunnel the player walks through.

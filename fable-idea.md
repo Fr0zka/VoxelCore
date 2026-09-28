@@ -1,14 +1,16 @@
 # fable-idea.md — performance & feature ideas
 
-*Fable 5, max-effort pass — 2026-06-09. Grounded in a read of the actual code (mesher, apply path, task launch, content manager), not generic advice. Companion to CODEMAP.md §8 — nothing here is implemented; it's a menu.*
-
-*Note: the strict-whitelist `.gitignore` will ignore this file. Add `!fable-idea.md` if you want it tracked.*
+*Fable 5, max-effort pass — 2026-06-09. Grounded in a read of the actual code (mesher, apply path, task launch, content manager), not generic advice. Companion to CODEMAP.md §8. Items marked ✅ are implemented (evidence inline); everything else is still a menu.*
 
 ---
 
 ## Part I — Performance
 
-### 0. Measure before anything (half a session, directs everything else)
+### 0. Measure before anything (half a session, directs everything else) — ✅ DONE
+
+*Evidence:* `stat VoxelForge` group (`Public/VoxelStats.h`, `STATGROUP_VoxelForge` tile-classification/meshing
+counters) and Insights scopes around the stages (`VoxelForge_GenerateMesh`, `VoxelForge_BuildStreams`,
+`VoxelForge_ApplyMeshToChunk`, `VoxelForge_Tick` and its sub-steps).
 
 Add `TRACE_CPUPROFILER_EVENT_SCOPE` around the four stages of a chunk (density grid sample / MC loop / normals / RMC stream build+upload) plus a `stat VoxelForge` group: chunks pending, applies this frame, avg gen ms, verts/chunk. One Unreal Insights capture then tells us if we're density-bound (my bet) or upload-bound, and every item below gets a before/after number. Cheap insurance against optimizing the wrong thing.
 
@@ -30,8 +32,9 @@ So: normals can cost as much as the entire density grid; a SurfaceWorld chunk do
 
 ### Tier 1 — high win / low risk / small-medium effort (do these first)
 
-> **STATUS 2026-07-05: Tier 1 COMPLETE.** T1.a ✅ (surface-column cache, now file-scope `GSurfColCache`);
-> T1.b ✅ (grid-based normals — the old per-vertex `ComputeGradientNormal` trio is gone from the mesher);
+> **STATUS 2026-07-05: Tier 1 COMPLETE.** T1.a ✅ (surface-column cache; since cleanup/2026-09 the density
+> path's copy is the surface stack's `FSurfaceColumnSource` memo and `GSurfColCache` serves `ClassifyTile` only);
+> T1.b ✅ (grid-based normals inline in `GenerateMesh`);
 > T1.c ✅ (`bShouldCreateCollision` = level 0 only, VoxelWorld.cpp ApplyMeshToTile); T1.d ✅ (v2
 > `ClassifyTile`, trace-verified −44 % worker CPU); T1.e ✅ (`MaxMeshAppliesPerFrame`, default 4);
 > T1.f ✅ (`BuildTileStreamSet` runs in the gen task; apply only uploads).
@@ -46,7 +49,7 @@ So: normals can cost as much as the entire density grid; a SurfaceWorld chunk do
 
 **T1.d — Chunk classification: skip trivially solid/air chunks before sampling.** ✅ DONE 2026-07-05
 ⛔ **Turned OFF in streaming 2026-09-13.** After the operator stack, it cost more than it saved on the
-game path (WORK-NEXT.md A/B). Do not re-propose tile classification without a design that is
+game path (Docs/archive/WORK-NEXT.md A/B). Do not re-propose tile classification without a design that is
 cheaper than meshing the tile.
 (v2 — `UVoxelGenerator::ClassifyTile`, see ARCHITECTURE §8.10; a 2026-06-26 v1 with a global ceiling
 bound was reverted for roof holes. Trigger: trace showed 84 % of GenerateMesh calls produced empty
@@ -106,7 +109,7 @@ the Surface|Macro knobs live, then extend with a top-view passage-path overlay (
 **F2 — Determinism validator button.** ✅ DONE 2026-07-04 (`AVoxelWorld::ValidateDeterminism`,
 Live Edit category). CallInEditor: sample a band of densities from two different chunk-window alignments, diff, report max delta. Turns the scariest invariant (§8.4 — window invariance) into a one-click regression test *before* biome code starts landing.
 
-**F3 — `stat VoxelForge` + Insights scopes.** Same as Perf §0 — listed here because it's also the tool that tells us when a feature regressed something.
+**F3 — `stat VoxelForge` + Insights scopes. ✅ DONE** (see Perf §0 for the evidence). Same as Perf §0 — listed here because it's also the tool that tells us when a feature regressed something.
 
 ### B. The "this becomes a game" features
 
@@ -116,9 +119,15 @@ Live Edit category). CallInEditor: sample a band of densities from two different
 `ResolveBiomeSampleAt` / `FBiomeContext`, VoxelGenerator.cpp §biomes; deco borders follow the
 Voronoi field).** Original sketch (kept for the cave-biome extension): Deterministic XY biome map = warped Voronoi/cellular cells (seeded, window-invariant by construction, same family as the relief map — and relief M should be an *input*: mountain biomes live where M is high). Resolution rules to protect §8.10: resolve **per chunk** (dominant biome + ≤2 neighbors + blend weights, stored in the thread-local chunk cache); per **voxel** blend only a handful of scalars (height offset, roughness, terrace, water tint index). Per biome: a *content profile* — decoration set, atmosphere/audio override, material palette index, water level offset. Archetype transitions stay Hard; biomes vary *within* SurfaceWorld first, cave-biomes (crystal/fungal/ice) reuse the identical pattern later.
 
-**F6 — Material identity: vertex-data masks + triplanar palette material.** Geometry variety without *surface* variety still reads samey. At mesh time, pack per-vertex: slope (from the T1.b normal), relative height, biome/material index (from F5) into vertex color channels. One master material: triplanar rock/grass/sand/snow layers selected & blended by those masks + a macro-variation texture. This is the single biggest *visual* multiplier available and it's mostly material-graph work.
+**F6 — Material identity: vertex-data masks + triplanar palette material. ✅ DONE (Stage 1)** — the mesher
+writes per-vertex masks into `FVoxelMeshData::Colors` (R = dominant biome palette, G = slope, B = border blend,
+A = neighbour palette; `VoxelMarchingCubesMesher.cpp`), fed by `UVoxelBiomeDefinition::MaterialPaletteIndex`
+(ARCHITECTURE §8.15). Original note: Geometry variety without *surface* variety still reads samey. At mesh time, pack per-vertex: slope (from the T1.b normal), relative height, biome/material index (from F5) into vertex color channels. One master material: triplanar rock/grass/sand/snow layers selected & blended by those masks + a macro-variation texture. This is the single biggest *visual* multiplier available and it's mostly material-graph work.
 
-**F7 — POI / set-piece system.** Noise terrain everywhere = beautiful nowhere. Deterministic destinations: chunk-hash-placed stamps (composed SDF carves/fills + a decoration prefab + optional ambient actor), e.g. buried shrines, crystal gardens at passage mouths, ruins on mesas. Placement uses the same two-region COLLECT discipline as rooms (§8.4). Destinations are what turn wandering into stories ("found a shrine at −400 m").
+**F7 — POI / set-piece system. ◐ PARTLY DONE** — the placement side is built: `FStrateLandmark` with
+`AnchorMode` (HashLattice / PassageMouth), exclusion and set-pieces folded in, `FTerrainCondition` aware
+placement, and `FDecoCompanion` satellites (ARCHITECTURE §8.5). Not built: composed SDF carve/fill stamps.
+Original note: Noise terrain everywhere = beautiful nowhere. Deterministic destinations: chunk-hash-placed stamps (composed SDF carves/fills + a decoration prefab + optional ambient actor), e.g. buried shrines, crystal gardens at passage mouths, ruins on mesas. Placement uses the same two-region COLLECT discipline as rooms (§8.4). Destinations are what turn wandering into stories ("found a shrine at −400 m").
 
 **F8 — Ore veins / diggable resources.** The game's verb is digging; give digging a reward loop. A secondary material-id field (cheap 3D noise threshold, per-strate/biome tables with depth curves) evaluated **only at mesh vertices** (≈ free) → vertex color → material shows veins; on carve, query the field at the brush center → grant resource. No per-voxel density cost, fully deterministic.
 
@@ -126,27 +135,10 @@ Voronoi field).** Original sketch (kept for the cave-biome extension): Determini
 
 **F17 — Generator surface-class tag (ceiling/ground/cave material the *right* way). ✅ DONE 2026-07-05** (per-vertex semantic class in the mesher — down-facing verts query a memoized `GetSurfaceHeightAt`, nearer CeilSurf ⇒ sky-cap — per-tri majority → two contiguous polygroup runs → RMC section per group, slot 1 = `CeilingMaterial`, per-section shadow. Trigger: the whole-tile normal vote painted mixed coarse tiles with one material. Cave-roof discrimination hook is in place: down-facing below TerrainZ ⇒ ground/rock. Remaining polish idea: fully sideways cap-fold tris (all 3 verts |N.Z|≤0.1) default to ground.) Original design note: ★ do this when caves land. Today `ApplyMeshToTile` picks one material per tile from a ceiling test — first a height-oracle sample (midpoint), now a worker-side **normal vote** over the tile's mesh normals (down-facing ⇒ `bIsCeiling` ⇒ `CeilingMaterial` + no shadow; gated to SurfaceWorld by one `GetSurfaceHeightAt` probe). That's a **stopgap that only works because down-facing == sky-cap *while no caves exist*.** The moment a mountain-biome cave uses the same density/mesh system, its roof is also down-facing and would wrongly get the sky-cap material — orientation can't tell a cave ceiling from a surface ceiling. **The discriminator is semantic, not geometric, and only the generator knows it:** a sky-cap surface is the `ComputeSurfaceCeiling` (`CeilSurf`) boundary; a cave ceiling is a 3D-noise **carve** below `TerrainZ`. Cheap test the generator already has the inputs for — at a down-facing surface vertex, compare world Z to the column's `TerrainZ`/`CeilSurf` (both from the surface-column cache the mesher already holds): near `CeilSurf` ⇒ sky-cap, below `TerrainZ` ⇒ cave. **Plan:** stamp a discrete *surface class* (ground / sky-cap / cave-ceiling / cave-wall…) per vertex/triangle **at mesh time** in the mesher → carry it as the **polygroup** (already enabled, `Builder.EnablePolyGroups()`, every tri currently group 0) → `ApplyMeshToTile` maps polygroup → material slot (slot 0 terrain, slot 1 sky-cap, slot 2 cave-rock, biome-specific via the F5 palette mask) and sets per-section shadow. Discrete "which material" → polygroup/slot; continuous masks (biome blend, slope — F6) stay in `Colors`. This **subsumes** the current ground/ceiling split (it falls out as a special case), fixes the coarse mixed-tile horizon artifact exactly (per-triangle, not per-tile dominant-wins), and is the only version that survives caves. Pairs naturally with F5/F6/F8 (all want generator-stamped per-vertex material identity). Cost: a per-tri classify in the mesher (cheap, has the cache) + multi-slot setup in the apply path (RMC supports it; confirm the v5 per-section `UpdateSectionConfig` / slot-per-polygroup calls + empty-polygroup = no draw). Until then: the normal vote is fine — it's commented as "no caves yet → down == cap."
 
-**F18 — Far-field per-surface SHEETS (the render-distance ring, cheap). ✅ BUILT & WORKING 2026-07-06**
-(marker ticked 2026-07-27). With `RenderDistanceChunks` the
-outermost ring can reach many km — as MC tiles that's 600-1000 primitives paying per-frame visibility/VSM
-forever, and each far tile runs full 3D marching cubes just to rediscover two heightfields. In an open
-strate the far field IS two heightfields the generator already computes per column (`GetSurfaceHeightAt`:
-TerrainZ + CeilSurf). So: the extended ring streams SHEET tiles instead (level `MaxClipLevel +
-FarSheetSpanLevels`, so one sheet covers 4-16 MC-tile footprints) and the mesher builds each as two
-regular displaced grids — ground sheet (polygroup 0) + sky-cap sheet (polygroup 1), tags true **by
-construction** (no vote, no classify probes), same materials/UVs/biome color masks as MC, normals from
-the height gradient, perimeter skirts per bucket. Gen ~3-6× cheaper per area than band-cut MC; primitives
-~10-16× fewer. Caveats accepted: SurfaceWorld only (non-open strates produce empty sheets — their far
-ring was invisible rock anyway; FloatingIslands has no far ring beyond MaxClipLevel), carved features
-(passages/spine/chasms) don't show at sheet distance, sheets need the strate band armed (in the
-inter-strate gap the far ring blanks until you land). Streaming: sheet ring in `BuildDesiredTiles`
-(covered-check vs the MaxClipLevel box), `IsTileInClipRange` shares the same outer shell,
-`LoadTile` routes `Level > MaxClipLevel` to `GenerateSheetMesh`. **Build-1 fix (XY hole):** a
-partially-covered sheet rendered its *whole* footprint, overlaying the near LOD0-1 terrain with its
-coarse sampling. So the MC-covered box around the player (level-MaxClipLevel box, shrunk 1 tile for a
-seam-overlap ring) is cut from sheets at cell granularity (`AVoxelWorld::SheetHole*Vox` → `GenerateSheetMesh`
-hole args; hole moves on a MaxClipLevel-tile crossing → overlapping sheets re-queue via `BandRemeshQueue`;
-hole-edge cells emit no skirt).
+**F18 — Far-field per-surface SHEETS. ⛔ REMOVED (owner decision, 2026-09 cleanup).** Built 2026-07-06 as a
+render-distance ring of heightfield "sheet" tiles past `MaxClipLevel` (meshed by `GenerateSheetMesh`); the
+runtime path, its settings and the selector's sheet branch are deleted; the render-distance ring is plain
+level-`MaxClipLevel` MC tiles (ARCHITECTURE §8.10).
 
 **F19 — AI navigation & agents (function-based). PARKED (no NPCs yet); FOUNDATION BUILT 2026-07-07.**
 Mobs need two things the world didn't give them: (1) to *exist* away from the local player, (2) to *route*.
@@ -169,7 +161,7 @@ Mobs need two things the world didn't give them: (1) to *exist* away from the lo
   mandatory. AI is server-authoritative (§9.6). ★ Build when NPCs actually land.
 
 **F20 — Biome-selected surface terrain ops (terrace / cliff / layer-lines / overhang / spike / hole). SPEC 2026-07-07.**
-Terrain ops are cave-only today (per-room in `GetDensityWithParams`; `GetSurfaceDensity` applies NONE — that's
+Terrain ops were cave-only at the time (per-room in `GetDensityWithParams`; the SurfaceWorld density applied NONE — that's
 the "ops don't work on the surface" report). This brings them to the SURFACE, as a **biome** property,
 **conditioned on local terrain** so they read geological instead of random. (Slots in ahead of the later
 cave-system redo, which will add biome support cave-side reusing this same op→biome model.)
@@ -214,7 +206,7 @@ fade with slope ⇒ seamless at biome borders; placement hashes are pure `(seed,
 "ops finally work on the surface" win; **(2)** overhang (3D band, slope-conditioned); **(3)** spike/hole (placed +
 shortlist + ClassifyTile guard) — most cost, do last.
 
-**PHASE 1 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
+**PHASE 1 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `Docs/archive/AUDIT-2026-07.md §0`). Heightfield ops shipped: **Cliff** (slope-gated STEEPENING —
 push height from the local mean where steep ⇒ sheer walls; the slope-conditioned one, hugs steep terrain;
 v1 band-snap was too subtle, reformulated to steepening after Jahni's "doesn't change much"), **Terrace** (relief-gated plateau quantize, now with
 `TerraceHardness` soft-round↔crisp-mesa), **LayerLines** (sedimentary sine shelves, slope-expressed). *Design
@@ -228,10 +220,10 @@ selection AND seamless border blending come for FREE with zero new resolution pa
 ops (fine — biome-differentiated terrain already implies that), and a strate can also carry ops with no biomes at
 all (more flexible than biome-only). All fields default OFF ⇒ current world byte-identical. Applied in the single
 height oracle `ComputeSurfaceTerrainZ` (new `SampleSurfaceStructuralZ` helper = pre-op raw height, re-sampled at
-an XY offset for Cliff's slope) so MC/sheets/ClassifyTile/deco/BP-bridge all agree, no T1.d interference. Revisit
+an XY offset for Cliff's slope) so MC/ClassifyTile/deco/BP-bridge all agree, no T1.d interference. Revisit
 the array+condition model for **phase 2 (overhangs)** where per-entry slope-gating earns its keep.
 
-**PHASE 2 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `AUDIT-2026-07.md §0`). Overhang (first VOLUMETRIC op) as
+**PHASE 2 — ✅ BUILT & WORKING** (built 2026-07-08; marker ticked 2026-07-27 — confirmed working by Jahni 2026-07-26, see `Docs/archive/AUDIT-2026-07.md §0`). Overhang (first VOLUMETRIC op) as
 `FSurfaceGenerationParams` fields (`OverhangStrength/Reach/Height/Frequency/ZScale/SlopeThreshold`, default
 off). **Design NOTE — v1 additive-noise-band was WRONG (Jahni: "does nothing" + sketch of a real cliff lip):
 band-additive noise can only bump the surface where it already is, never make rock jut OUT over a void.**
@@ -267,11 +259,11 @@ Multiplayer — **NO LONGER just "deferred": it's the confirmed direction (liste
 
 ## Suggested order (if it were mine to pick)
 
-1. **Perf 0 + T1.c + T1.a + T1.b** — one focused session: measurement, the one-line collision win, the two big density cuts.
-2. **T1.e + T1.f + F16** — smooth the game thread (apply budget, worker-side streams, HISM props).
-3. **F1 preview tool + F2 validator** — before biome work starts, build the instruments.
-4. **F5 biomes + F6 materials** — the look of the game. (F9 audio rides along cheaply.)
-5. **F4 save/load** — the moment it feels like a game, players will want to keep one.
-6. **F7 POIs + F8 ores** — destinations and rewards.
-7. **T2.a SIMD noise** — after content direction settles (it changes seeds), before world-size ambitions grow.
-8. **Transvoxel** (already chosen) whenever LOD cracks become the loudest remaining flaw.
+1. ✅ **Perf 0 + T1.c + T1.a + T1.b** — one focused session: measurement, the one-line collision win, the two big density cuts.
+2. ✅ **T1.e + T1.f + F16** — smooth the game thread (apply budget, worker-side streams, HISM props).
+3. ✅ **F1 preview tool + F2 validator** — before biome work starts, build the instruments.
+4. ✅ **F5 biomes + F6 materials** — the look of the game. (F9 audio: not built.)
+5. **F4 save/load** — the moment it feels like a game, players will want to keep one. *(open)*
+6. **F7 POIs + F8 ores** — destinations and rewards. *(F7 placement built, stamps open; F8 open)*
+7. ✅ **T2.a SIMD noise** — after content direction settles (it changes seeds), before world-size ambitions grow.
+8. **Transvoxel** (already chosen) whenever LOD cracks become the loudest remaining flaw. *(open — skirts fill LOD cracks today)*

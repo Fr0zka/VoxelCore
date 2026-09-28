@@ -203,15 +203,12 @@ namespace VoxelMath
 // Pourquoi 32 ? Puissance de 2 → astuces bit à bit + bon alignement GPU.
 // VOXEL_SIZE = 25 cm/voxel (Unreal travaille en centimètres). 1 chunk = 8 m.
 //
-// NOTE: 64³ a été essayé ("B", 2026-06-16) pour couper les draw calls (8× moins de
-// chunks) mais le streaming devenait trop saccadé (briques 8× plus lourdes → applies
-// + spawns de contenu en gros à-coups sur le game thread). Reverté à 32³ : le fps se
-// règle côté RENDU (ombres off sur LOD lointain, voir ApplyMeshToChunk), pas via la
-// taille de chunk. La taille de chunk reste le levier streaming-vs-draws si besoin.
+// NOTE: 64³ coupe les draw calls (8× moins de chunks) mais rend le streaming trop
+// saccadé (briques 8× plus lourdes → applies + spawns de contenu en gros à-coups sur
+// le game thread). Le fps se règle côté RENDU (ombres off sur LOD lointain, voir
+// ApplyMeshToChunk), pas via la taille de chunk. La taille de chunk reste le levier streaming-vs-draws si besoin.
 
-constexpr int32 CHUNK_SIZE         = 32;
-constexpr int32 CHUNK_SIZE_SQUARED = CHUNK_SIZE * CHUNK_SIZE;     // 1024
-constexpr int32 CHUNK_VOLUME       = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 32768
+constexpr int32 CHUNK_SIZE = 32;
 
 constexpr float VOXEL_SIZE = 25.0f;
 
@@ -276,26 +273,6 @@ enum class EVoxelFace : uint8
     NegativeZ,  // Down  (-Z)
 };
 
-inline FIntVector GetFaceDirection(EVoxelFace Face)
-{
-    switch (Face)
-    {
-        case EVoxelFace::PositiveX: return FIntVector( 1,  0,  0);
-        case EVoxelFace::NegativeX: return FIntVector(-1,  0,  0);
-        case EVoxelFace::PositiveY: return FIntVector( 0,  1,  0);
-        case EVoxelFace::NegativeY: return FIntVector( 0, -1,  0);
-        case EVoxelFace::PositiveZ: return FIntVector( 0,  0,  1);
-        case EVoxelFace::NegativeZ: return FIntVector( 0,  0, -1);
-        default:                    return FIntVector( 0,  0,  0);
-    }
-}
-
-inline FVector GetFaceNormal(EVoxelFace Face)
-{
-    const FIntVector Dir = GetFaceDirection(Face);
-    return FVector(Dir.X, Dir.Y, Dir.Z);
-}
-
 //=============================================================================
 // COORDINATE CONVERSION
 //=============================================================================
@@ -317,53 +294,6 @@ inline FIntVector WorldToChunkCoord(const FVector& WorldPos)
         FMath::FloorToInt((WorldPos.Y / VOXEL_SIZE) / CHUNK_SIZE),
         FMath::FloorToInt((WorldPos.Z / VOXEL_SIZE) / CHUNK_SIZE)
     );
-}
-
-inline FIntVector WorldToLocalCoord(const FVector& WorldPos)
-{
-    // ((x % n) + n) % n → modulo positif même pour x négatif.
-    //   (-5 % 32) = -5 en C++, mais on veut 27.
-    return FIntVector(
-        ((FMath::FloorToInt(WorldPos.X / VOXEL_SIZE) % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
-        ((FMath::FloorToInt(WorldPos.Y / VOXEL_SIZE) % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
-        ((FMath::FloorToInt(WorldPos.Z / VOXEL_SIZE) % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
-    );
-}
-
-inline FVector ChunkToWorldPos(const FIntVector& ChunkCoord)
-{
-    return FVector(
-        ChunkCoord.X * CHUNK_SIZE * VOXEL_SIZE,
-        ChunkCoord.Y * CHUNK_SIZE * VOXEL_SIZE,
-        ChunkCoord.Z * CHUNK_SIZE * VOXEL_SIZE
-    );
-}
-
-// Index 3D → 1D pour un tableau plat (voir doc CLAUDE.md: "x + y*SizeX + z*SizeX*SizeY").
-inline int32 LocalToIndex(int32 X, int32 Y, int32 Z)
-{
-    return X + (Y * CHUNK_SIZE) + (Z * CHUNK_SIZE_SQUARED);
-}
-
-inline FIntVector IndexToLocal(int32 Index)
-{
-    return FIntVector(
-        Index % CHUNK_SIZE,
-        (Index / CHUNK_SIZE) % CHUNK_SIZE,
-        Index / CHUNK_SIZE_SQUARED
-    );
-}
-
-inline bool IsValidLocalCoord(int32 X, int32 Y, int32 Z)
-{
-    return X >= 0 && X < CHUNK_SIZE
-        && Y >= 0 && Y < CHUNK_SIZE
-        && Z >= 0 && Z < CHUNK_SIZE;
-}
-
-inline bool IsValidLocalCoord(const FIntVector& Coord)
-{
-    return IsValidLocalCoord(Coord.X, Coord.Y, Coord.Z);
 }
 
 //=============================================================================

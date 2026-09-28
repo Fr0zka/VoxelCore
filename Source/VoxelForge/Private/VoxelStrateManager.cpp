@@ -2,7 +2,6 @@
 // Runtime strate layout generation and queries.
 
 #include "VoxelStrateManager.h"
-#include "CoreGlobals.h"  // GIsAutomationTesting — the opt-in diagnostic stays quiet under tests
 #include "VoxelSettings.h"
 #include "VoxelSeasonAsset.h"
 #include "VoxelTypes.h"  // For CHUNK_SIZE, VOXEL_SIZE, WorldToChunkCoord
@@ -234,8 +233,8 @@ namespace
 {
     // One projection result per passage is enough for the current voxel sample.  The surrounding
     // passage cache already moves with (manager, layout, chunk); a generation invalidates old flags
-    // before any caller can observe them.  Keeping the entries indexed by passage avoids the TMap
-    // rehash path that this hot loop used to carry, while a collision-free hit remains exact.
+    // before any caller can observe them.  Keeping the entries indexed by passage avoids a TMap
+    // rehash path in this hot loop, while a collision-free hit remains exact.
     struct FPassageFloorProjectionCacheEntry
     {
         // The sample key lives once in FPassageEvaluationCache.  A monotonically increasing
@@ -1334,7 +1333,6 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             }
 
             Slot.Definition->GeneratorType = SeasonStrate.Archetype;
-            Slot.Definition->bUseOperatorStack = SeasonStrate.bUsesRecipe;
             Slot.Definition->StrateHeightInChunks = SeasonStrate.HeightInChunks;
             Slot.Definition->GenerationParams = SeasonStrate.Params.TunnelNetworkParams;
             Slot.Definition->SlabParams = SeasonStrate.Params.SlabParams;
@@ -1401,10 +1399,9 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
                 : FString::Printf(TEXT("Value_%d"), static_cast<int32>(Slot.Definition->GeneratorType));
             VoxelForgeStartupTrace::RecordEvent(TEXT("strate_slot"), FString::Printf(
                 TEXT("\"index\":%d,\"definition\":\"%s\",\"archetype\":\"%s\",\"top_chunk_z\":%d,"
-                     "\"bottom_chunk_z\":%d,\"height_chunks\":%d,\"operator_stack\":%d"),
+                     "\"bottom_chunk_z\":%d,\"height_chunks\":%d"),
                 Slot.StrateIndex, *DefinitionPath, *ArchetypeName,
-                Slot.TopChunkZ, Slot.BottomChunkZ, Slot.HeightInChunks,
-                Slot.Definition->bUseOperatorStack ? 1 : 0));
+                Slot.TopChunkZ, Slot.BottomChunkZ, Slot.HeightInChunks));
         }
 
         UE_LOG(LogTemp, Log, TEXT("[StrateManager] Strate %d: '%s' | Z chunks [%d to %d] | %d chunks tall"),
@@ -1413,79 +1410,6 @@ bool UVoxelStrateManager::Initialize(UVoxelSettings* Settings, int32 WorldSeed)
             Slot.TopChunkZ,
             Slot.BottomChunkZ,
             Slot.HeightInChunks);
-    }
-
-    // Diagnostic de configuration, une seule fois par construction de layout. SurfaceWorld est
-    // volontairement exclu : son chemin T1.d exact-lattice ne dépend pas de ce drapeau.
-    // Configuration diagnostic once per layout build. SurfaceWorld is deliberately excluded:
-    // its exact-lattice T1.d path does not depend on this flag.
-    int32 NumCaveSlots = 0;
-    int32 NumOperatorStackDisabledCaves = 0;
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        const ECaveGeneratorType SlotArchetype = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
-        if (!Slot.Definition || SlotArchetype == ECaveGeneratorType::SurfaceWorld)
-        {
-            continue;
-        }
-
-        ++NumCaveSlots;
-        const bool bUsesStack = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].bUsesRecipe : Slot.Definition->bUseOperatorStack;
-        if (!bUsesStack)
-        {
-            ++NumOperatorStackDisabledCaves;
-        }
-    }
-
-    // ⚠️ WARNING EN ÉDITEUR/JEU, JAMAIS EN TEST. Les tests `Determinism.*` construisent
-    // DÉLIBÉRÉMENT un monde non opt-in — c'est leur oracle de comparaison — et le framework
-    // d'automatisation compte un Warning comme un échec. Un diagnostic ne doit pas casser la suite
-    // qu'il est censé éclairer. Le message reste écrit UNE fois : seule la verbosité change.
-    // Warning in editor/game where it is actionable, never in tests: the Determinism.* tests build
-    // a non-opted-in world ON PURPOSE as their comparison oracle, and the automation framework
-    // treats a Warning as a failure. One message, two verbosities.
-    const bool bQuietDiagnostic = GIsAutomationTesting;
-
-    if (NumOperatorStackDisabledCaves > 0)
-    {
-        const FString Summary = FString::Printf(
-            TEXT("[StrateManager] Operator-stack opt-in: %d/%d cave layout slots have Use Operator Stack disabled. These slots cannot use operator-stack ClassifyBox/T1.d; enable the asset setting on the listed definitions if that is intended."),
-            NumOperatorStackDisabledCaves, NumCaveSlots);
-
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Summary); }
-        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Summary); }
-    }
-    else
-    {
-        UE_LOG(LogTemp, Log,
-            TEXT("[StrateManager] Operator-stack opt-in: all %d cave layout slots have Use Operator Stack enabled."),
-            NumCaveSlots);
-    }
-
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        const bool bSeasonStack = bUseSeason
-            && SeasonStrates[Slot.StrateIndex].bUsesRecipe;
-        const ECaveGeneratorType SlotArchetype = bUseSeason
-            ? SeasonStrates[Slot.StrateIndex].Archetype : Slot.Definition->GeneratorType;
-        if (!Slot.Definition
-            || SlotArchetype == ECaveGeneratorType::SurfaceWorld
-            || (bUseSeason ? bSeasonStack : Slot.Definition->bUseOperatorStack))
-        {
-            continue;
-        }
-
-        const FString Line = FString::Printf(
-            TEXT("[StrateManager]   cave slot=%d name='%s' Z chunks=[%d to %d] bUseOperatorStack=false"),
-            Slot.StrateIndex,
-            *Slot.Definition->StrateName.ToString(),
-            Slot.TopChunkZ,
-            Slot.BottomChunkZ);
-
-        if (bQuietDiagnostic) { UE_LOG(LogTemp, Verbose, TEXT("%s"), *Line); }
-        else                  { UE_LOG(LogTemp, Warning, TEXT("%s"), *Line); }
     }
 
     CachedSeed = WorldSeed;
@@ -1804,13 +1728,13 @@ void UVoxelStrateManager::GeneratePassages()
         case ECaveGeneratorType::TunnelNetwork:
         case ECaveGeneratorType::Underwater:
             // Une salle est une CIBLE ÉPARSE en XY, exactement comme un couloir de labyrinthe : le
-            // budget doit donc être réel. Zéro ici était un bug — la requête trouvait la salle la
-            // plus proche puis atterrissait à côté d'elle dans 92,8 % des cas (balayage d'un million
-            // de seeds). Un espacement de salles est le voisinage local naturel.
+            // budget doit donc être réel. Zéro ici est un bug — la requête trouve la salle la plus
+            // proche puis atterrit à côté d'elle dans 92,8 % des cas (balayage d'un million de
+            // seeds). Un espacement de salles est le voisinage local naturel.
             //
             // A room is an XY-SPARSE target, exactly like a maze corridor, so the budget must be
-            // real. Zero here was the bug: the query found the nearest room and then landed beside
-            // it 92.8% of the time (million-seed sweep). One room spacing is the natural local
+            // real. Zero here is a bug: the query finds the nearest room and then lands beside it
+            // 92.8% of the time (million-seed sweep). One room spacing is the natural local
             // neighbourhood, and it protects the configured spine-distance distribution.
             return FMath::Max(Definition.GenerationParams.RoomSpacing, 1.0f);
 
@@ -2771,9 +2695,9 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     {
         const FVoxelPassage& P = PassageData[PIdx];
         // BOUNDING-SPHERE REJECT: skip passages this voxel can't possibly be inside.
-        // EvaluateModifierSDF runs PER VOXEL and used to evaluate every passage's full
-        // capsule chain unconditionally — the dominant lag source once passages became
-        // 12-segment worms. Now far passages cost a single squared-distance compare.
+        // EvaluateModifierSDF runs PER VOXEL; evaluating every passage's full capsule chain
+        // unconditionally is the dominant lag source with 12-segment worm passages. Far
+        // passages cost a single squared-distance compare.
         if (FVector::DistSquared(Pos, P.BoundCenter) > P.BoundRadiusSq) continue;
         if (VoxelDensityProfile::AreCountersEnabled())
         {
@@ -3023,20 +2947,6 @@ void UVoxelStrateManager::ApplyPassageLandingAir(
     VF_ApplyPassageLandingCarving(Density, MinLandingSDF, BaseDensity, SealThickness);
 }
 
-void UVoxelStrateManager::ApplyPassageLandingAirMC(
-    float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness) const
-{
-    // ApplyDisturbances is deliberately an MC-space post-process and can add a bridge or ridge
-    // on top of the structural passage. Reassert only landing air here; the support slab is
-    // restored by ApplyPassageLandingFloorMC immediately afterwards. This stays on the same
-    // thread-local passage shortlist as the hot voxel path and performs no source/topology work.
-    float InternalDensity = -Density;
-    ApplyPassageLandingAir(
-        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
-    Density = -InternalDensity;
-}
-
 void UVoxelStrateManager::ApplyPassageTunnelAir(
     float& Density, float WorldX, float WorldY, float WorldZ,
     float BaseDensity, float SealThickness) const
@@ -3068,18 +2978,6 @@ void UVoxelStrateManager::ApplyPassageTunnelAir(
         const float AirTarget = -(BaseDensity * 2.0f + SealThickness + 4.0f);
         Density = FMath::Min(Density, AirTarget);
     }
-}
-
-void UVoxelStrateManager::ApplyPassageTunnelAirMC(
-    float& Density, float WorldX, float WorldY, float WorldZ,
-    float BaseDensity, float SealThickness) const
-{
-    // The disturbance layer uses MC polarity (negative = solid), so reuse the exact internal
-    // tunnel-air operation rather than maintaining a second polarity-specific formula.
-    float InternalDensity = -Density;
-    ApplyPassageTunnelAir(
-        InternalDensity, WorldX, WorldY, WorldZ, BaseDensity, SealThickness);
-    Density = -InternalDensity;
 }
 
 void UVoxelStrateManager::ApplyPassageLandingFloorMC(
@@ -3280,8 +3178,8 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         }
     }
 
-    // The graph tunnel no longer exposes a separate support slab.  Inter-strate landing carving
-    // remains independent and is still composed here when its own reach proof allows it.
+    // The graph tunnel does not expose a separate support slab.  Inter-strate landing carving
+    // is independent and is composed here when its own reach proof allows it.
     if (!bDisableLandingPosts
         && !bAnyLandingFloor && !bLegacyTunnelSupportFloor && MinLandingSDF < FLT_MAX)
     {
@@ -4799,7 +4697,7 @@ bool UVoxelStrateManager::AnyPassageAirPostNearLattice(
 
     // The union above is conservative but can be much smaller than the queried box. Restrict the
     // exact walk to its lattice intersection; a false positive still pays the exact predicates,
-    // while a far-away long-passage sphere no longer does.
+    // while a far-away long-passage sphere does not.
     if (!VF_LatticeAxisRange(
             FMath::Max((float)VoxelBox.Min.X, PotentialMinX),
             FMath::Min((float)VoxelBox.Max.X, PotentialMaxX),
@@ -6307,65 +6205,42 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
     const int32 SlotIdx = FindSlotIndexForChunkZ(ChunkCoord.Z);
     if (SlotIdx < 0 || !StrateLayout[SlotIdx].Definition) { return false; }
 
-    if (SeasonStrates.IsValidIndex(SlotIdx))
-    {
-        // A recipe is an explicit stack opt-in. Native fixed entries retain the authored/switch
-        // route while still reading their season parameter vector.
-        return SeasonStrates[SlotIdx].bUsesRecipe;
-    }
-
-#if WITH_EDITOR
-    if (FindComposerOverride(StrateLayout[SlotIdx].StrateIndex) != nullptr)
-    {
-        // Temporary composer candidates are measured through the stack path. Do not inherit an
-        // unrelated asset flag from the slot being replaced.
-        return true;
-    }
-#endif
-
+    // Every strate is generated by the operator stack: authored definitions, cooked-season entries
+    // (recipe or native) and editor composer candidates alike. The slot definition carries the
+    // archetype in every case.
     const UVoxelStrateDefinition* Def = StrateLayout[SlotIdx].Definition;
-    if (!Def->bUseOperatorStack) { return false; }
 
-    // LA LISTE DES ARCHÉTYPES PORTÉS — le seul endroit où elle est écrite. Un archétype non porté
-    // ignore le drapeau et retombe sur le `switch`, pour qu'on puisse cocher la case sur n'importe
-    // quelle strate sans rien casser en attendant son portage.
-    // THE PORTED-ARCHETYPE LIST, written down exactly once. An unported archetype ignores the flag
-    // and falls back to the switch, so the box can be ticked anywhere without breaking anything.
+    // LA LISTE DES ARCHÉTYPES — le seul endroit où elle est écrite.
+    // THE ARCHETYPE LIST, written down exactly once.
     switch (Def->GeneratorType)
     {
-    case ECaveGeneratorType::Maze:            return true;   // Phase 1
-    case ECaveGeneratorType::FlatPlain:                      // Phase 2 — les deux partagent
+    case ECaveGeneratorType::Maze:            return true;
+    case ECaveGeneratorType::FlatPlain:                      // les deux partagent
     case ECaveGeneratorType::CrystalChamber:  return true;   //   UNE seule pile (BuildSlabStack)
 
     case ECaveGeneratorType::SurfaceWorld:
-        // ✅ La garde « pas de biomes » est TOMBÉE (étape 2c) : le combiner `Mask` existe, donc une
-        // strate à biomes mélange bien ses hauteurs comme le chemin d'origine. Les trois archétypes
-        // du dessus plus celui-ci font 5 des 8 portés.
-        // The no-biome guard is GONE: the Mask combiner exists, so a biome strate blends its heights
+        // Pas de garde « pas de biomes » : le combiner `Mask` existe, donc une strate à biomes
+        // mélange bien ses hauteurs comme le chemin d'origine.
+        // No no-biome guard: the Mask combiner exists, so a biome strate blends its heights
         // exactly as the original path does.
         return true;
 
-    case ECaveGeneratorType::VerticalShafts:  return true;   // Phase 2 — 3 ops repris de Maze tels quels
+    case ECaveGeneratorType::VerticalShafts:  return true;   // 3 ops repris de Maze tels quels
 
     case ECaveGeneratorType::FloatingIslands:
-        // Phase 2 — la pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
+        // La pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
         // + carve, avec les MÊMES opérateurs au signe près.
         return true;
 
     case ECaveGeneratorType::Underwater:
         // ⚠️ AUCUNE PILE À ELLE : `Underwater` EST `TunnelNetwork` plus un drapeau d'eau consommé
-        // côté rendu. `GetDensityAt` les met dans le même `case`, et `WaterLevelRelative` n'est lu
+        // côté rendu. `VF_BuildOpStackForChunk` les met dans le même `case`, et `WaterLevelRelative` n'est lu
         // que par `GetWaterLevel*` de ce manager — jamais par la densité (vérifié, pas supposé).
     case ECaveGeneratorType::TunnelNetwork:
-        // Phase 2, LE DERNIER, et le plus gros : ~1080 lignes portées en trois étapes (squelette
-        // SDF → douze modificateurs de détail → override d'op par salle), 19 opérateurs, dont
-        // `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached` au lieu de les
-        // transcrire — c'est là que vit la discipline d'invariance de fenêtre d'ARCHITECTURE §8.4,
-        // et en forker une copie aurait été le pire résultat possible de ce refactor.
-        //
-        // **8 SUR 8.** Le `switch` d'archétypes a désormais un jumeau en pile d'opérateurs, opt-in
-        // par strate, chacun vérifié par un test d'équivalence bit à bit contre sa fonction
-        // d'origine. Ce qui n'est PAS fait : `ClassifyTile` n'utilise toujours pas `ClassifyBox`.
+        // Le plus gros : squelette SDF → douze modificateurs de détail → override d'op par salle,
+        // 19 opérateurs, dont `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached`
+        // au lieu de les transcrire — c'est là que vit la discipline d'invariance de fenêtre
+        // d'ARCHITECTURE §8.4 ; en forker une copie la casserait.
         return true;
 
     default:                                  return false;
@@ -6712,7 +6587,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     // Three transition styles:
     //
     //   GRADIENT (default):
-    //     Classic linear lerp of all params across BlendChunks. Smooth,
+    //     Classic linear lerp of all params across TransitionBlendChunks. Smooth,
     //     invisible boundary. Cave shape morphs gradually from one strate
     //     to the next over several chunks.
     //
@@ -6720,7 +6595,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     //     No blending at all — params switch instantly at the boundary.
     //     The abrupt change in density, room size, roughness, etc. creates
     //     a natural cliff, ledge, or visible material discontinuity.
-    //     BlendChunks is ignored (effectively 0).
+    //     TransitionBlendChunks is ignored (effectively 0).
     //
     //   INTERLEAVED:
     //     3D Perlin noise warps the effective boundary Z position per XY column.
@@ -6740,7 +6615,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
     // CHECK BOTTOM BOUNDARY (transitioning to strate below)
     //---------------------------------------------------------------------
     // DistFromBottom = how many chunks above the bottom edge of this strate.
-    // When 0, we're right at the boundary. When == BlendChunks, we're at
+    // When 0, we're right at the boundary. When == TransitionBlendChunks, we're at
     // the outer edge of the transition zone.
     int32 DistFromBottom = ChunkCoord.Z - Slot.BottomChunkZ;
 
@@ -6749,7 +6624,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
         // The upper strate (this one) controls the transition type at its lower edge
         const EVoxelStrateTransition TransType = Slot.Definition->TransitionType;
 
-        // Per-definition blend distance (overrides the manager's default BlendChunks)
+        // Per-definition blend distance.
         const int32 EffectiveBlend = Slot.Definition->TransitionBlendChunks;
 
         // Prepare the neighbor's params (only used for Gradient and Interleaved)
@@ -6929,7 +6804,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 //=============================================================================
 // Returns the definition's base GenerationParams (cave shape, SDF, roughness, etc.).
 //
-// NOTE: Terrain op fields (TerraceStepHeight, ColumnDensity, etc.) are no longer
+// NOTE: Terrain op fields (TerraceStepHeight, ColumnDensity, etc.) are not
 // merged here. They default to 0 (disabled) in the base params, and are applied
 // per-room during BuildChunkCache() via FCachedRoom::RoomOp — each room hash-rolls
 // one op from the strate's probability pool (FStrateTerrainOpEntry::Probability).
@@ -6952,93 +6827,3 @@ FStrateGenerationParams UVoxelStrateManager::BuildParamsFromDefinition(const UVo
     return Result;
 }
 
-uint64 UVoxelStrateManager::GetGenerationParamsFingerprint() const
-{
-    // The diagnostic command-line override changes density inputs without changing an asset.  Do
-    // not let a verdict from the unoverridden layout survive into an overridden session (or vice
-    // versa); a zero fingerprint conservatively disables persistence for that session.
-    const FRuntimeRoughnessOverrides& RoughnessOverrides = VF_GetRuntimeRoughnessOverrides();
-    if (RoughnessOverrides.bSurfaceRoughness
-        || RoughnessOverrides.bFrequency
-        || RoughnessOverrides.bNoiseType)
-    {
-        return 0;
-    }
-
-    // The session cache is deliberately conservative.  These inputs are valid density inputs but
-    // are not represented by the fixed-size hash below, so returning zero disables verdict reuse
-    // instead of pretending that a partial key is complete.
-    if (IsUsingSeason())
-    {
-        return 0;
-    }
-#if WITH_EDITOR
-    if (ComposerOverrides.Num() > 0)
-    {
-        return 0;
-    }
-#endif
-
-    uint32 A = 0x9E3779B9u;
-    uint32 B = 0x85EBCA6Bu;
-    auto HashBytes = [&A, &B](const void* Data, int32 Size)
-    {
-        A = FCrc::MemCrc32(Data, Size, A);
-        B = FCrc::MemCrc32(Data, Size, B ^ 0xA511E9B3u);
-    };
-    auto HashValue = [&HashBytes](const auto& Value)
-    {
-        HashBytes(&Value, sizeof(Value));
-    };
-
-    HashValue(CachedSeed);
-    HashValue(bOpenSurfaceEntry);
-    HashValue(OriginSpineRadius);
-    HashValue(InterStrateGapChunks);
-    const int32 LayoutCount = StrateLayout.Num();
-    HashValue(LayoutCount);
-
-    for (const FStrateSlot& Slot : StrateLayout)
-    {
-        if (Slot.Definition == nullptr)
-        {
-            return 0;
-        }
-
-        // BuildChunkCache resolves these arrays into the room cache.  Hashing UObject pointers or
-        // asset names would not prove the asset contents, so dynamic operation/biome layouts
-        // conservatively opt out.  The normal synthetic/runtime profile has neither array.
-        if (Slot.Definition->TerrainOperations.Num() > 0
-            || Slot.Definition->Biomes.Num() > 0)
-        {
-            return 0;
-        }
-
-        HashValue(Slot.StrateIndex);
-        HashValue(Slot.TopChunkZ);
-        HashValue(Slot.BottomChunkZ);
-        HashValue(Slot.HeightInChunks);
-        HashValue(Slot.Definition->GeneratorType);
-        HashValue(Slot.Definition->bUseOperatorStack);
-        HashValue(Slot.Definition->bEnableWorms);
-        HashValue(VF_WormsForceOff());
-        // Development-only stage ablations change the field and therefore belong in every
-        // persistent/verdict key even though they are not authored generation parameters.
-        HashValue(VoxelDensityAblation::GetResolvedMask());
-        HashValue(Slot.Definition->StrateHeightInChunks);
-        HashValue(Slot.Definition->TransitionType);
-        HashValue(Slot.Definition->TransitionBlendChunks);
-        HashValue(Slot.Definition->GenerationParams);
-        HashValue(Slot.Definition->SlabParams);
-        HashValue(Slot.Definition->MazeParams);
-        HashValue(Slot.Definition->SurfaceParams);
-        HashValue(Slot.Definition->VerticalShaftParams);
-        HashValue(Slot.Definition->FloatingIslandParams);
-        HashValue(Slot.Definition->PassageConfig);
-        HashValue(Slot.Definition->bHasWater);
-        HashValue(Slot.Definition->BiomeMapParams);
-    }
-
-    const uint64 Result = (static_cast<uint64>(B) << 32) | static_cast<uint64>(A);
-    return Result != 0 ? Result : 1;
-}

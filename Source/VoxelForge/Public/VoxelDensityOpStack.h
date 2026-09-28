@@ -2,34 +2,21 @@
 // La PILE : un conteneur ordonné d'opérateurs, plus les fabriques d'opérateurs concrets.
 // The STACK: an ordered container of operators, plus the concrete-operator factories.
 //
-// ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN (depuis OPSTACK-PLAN §4, Phase 1, point 3).
-// `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
-// UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
-// strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés :
+// ⚠️ CECI EST LE CHEMIN DE GÉNÉRATION DU JEU.
+// `UVoxelGenerator::GetDensityAt` construit la pile par chunk pour chaque strate :
 // **Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork,
-// Underwater (8 sur 8)**.
-// Toute autre strate passe encore par le `switch`, inchangé.
-// `ClassifyTile` est branché pour les archétypes de cave opt-in : il construit la même pile et
-// plie `ClassifyBox`; les gaps et SurfaceWorld gardent leurs preuves exactes dédiées.
+// Underwater (8 sur 8)**. `ClassifyTile` construit la même pile pour les archétypes de cave et plie
+// `ClassifyBox`; les gaps et SurfaceWorld gardent leurs preuves exactes dédiées.
 //
-// THIS FEEDS THE GAME, BUT ONLY BEHIND AN OPT-IN. GetDensityAt builds the stack per chunk and
-// evaluates it instead of the switch only when UsesOperatorStackForChunk returns true (strate ticked
-// bUseOperatorStack AND its archetype is ported — all 8). ClassifyTile uses the same stack for cave
-// archetypes; gaps and SurfaceWorld retain their exact hand-written proofs.
-//
-// ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde.
-// ⚠️ EN REVANCHE, LES COMPARER EST DEVENU LÉGITIME — cette ligne disait l'inverse et elle est
-// périmée. `AUDIT §C10` (le résidu ~1 ULP) est CLOS depuis `FPSemantics = Precise` : les cinq tests
-// d'équivalence comparent bit à bit et sont verts. Ils ne sont plus des contrôles de FIDÉLITÉ (la
-// barre `§2.6.1` n'exige aucune ressemblance avec l'ancien monde) mais des oracles de
-// CORRECTION DE PORTAGE — une faute de transcription reste un vrai bug, et l'ancienne fonction est
-// le moyen le moins cher de l'attraper.
+// THIS IS THE GAME'S GENERATION PATH. GetDensityAt builds the stack per chunk for every strate.
+// ClassifyTile uses the same stack for cave archetypes; gaps and SurfaceWorld retain their exact
+// hand-written proofs.
 //
 // POURQUOI CETTE FORME / WHY THIS SHAPE
-// La question à laquelle la Phase 1 doit répondre n'est pas « est-ce que ça marche ? » mais
+// La question à laquelle cette forme répond n'est pas « est-ce que ça marche ? » mais
 // **« est-ce que la séparation source / modifier tombe naturellement du code existant ? »**
-// (OPSTACK-PLAN §4, le déclencheur d'arrêt). En portant Maze hors du chemin chaud et en le
-// comparant à l'original, cette question reçoit une réponse MESURÉE plutôt qu'une opinion.
+// (OPSTACK-PLAN §4). Chaque archétype a été porté puis comparé bit à bit à sa fonction
+// d'origine avant qu'elle ne soit retirée : la réponse a été MESURÉE plutôt qu'une opinion.
 
 #pragma once
 
@@ -203,10 +190,10 @@ public:
         return EvalSample(WorldX, WorldY, WorldZ).Density;
     }
 
-    /** L'état COMPLET (densité + SDF) après toute la pile. Diagnostic : quand une comparaison
-     *  avec l'ancien chemin diverge, c'est le canal SDF qui dit si l'écart naît avant ou après
-     *  la conversion. / The full state after the stack — the SDF channel is what says whether a
-     *  divergence is born before or after the carve. */
+    /** L'état COMPLET (densité + SDF) après toute la pile. Diagnostic : quand deux évaluations
+     *  divergent, c'est le canal SDF qui dit si l'écart naît avant ou après la conversion.
+     *  / The full state after the stack — the SDF channel is what says whether a divergence is
+     *  born before or after the carve. */
     FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
     {
         FVoxelOpSample S;
@@ -229,11 +216,11 @@ public:
 
         // The room-graph source publishes the authored floor ownership while evaluating the
         // shape, but it must not be reasserted here.  This stack is followed by the common
-        // disturbance/passage writers; composing the floor at this point made every authored
-        // floor sample look like a post-hoc clamp (and counted 100% of them).  The generator now
+        // disturbance/passage writers; composing the floor at this point would make every authored
+        // floor sample look like a post-hoc clamp (and counted 100% of them).  The generator
         // consumes the same immutable core result after those writers and composes the floor once,
         // at the final MC boundary.  The metadata remains on the sample for that hand-off and for
-        // diagnostics, but it is no longer allowed to modify density inside the operator stack.
+        // diagnostics, but it is not allowed to modify density inside the operator stack.
         return S;
     }
 
@@ -568,12 +555,6 @@ namespace VoxelDensityOps
      *  `FillOnly` quand une colonne atteint la boîte, `Identity` (le cas courant) sinon. */
     VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeGridColumnMod(const FSlabGenerationParams& P, int32 Seed);
 
-    /** Rôle 1 — le pont entre les deux espaces : consomme les piles de HAUTEUR (sol + voûte,
-     *  `VoxelHeightOp.h`) et en fait une densité. `IsXYPure()` est **false** — les hauteurs sont
-     *  pures en XY, la densité est une distance à celles-ci et ne peut pas l'être. */
-    VOXELFORGE_API TUniquePtr<IVoxelDensityOp> MakeSurfaceColumnSource(const FSurfaceGenerationParams& P,
-                                                                       int32 Seed);
-
     /**
      * SurfaceWorld, COMPLET : colonne (sol + voûte) → densité, overhang 3D, post structurel, et le
      * mélange de biomes quand `PerBiomeParams` est non vide.
@@ -597,9 +578,8 @@ namespace VoxelDensityOps
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
      *   SlabVoidSource → GridColumnMod → [structural post ×4]
      *
-     * C'est le premier vrai gain du refactor (OPSTACK-PLAN §4) : deux des huit archétypes
-     * disparaissent dans un opérateur, et leur différence redevient ce qu'elle était déjà dans
-     * `GetSlabDensity` — un jeu de valeurs par défaut, pas du code.
+     * Deux des huit archétypes tiennent dans un opérateur (OPSTACK-PLAN §4) : leur différence est
+     * un jeu de valeurs par défaut, pas du code.
      */
     VOXELFORGE_API void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
                                        int32 Seed, float SpineRadius,
@@ -611,10 +591,8 @@ namespace VoxelDensityOps
      *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge
      *   → ShaftConnectorAir → ShaftConnectorFloor → [structural post ×4]
      *
-     * C'est la démonstration que `§2.5` promettait : dans le `switch`, Maze et VerticalShafts sont
-     * deux fonctions de ~100 lignes sans rien de commun à l'œil ; en opérateurs, ce sont les mêmes
-     * trois ops avec une source différente et d'autres réglages (fréquence 0.1 au lieu de 0.12,
-     * fenêtre `rough + 4` au lieu de `R + rough + 2`).
+     * Trois de ces ops sont ceux de Maze (`§2.5`), avec une source différente et d'autres réglages
+     * (fréquence 0.1 au lieu de 0.12, fenêtre `rough + 4` au lieu de `R + rough + 2`).
      */
     VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
                                                 int32 Seed, float SpineRadius,

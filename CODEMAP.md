@@ -54,9 +54,12 @@ A **density-field voxel terrain** plugin for Unreal Engine, built around undergr
         ▼
    UVoxelGenerator::GetDensityAt(x,y,z)        ← THE density entry point
         │ asks StrateManager which strate/params/generator-type applies
-        ├─ TunnelNetwork → GetDensityWithParams()  (rooms+tunnels+ops+worms+seal+passages)
+        ├─ builds the chunk's operator stack once per chunk (VF_BuildOpStackForChunk;
+        │   editor composer / cooked-season recipe stacks first)  → every archetype
+        │     TunnelNetwork/Underwater → fused evaluator = GetDensityWithParams()
         │       └─ VoxelCaveMorphology::BuildChunkCache + EvaluateSDFCached  (room/tunnel SDF)
-        ├─ FlatPlain / CrystalChamber → GetSlabDensity()  (floor+ceiling+columns+seal+passages)
+        │     others → FVoxelOpStack::EvalMC  (source → modifiers → structural posts)
+        ├─ + disturbances + structural tail (landing floor, tunnel core, XY seal)
         └─ + UVoxelDiffLayer::GetDensityOffset()   (player carve/fill)
         │
         ▼ FVoxelMeshData (verts/tris/uvs/normals)
@@ -118,27 +121,25 @@ remains `0`, and lateral regions remain gated off.
 | `Public/VoxelForgeModule.h` / `Private/VoxelForgeModule.cpp` | `FVoxelForgeModule` boilerplate (Startup/Shutdown just log). |
 | `Source/VoxelForgeEditor/VoxelForgeEditor.Build.cs` / `Private/VoxelForgeExploreCommandlet.*` | Editor/commandlet-only `-run=VoxelForgeExplore`; owns bounded render/`VF_` walk/OBJ export orchestration and is not linked by Game/Shipping. |
 | `Public/VoxelGeometryHash.h` | Header-only geometry digest shared by commandlet export and runtime tile-hash dump; hashes mesh counts and the vertex/normal/UV/color/triangle arrays with the historical CRC order. |
-| `Public/VoxelStats.h` / `Private/VoxelStats.cpp` | `stat VoxelForge` DWORD counters for tile classification, skipping, meshing, operator-stack verdicts, and cave-bail diagnosis. The former ambiguous `Cave Bail Not Op Stack` is split into `Sole Slot`, `Boundary Tile`, `No Layout`, and late `Recheck` counters, so each increment names one guard/context. |
+| `Public/VoxelStats.h` / `Private/VoxelStats.cpp` | `stat VoxelForge` DWORD counters for tile classification, skipping, meshing, operator-stack verdicts, and cave-bail diagnosis. Each `Cave Bail *` counter names one guard; `Cave Bail No Stack` counts slots with no buildable stack (no definition, or a degenerate strate). |
 
 ### 3.2 Foundational types — `Public/VoxelTypes.h` (no UClass, everyone includes it)
 | Symbol | Line | Notes |
 |--------|------|-------|
-| `CHUNK_SIZE` (32), `CHUNK_SIZE_SQUARED`, `CHUNK_VOLUME` | 19-21 | Chunk dimensions. (64³ tried for fewer draws → reverted: streaming too bursty. fps is fixed render-side instead.) |
-| `VOXEL_SIZE` (25.0f cm) | 23 | World scale. |
-| `EVoxelFace` enum + `GetFaceDirection` / `GetFaceNormal` | 33-61 | 6 cube faces. |
-| `WorldToChunkCoord` / `WorldToLocalCoord` / `ChunkToWorldPos` | 74-104 | Coord-space conversions (handle negatives via floor/positive-modulo). |
-| `LocalToIndex` / `IndexToLocal` / `IsValidLocalCoord` | 107-131 | Flat-array 3D↔1D indexing. |
-| `VoxelMath::IsFiniteFast` / `IsFinite` | ~24-53 | Exact IEEE bit test (`voxel.FastIsFinite` A/B switch). |
-| `VoxelMath::DetSinCos` / `DetSin` / `DetCos` | ~63-195 | **The only sin/cos allowed where the world is decided** (2026-09-16, `10fd0b6`). Fixed double period reduction and float polynomial, no CRT: `FMath::Sin/Cos` are CRT `sinf/cosf`, whose FMA3 variant is picked by CPU. Pinned by `VoxelForge.Determinism.DetSinCos`; `-voxel.CrtFma3=0` flips the CRT path to prove it. |
-| `SmoothStep01` | 140 | 3x²-2x³ — used everywhere for blends. |
-| `VOXEL_NOISE_SCALE` (1.25f) | 147 | Rescales UE PerlinNoise3D to ~[-1,1]. |
-| `EVoxelTileClass` enum (`Mixed`/`AllSolid`/`AllAir`) | — | T1.d verdict. **MOVED here from `VoxelGenerator.h` 2026-07-27** so `VoxelDensityOp.h` can share it without a UCLASS dependency. A false `AllSolid`/`AllAir` is a HOLE; a false `Mixed` only costs CPU. |
-| `FVoxelMeshData` struct | 157-173 | Mesher output (Vertices/Triangles/UVs/Normals/**Colors**). Plain C++, not USTRUCT. `Colors` = F6 material masks (R=dominant biome palette, G=slope, B=border blend weight, A=neighbour biome palette). §8.15. |
+| `CHUNK_SIZE` (32) | 211 | Chunk dimensions. 64³ would cut draw calls but makes streaming too bursty; fps is fixed render-side instead. |
+| `VOXEL_SIZE` (25.0f cm) | 213 | World scale. |
+| `EVoxelFace` enum | 266 | 6 cube faces. |
+| `WorldToChunkCoord` | 287 | World cm → chunk coord (handles negatives via floor). |
+| `VoxelMath::IsFiniteFast` / `IsFinite` | 24 / 45 | Exact IEEE bit test (`voxel.FastIsFinite` A/B switch). |
+| `VoxelMath::DetSinCos` / `DetSin` / `DetCos` | 63 / 181 / 189 | **The only sin/cos allowed where the world is decided** (2026-09-16, `10fd0b6`). Fixed double period reduction and float polynomial, no CRT: `FMath::Sin/Cos` are CRT `sinf/cosf`, whose FMA3 variant is picked by CPU. Pinned by `VoxelForge.Determinism.DetSinCos`; `-voxel.CrtFma3=0` flips the CRT path to prove it. |
+| `SmoothStep01` | 306 | 3x²-2x³ — used everywhere for blends. |
+| `VOXEL_NOISE_SCALE` (1.25f) | 313 | Rescales UE PerlinNoise3D to ~[-1,1]. |
+| `EVoxelTileClass` enum (`Mixed`/`AllSolid`/`AllAir`) | 231 | T1.d verdict. Lives here so `VoxelDensityOp.h` can share it without a UCLASS dependency. A false `AllSolid`/`AllAir` is a HOLE; a false `Mixed` only costs CPU. |
+| `FVoxelMeshData` struct | 365-391 | Mesher output (Vertices/Triangles/UVs/Normals/**Colors**). Plain C++, not USTRUCT. `Colors` = F6 material masks (R=dominant biome palette, G=slope, B=border blend weight, A=neighbour biome palette). §8.15. |
 
 ### 3.2b Density operator stack contract — `Public/VoxelDensityOp.h` (plain C++, no UHT)
-**Production path behind a per-strate opt-in** — the stack is built/evaluated by `GetDensityAt` for
-all eight archetypes when `bUseOperatorStack` is enabled, while the legacy `switch` remains the
-reference path for opt-out strates. See [OPSTACK-PLAN.md](OPSTACK-PLAN.md) for the decomposition.
+**The production density path** — `GetDensityAt` builds and evaluates a stack for every strate of
+all eight archetypes; there is no other path. See [Docs/archive/OPSTACK-PLAN.md](Docs/archive/OPSTACK-PLAN.md) for the decomposition.
 
 | Symbol | Notes |
 |--------|-------|
@@ -159,29 +160,24 @@ manager passage post, **moved here 2026-07-27** so the generator and
 the operator stack share ONE copy. The XY helper is a radial smooth ramp in actor-space and is a
 true no-op when `WorldRadiusVoxels == 0`; `VF_XYEdgeSealForcedMarginOverBox` is the shared sound
 proof for `ClassifyBox` and T1.d's global shell skip. `VoxelGenerator.cpp` keeps same-named
-`static FORCEINLINE` forwarders for the original three helpers; the new edge helper is called
-directly. **Convention: INTERNAL (positive = solid); `VF_ApplyXYEdgeSealMC` is the output wrapper.**
+`static FORCEINLINE` forwarders for `ApplyBoundarySeal` and `ApplyOriginSpine`; the passage and
+edge helpers are called directly. **Convention: INTERNAL (positive = solid); `VF_ApplyXYEdgeSealMC` is the output wrapper.**
 
 ### 3.2d Operator stack — `Public/VoxelDensityOpStack.h` + `Private/VoxelDensityOpStack.cpp`
-⚠️ **Feeds the game, behind a per-strate opt-in** (Phase 1 step 3). `GetDensityAt` builds the stack
-in its per-chunk refetch block and evaluates it *instead of* the `switch` only when
-`UVoxelStrateManager::UsesOperatorStackForChunk` says so — strate ticked `bUseOperatorStack` **and**
-archetype in the ported list, which is now **all 8 of 8**: Maze, FlatPlain, CrystalChamber,
-SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork, Underwater. A strate that has not
-ticked the box still takes the `switch`, unchanged — the flag is the only thing that switches paths.
-**`ClassifyTile` IS wired now**, for CAVE archetypes only and behind the same per-strate opt-in:
-where it used to `return Mixed` without a call, it builds the strate's stack through the *same*
-factory `GetDensityAt` uses (`VF_BuildOpStackForChunk`) and folds `ClassifyBox`. SurfaceWorld and
-bedrock gaps keep their hand-written proofs — the exact-lattice column test is better than any box
-bound. Guards, all failing to `Mixed`: one cave slot per tile, no mixed cave/surface/gap tile, the
-opt-in true on *every* chunk the box touches, the params **bit-identical** across every chunk coord
-the box touches (blended transition bands make one stack unable to represent the tile — `AUDIT §C2`),
-a 27-chunk-coord cap, and the disturbances folded in by hand since they are applied after the stack.
+⚠️ **This IS the game's generation path.** `GetDensityAt` builds the stack in its per-chunk refetch
+block for every strate — **all 8 archetypes**: Maze, FlatPlain, CrystalChamber, SurfaceWorld,
+VerticalShafts, FloatingIslands, TunnelNetwork, Underwater. An editor composer candidate or a
+cooked-season recipe supplies its own stack; otherwise (or if that stack cannot be built) the
+archetype's native stack is used. A degenerate (zero-height) strate has no stack and is open air.
+`UVoxelStrateManager::UsesOperatorStackForChunk` only says whether a slot has a known archetype.
+**`ClassifyTile`**, for CAVE archetypes, builds the strate's stack through the *same* factory
+`GetDensityAt` uses (`VF_BuildOpStackForChunk`) and folds `ClassifyBox`. SurfaceWorld and bedrock
+gaps keep their hand-written proofs — the exact-lattice column test is better than any box bound.
+Guards, all failing to `Mixed`: one cave slot per tile, no mixed cave/surface/gap tile, a stack on
+*every* chunk the box touches, the params **bit-identical** across every chunk coord the box touches
+(blended transition bands make one stack unable to represent the tile — `AUDIT §C2`), a
+27-chunk-coord cap, and the disturbances folded in by hand since they are applied after the stack.
 Brute-forced end to end by `VoxelForge.OpStack.ClassifyTileSoundness`.
-⛔ Never run both paths in one world. **Comparing them IS legitimate now** — the ~1 ULP residue of
-AUDIT §C10 is gone since `FPSemantics = Precise`, and all eight equivalence tests compare bit for
-bit. They are port-correctness oracles, not fidelity checks: the acceptance bar is §2.6.1 (same seed
-⇒ same world on every peer), which does not require resembling the pre-refactor world.
 
 | Symbol | Role | Notes |
 |--------|------|-------|
@@ -197,7 +193,7 @@ bit. They are port-correctness oracles, not fidelity checks: the acceptance bar 
 | `VoxelDensityOps::MakeSlabVoidSource` | 1 | Floor surface + ceiling surface → void field. **XY-pure** since §3.1, which is what gives it an **exact `ClassifyBox` with no sampling**: the proved FBM supremum `1.5` bounds both surfaces into known Z bands. Serves FlatPlain **and** CrystalChamber. |
 | `VoxelDensityOps::MakeGridColumnMod` | 3 | Infinite-height cylinders on a world grid, 3×3 cell memo. Adds solid only ⇒ `FillOnly` when a column reaches the box, `Identity` otherwise — and that `Identity` is what lets the source's `AllAir` verdict survive. |
 | `FShaftFieldSource` (internal) | 1 | VerticalShafts' memoised inner 3×3 shaft/capsule source. Each rebuild uses a direct-indexed wider halo (default 9×9 tree-emission / 15×15 roll) so every emitted shaft has its complete 5×5 parent window plus capsule reach; the nearest strictly more-central shaft in ±2 cells is the deterministic parent, with a deterministic lower-origin ±3 fallback and a direct `(0,0)` spine fallback. Thus every shaft has a provable path to the spine. Existing `VoxelHash::Pair`/`Spacing*1.6` links remain additive texture/loops. Tree and spine capsules use a radius strictly above `sup|FBM|=1.5`, and tree Z is chosen in a ledge-free band; the structural post still owns the column and the ledge modifier keeps its mathematical axis boundary open. The source publishes a conservative interval covering both shafts and connector capsules; it does not answer for the ledge or converter. |
-| `VoxelDensityOps::BuildSlabStack` | — | 6 ops, **no branch on archetype**: FlatPlain and CrystalChamber differ only in defaults, exactly as `GetSlabDensity` already had it. 8 archetypes → 7. |
+| `VoxelDensityOps::BuildSlabStack` | — | 6 ops, **no branch on archetype**: FlatPlain and CrystalChamber differ only in defaults. |
 | `FSurfaceColumnSource` (internal) | 1 | The bridge between the two spaces: consumes the ground + sky-cap **height** stacks and produces density. `IsXYPure()` **false** — the heights are XY-pure, a distance to them never is. Owns a **six-box spatial LRU** of direct-indexed per-column cells, keyed by `PrepareChunk` on `(StrateBottomWorldZ, LayoutVersion, Seed, ParamsFingerprint)` so it is **shared down the whole vertical strate stack**, exactly like `GSurfColCache`. Six 81×81 boxes preserve hot columns across interleaved regions at roughly 0.79 MiB TLS before padding (more memory, fewer whole-cache recenter/recompute misses). Fractional XY remains direct-compute. `FSurfaceColumn` is deliberately trivial: all five outputs are written before the cache's `Computed` publish, so removing its default initialization removes a TLS constructor leaf without changing a value. |
 | `VoxelDensityOps::BuildSurfaceStack` | — | SurfaceWorld, complete: column + overhang + 4 structural, plus biome blending when `PerBiomeParams` is non-empty. Takes ownership of an `IVoxelBiomeField`. |
 | `VoxelDensityOps::BuildVerticalShaftStack` | — | 9 ops, and **three are Maze's reused unchanged** (`ConstantRock`, `SdfRoughness`, `SdfCarve`) with different tuning (freq 0.1 vs 0.12, window `rough+4` vs `R+rough+2`). Passes the runtime spine radius into `FShaftFieldSource`, which mirrors the generator's connector-only origin endpoint and roughness-safe spine capsule. The measured proof of `OPSTACK-PLAN §2.5`'s reuse claim. |
@@ -213,7 +209,7 @@ bit. They are port-correctness oracles, not fidelity checks: the acceptance bar 
 | `FRoomGraphSource::LocalParams()` | — | **The per-room op override** (DECOMPOSITION §2's "no clean home"). Strate params + the nearest room's `UVoxelTerrainOpDefinition::ApplyTo`, memoised once per voxel and read by eleven modifiers. One op owns the shared state, the rest read it — the same pattern as `FOverhangShelfMod` ← `FSurfaceColumnSource`. The detail consumers use the propagated interval for their shared near/far gate; unknown remains conservative, and the per-room parameter override is never used to claim an unproved box identity. |
 | `FIslandBlobSource` (internal) | 1 | Hash-placed tapered flat-top blobs, `SmoothMin`'d, in a **domain-warped XY frame** (the warp stays inside the op — see the deviation note vs DECOMPOSITION §7). SDF channel only. The source publishes an interval covering the full authored radius envelope (`max(MinRadius, MaxRadius)`), the two-axis warp·**√2** envelope, top surface and SmoothMin dip; the fill converter makes its own decision. **No lower Z bound exists** — a hairline thread of matter hangs below each island down its axis, so only the TOP may reject. |
 | `VoxelDensityOps::BuildFloatingIslandStack` | — | 8 ops, and **the stack runs backwards**: void source + fill instead of rock source + carve, using the *same* classes with the opposite sign. Only the blob source is new. Reuse by **inversion** — a stronger result than reuse by identity, since it says the abstract axis (the density sign) is the right one. |
-| `VoxelDensityOps::BuildMazeStack` | — | The 8-op Maze stack (4 structural posts included). Its lattice source mirrors the origin-directed tree + capped loops and rebuilds the 2×2×2 lower-node window once per cell; the per-voxel loop only evaluates cached capsules. If this ever becomes one op, the refactor failed its own test (§2.5). Callers must skip it on a **degenerate strate** (top−bottom ≤ 0): `GetMazeDensity` early-outs to air there and the stack has no such early-out by design — `GetDensityAt` falls back to the `switch`. |
+| `VoxelDensityOps::BuildMazeStack` | — | The 8-op Maze stack (4 structural posts included). Its lattice source mirrors the origin-directed tree + capped loops and rebuilds the 2×2×2 lower-node window once per cell; the per-voxel loop only evaluates cached capsules. If this ever becomes one op, the refactor failed its own test (§2.5). Callers must skip it on a **degenerate strate** (top−bottom ≤ 0): the stack has no such early-out by design — `VF_BuildOpStackForChunk` refuses it and `GetDensityAt` returns air. |
 
 #### Lateral region parent (Tier 4d)
 
@@ -252,29 +248,30 @@ is a **column** property, or one opaque op (`OPSTACK-PLAN §2.5`'s failure mode)
 | `VoxelHeightOps::BuildSurfaceHeightStack` | 5 ops in `ComputeSurfaceTerrainZ`'s order — structural → cliff → terrace → layer lines → beach. **Order is not negotiable.** |
 
 ### 3.3 Chunk identity
-`VoxelChunk.h` (the old `FVoxelChunk` coord wrapper) was DELETED — dead since the tile
-redesign; tile identity lives in `FVoxelTileKey` (VoxelWorld.h).
+Tile identity lives in `FVoxelTileKey` (VoxelTypes.h:326).
 
 ### 3.4 Settings — `Public/VoxelSettings.h`
 `UVoxelSettings : UPrimaryDataAsset` — the single tuning asset assigned on `AVoxelWorld`.
 | Group | Fields (line) |
 |-------|---------------|
 | Streaming | `ViewDistanceXY=16`, `ViewDistanceUp/Down=5`, `MaxConcurrentTasks=16`, `MaxMeshAppliesPerFrame=4` (defaults — actual values live on the data asset) |
-| Clipmap | `ClipRadius`, `MaxClipLevel=5`, `FullResClipLevels`, `CoarseTileCells`, `RenderDistanceChunks=768` (measured ship defaults; custom horizontal reach: the outermost shell keeps generating until it covers this many chunks; 0 = off), `bFarSheetRing=false` by default, plus `FarSheetSpanLevels` (F18 — the optional render-distance ring streams per-surface SHEETS: level MaxClipLevel+span heightfield tiles instead of MC, see `GenerateSheetMesh`), skirts, `LODOctaveDrop` (T2.b octave drop on coarse tiles — 0 = off/byte-identical). Existing serialized data assets retain their authored values until deliberately migrated. |
+| Clipmap | `ClipRadius`, `MaxClipLevel=5`, `FullResClipLevels`, `CoarseTileCells`, `RenderDistanceChunks=768` (measured ship defaults; custom horizontal reach: the outermost shell keeps generating until it covers this many chunks; 0 = off), skirts, `LODOctaveDrop` (T2.b octave drop on coarse tiles — 0 = off/byte-identical). Existing serialized data assets retain their authored values until deliberately migrated. |
 | World bounds | `WorldRadiusVoxels=8192` and `EdgeSealThickness=64` (actor-space XY radial shell; radius 0 = true legacy no-op) |
 | Lighting | `bEnableDensityVolume` + DensityVolume* tunables (§3.11 density clipmap / mini-sun shadows) |
-| Rendering | `VoxelMaterial` (61) |
+| Rendering | `VoxelMaterial` (377) |
 | Strates | Optional cooked `Season`; effective seed/spine/radius/season accessors read it when assigned. Otherwise `Seed`, `CurrentSeason=1`, `StratePool`, `FixedStrates`, and `TotalStrates=10` retain the authored path. |
-| Carving budget | `MaxModifications=0` (97), `MaxBrushRadius=15` (102), `MaxTotalVolume=0` (107). 0 = unlimited. |
+| Carving budget | `MaxModifications=0` (449), `MaxBrushRadius=15` (454), `MaxTotalVolume=0` (459). 0 = unlimited. |
 
 ### 3.5 World orchestrator — `Public/VoxelWorld.h` + `Private/VoxelWorld.cpp`
 `AVoxelWorld : AActor` — owns everything, drives streaming. Also `FChunkResult` struct
-(VoxelWorld.h:35) = async task payload (coord, chunk, meshdata, LOD, **Epoch**, request timing,
+(VoxelWorld.h:99) = async task payload (coord, chunk, meshdata, LOD, **Epoch**, request timing,
 worker-built stream geometry counts/bytes, desired-set epoch and obsolete/cancellation state).
 
 **Owned objects (UPROPERTY):** `Settings`, `Generator`, `Mesher`, `StrateManager`,
-`DiffLayer` (VoxelWorld.h:55-78). **Storage:** `Chunks` map, `ChunkMeshes` map,
-`ChunkLODs`, `ProcessQueue` (TQueue), `PendingChunkCoord` (TSet) (VoxelWorld.h:85-312).
+`DiffLayer`, `ContentManager`, `AtmosphereManager`, `DensityVolume` (VoxelWorld.h:188-228).
+**Storage:** `LoadedTiles` (TSet), `TileComponents` map + `TileComponentPool` (VoxelWorld.h:260-308),
+the four MPSC result queues `CriticalProcessQueue` / `EditedProcessQueue` / `NearProcessQueue` /
+`ProcessQueue`, and `PendingTiles` (TSet) (VoxelWorld.h:908-912).
 **Async state:** `bShuttingDown`, `ActiveTaskCount` (atomics), `GenerationEpoch`, and the
 game-thread `PendingTileCancellation` map whose per-request atomic flags are read-only on workers.
 
@@ -293,45 +290,45 @@ casse cette arithmetique *structurellement* — `BeginPlay` loggue une **Error**
 
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| `AVoxelWorld()` ctor | 12 | Enables Tick. |
-| `RegenerateAllChunks()` | 21 | Bumps epoch, unloads all → Tick reloads. CallInEditor button. |
+| `AVoxelWorld()` ctor | 176 | Enables Tick. |
+| `RegenerateAllChunks()` | 530 | Bumps epoch, unloads all → Tick reloads. CallInEditor button. |
 | `ValidateDeterminism()` | — | **F2 CallInEditor button (PIE)**: re-samples boundary points under left- vs right-chunk cache warm-ups + a same-alignment repeat; any non-zero delta = window-invariance regression (§8.4). Run after every "bit-identical" hot-path refactor. |
 | `GetMaxConcurrentTasks()` | — | T2.d — asset `MaxConcurrentTasks` capped to logical cores − 2 (all three budget checks use it). |
-| `PostEditChangeProperty` | 45 | Editor live-edit hook. |
-| `OnObjectModifiedInEditor` | 58 | Regenerates when a strate asset is edited (if `bLiveEditStrates`). |
-| `EndPlay` | 140 | Sets `bShuttingDown`, **waits for `ActiveTaskCount`→0**, unbinds delegate. |
-| `BeginPlay` | 177 | Constructs Generator/Mesher/StrateManager/DiffLayer, wires services, seeds. |
-| `Tick` | 220 | `UpdateChunksAroundPosition(player, heading)` + `ProcessPendingChunks()`; the clean LOD0 latency summary is flushed at `EndPlay`. |
-| `GetPlayerPosition` | 231 | Pawn position or zero. (`GetLODForChunk`/`LODToStep`/`IsChunkInRange` removed — dead since the clipmap.) |
-| `ProcessPendingChunks` | 301 | Drains ProcessQueue under per-frame budget; reads the per-request cancellation token before removing its map entry, drops obsolete/aborted results, then applies each live result via `ApplyTileResult`. |
+| `PostEditChangeProperty` | 1000 | Editor live-edit hook. |
+| `OnObjectModifiedInEditor` | 1022 | Regenerates when a strate asset is edited (if `bLiveEditStrates`). |
+| `EndPlay` | 1118 | Sets `bShuttingDown`, **waits for `ActiveTaskCount`→0**, unbinds delegate. |
+| `BeginPlay` | 1429 | Constructs Generator/Mesher/StrateManager/DiffLayer, wires services, seeds. |
+| `Tick` | 4395 | `UpdateChunksAroundPosition(player, heading)` + `ProcessPendingChunks()`; the clean LOD0 latency summary is flushed at `EndPlay`. |
+| `GetPlayerPosition` | 4831 | Pawn position or zero. |
+| `ProcessPendingChunks` | 5856 | Drains ProcessQueue under per-frame budget; reads the per-request cancellation token before removing its map entry, drops obsolete/aborted results, then applies each live result via `ApplyTileResult`. |
 | `ApplyTileResult` | — | **Shared game-thread apply** for one `FChunkResult` (async drain + sync carve): discards stale generation epochs and keys no longer desired, marks loaded, ingests capture, EMPTY releases the tile's existing component (a re-gen can flip content→empty on band change — old geometry must not linger), else `ApplyMeshToTile`. Returns true iff a visible mesh uploaded (counts the budget). Doesn't touch `PendingTiles` (caller's). |
 | `FVoxelStackSampler` / `FScopedVoxelStackRegistration` (`VoxelStackSampler.h/.cpp`) | — | **Diagnostic raw stack sampler, off by default.** A sampler thread captures registered generation workers' stacks (`CaptureThreadStackBackTrace`) every N µs and tags each with the tile's LOD. It writes bounded raw PCs to CSV plus a symbolization-free summary under `Saved/`; symbol resolution is deferred until after process exit so the measured process never initializes/calls DbgHelp for this diagnostic. Lifecycle teardown is serialized and registration TLS is session-tagged. Registration is per tile TASK in `LoadTile` (and the export's tasks), never per sample; disabled costs one relaxed atomic load. Game `-voxel.SampleStacks=<us>`, commandlet `-samplestacks[=us]`. |
 | Room-cache performance (2026-09-13): `VF_FindPlayerFitPointForRoomMemoized` / `GPlayerFitMemo` (`VoxelCaveMorphology.cpp`), `voxel.TileCacheWindow` + `VoxelGenLOD::TileOriginVoxels/TileCellsPerAxis` (`VoxelGenerator.h`), `FChunkSDFSpatialIndex` | — | **Player-fit memo:** exact 97-word key, process-wide, `voxel.PlayerFitMemo`. **Tile cache window:** the room cache covers the requesting tile's footprint plus a fixed collect margin. It is set via `TGuardValue` in `GenerateMesh`/classify, and is window-invariant by construction (the margin does not grow with the tile). **LOD-gated:** fused path at LOD ≥ `voxel.TileCacheWindowMinLOD` (3), op-stack at LOD ≥ `voxel.TileCacheWindowOpStackMinLOD` (4); lower LODs keep the 4-chunk worker window, because the tile window slowed LOD0 evaluation ~6%. Strates whose authored terrain ops exceed the proven 256-voxel extent (or are malformed/unloaded) fall back to the legacy window (`VF_ComputeTerrainOpEnvelope`). `voxel.SpatialIndex` is -1 auto (off at fused LOD0, on elsewhere), 0 or 1. **Spatial index:** ordered XY buckets over cache primitives, exact rejection. The `static_assert` in `VoxelStrateTypes.h` ties `VF_STRATE_PARAM_FIELDS` to `FStrateGenerationParams` (83 fields + 8 B padding). |
-| `GenerateTileResult` | — | **Shared worker-side gen** for one tile (async `LoadTile` task + sync `SyncRemeshTile`): [ClassifyTile (T1.d) + exact validation, only when `voxel.OuterClassifierMode=1`; **default 0 since 2026-09-13**] → `GenerateMesh`/`GenerateSheetMesh` → `BuildTileStreamSet`; records vertex count and resident stream allocation bytes for the horizon trace. Reads Generator/Mesher only → safe on a worker or the game thread; fills `FChunkResult`, no enqueue. |
+| `GenerateTileResult` | — | **Shared worker-side gen** for one tile (async `LoadTile` task + sync `SyncRemeshTile`): [ClassifyTile (T1.d) + exact validation, only when `voxel.OuterClassifierMode=1`; **default 0 since 2026-09-13**] → `GenerateMesh` → `BuildTileStreamSet`; records vertex count and resident stream allocation bytes for the horizon trace. Reads Generator/Mesher only → safe on a worker or the game thread; fills `FChunkResult`, no enqueue. |
 | `RecordTileHash` / `WriteTileHashDump` | — | Headless `-voxel.TileHashDump=<absolute path>` parity instrument. Records the exact `FVoxelMeshData` used by the streaming result, including empty/classified tiles, then writes sorted absolute tile keys, LOD step/cells, content-band limits, settings digest context, and the shared `VoxelGeometryHash` at `EndPlay`. |
 | `SyncRemeshTile` | — | **INSTANT DIG**: level-0 same-frame re-mesh on the game thread (`GenerateTileResult` + `ApplyTileResult` inline, Cells=CHUNK_SIZE/Step=1 + strate band, no capture). Used for the tile under the brush centre so a carve is visible THIS frame; one full-res gen on the game thread. |
-| `UpdateChunksAroundPosition` | 362 | Builds desired set, cancels pending keys that left it, sorts from the **true pawn position**, submits the occupied/support LOD0 tile and the next tile along the pawn heading as an absolute `BackgroundHigh` prefix, then loads/unloads and handles LOD changes. **Delta cull**: `BuildDesiredTiles` returns the LEAVERS (stamped `DesiredStamped` map, one sweep) — only those + `TransitionHold` are considered per crossing, not every loaded tile. `BuildDesiredTiles` also applies `RenderDistanceChunks`: the outermost shell widens to cover the distance — as level-MaxClipLevel MC tiles, or (F18 `bFarSheetRing`) as a SHEET ring at level MaxClipLevel+span (covered-check vs the MaxClipLevel box; `VF_OuterShell` shared with `IsTileInClipRange` so the cull sees the same horizon), dz pre-clamped to the vertical band. **§9.3 anchors:** also prunes dead `StreamingAnchors` + detects their chunk crossings → rebuilds the desired set when an anchor moves/(un)registers (`bAnchorsMoved`/`bForceDesiredRebuild`), same cadence as player movement. §8.10. |
+| `UpdateChunksAroundPosition` | 6870 | Builds desired set, cancels pending keys that left it, sorts from the **true pawn position**, submits the occupied/support LOD0 tile and the next tile along the pawn heading as an absolute `BackgroundHigh` prefix, then loads/unloads and handles LOD changes. **Delta cull**: `BuildDesiredTiles` returns the LEAVERS (stamped `DesiredStamped` map, one sweep) — only those + `TransitionHold` are considered per crossing, not every loaded tile. `BuildDesiredTiles` also applies `RenderDistanceChunks`: the outermost shell widens to cover the distance as level-MaxClipLevel MC tiles (`VF_OuterShell` shared with `IsTileInClipRange` so the cull sees the same horizon), dz pre-clamped to the vertical band. **§9.3 anchors:** also prunes dead `StreamingAnchors` + detects their chunk crossings → rebuilds the desired set when an anchor moves/(un)registers (`bAnchorsMoved`/`bForceDesiredRebuild`), same cadence as player movement. §8.10. |
 | `AdvanceHeadlessCollisionGateStressTest` / `ObserveHeadlessCollisionGateStressTest` / `MaybeFinishHeadlessCollisionGateStressTest` | — | Explicit `-voxel.TestCollisionGateStress=1` harness only. The `GetDensityAt` column at capsule feet defines the local air/solid surface; each frame records actor position, velocity, direct foot tile and gate support readiness, gate state, signed feet clearance, and a ≤0.5-voxel sweep between positions. PASS requires no measured clearance below −5 cm; support submission/readiness, travel, and holds are diagnostics. Result logs include the terminal density column and the first crossing below spawn height. |
-| `BuildDesiredTiles` | ~722 | Builds `DesiredSorted`+`DesiredStamped` (player clipmap shells + F18 sheet ring) then `AddAnchorDesiredTiles()` before the leaver sweep; it orders from the true local pawn position and builds `CriticalDesiredTiles` for the occupied/support and heading tiles. Also rebuilds `DesiredTransitionDescendants` (ancestor → desired descendants) for the reconcile pass. |
-| `VoxelClipmapDesiredTiles::Build` / `AlignedRingBounds` (`Private/VoxelClipmapDesiredTiles.h`) | — | The pure clipmap selector. **Every finer ring snaps outward to a child-pair boundary** (`AlignedRingBounds`, alignment 2; the last MC ring aligns to the sheet grouping width), so a coarser tile is wholly inside or wholly outside the finer ring: **no two desired tiles of different levels overlap** (a 7-wide odd ring used to leave one half-covered coarse tile per axis side, drawn over the fine one: 635 pairs at the owner config). Cost: LOD0 ring 343 → 512 tiles. Guarded by `VoxelForge.Streaming.ClipmapDesiredTilesNoOverlapCoverage`. Anchor tiles appended later are outside this guarantee. |
+| `BuildDesiredTiles` | 6482 | Builds `DesiredSorted`+`DesiredStamped` (player clipmap shells) then `AddAnchorDesiredTiles()` before the leaver sweep; it orders from the true local pawn position and builds `CriticalDesiredTiles` for the occupied/support and heading tiles. Also rebuilds `DesiredTransitionDescendants` (ancestor → desired descendants) for the reconcile pass. |
+| `VoxelClipmapDesiredTiles::Build` / `AlignedRingBounds` (`Private/VoxelClipmapDesiredTiles.h`) | — | The pure clipmap selector. **Every finer ring snaps outward to a child-pair boundary** (`AlignedRingBounds`, alignment 2; the outermost ring needs none), so a coarser tile is wholly inside or wholly outside the finer ring: **no two desired tiles of different levels overlap** (an unaligned 7-wide odd ring leaves one half-covered coarse tile per axis side, drawn over the fine one: 635 pairs at the owner config). Cost: LOD0 ring 343 → 512 tiles. Guarded by `VoxelForge.Streaming.ClipmapDesiredTilesNoOverlapCoverage`. Anchor tiles appended later are outside this guarantee. |
 | `ReconcileReadyTransitionVisibility` | — | Visibility-only pass while streaming is unsettled: hides a retired tile once all desired tiles over its footprint are loaded, reveals new tiles once no visible retired tile overlaps them. **Indexed** (dyadic ancestors + `DesiredTransitionDescendants`, visible retired tiles collected once per pass): moving p95 32 ms → 0.31 ms. `voxel.MeasureReadyTransitionVisibility=1` logs per-frame samples. |
-| `RequestCollisionGateSupportTile` / `UpdatePawnCollisionGate` | — | The gate submits the pawn's level-0 support tile **immediately** as `CollisionCritical`, even before the first desired set exists (the desired rebuild then adopts the same pending key). The gate holds downward Z only, with **no timeout** (the old 2 s release fired at every startup, while the game thread applied nothing for ~2.2 s). |
+| `RequestCollisionGateSupportTile` / `UpdatePawnCollisionGate` | — | The gate submits the pawn's level-0 support tile **immediately** as `CollisionCritical`, even before the first desired set exists (the desired rebuild then adopts the same pending key). The gate holds downward Z only, with **no timeout** (a 2 s release would fire at every startup, while the game thread applies nothing for ~2.2 s). |
 | `AddAnchorDesiredTiles` | — | **§9.3 multi-anchor:** folds each `FVoxelStreamingAnchor`'s thin level-0 box (`XYRadiusChunks`/`ZBelowChunks`/`ZAboveChunks`) into the SAME desired set (deduped by stamp) so AI/remote players keep collision loaded around them; delta cull releases them on move/unregister. **§9.4:** a tile only a CollisionOnly anchor wants (clipmap didn't stamp it) → `CollisionOnlyTiles` → hidden at apply. Zero cost when no anchors. |
 | `ReconcileAnchorTileVisibility` | — | **§9.4:** after each rebuild, toggle `SetVisibility` on ALREADY-LOADED tiles that flipped render↔collision-only (diff `CollisionOnlyTiles` vs prev — bounded, no O(loaded) scan; unhide only if still desired). No-op without CollisionOnly anchors. |
 | `RegisterStreamingAnchor` / `UnregisterStreamingAnchor` | — | **BlueprintCallable §9.3:** add/remove an actor as a streaming anchor (`EVoxelAnchorPolicy` CollisionOnly/FullVisual + XY/ZBelow/ZAbove box). Idempotent; forces a rebuild next Tick. §9.4: CollisionOnly tiles cook collision but are hidden (no draw/VSM) unless the player clipmap wants them too. |
-| `LoadTile` | 445 | Budget check → `UE::Tasks::Launch` background gen+mesh; RAII task guard. Worker runs `Generator->ClassifyTile` first (T1.d): AllSolid/AllAir ⇒ skip `GenerateMesh`, tile stays empty (capture tiles always generate). It carries `GenerationEpoch`/desired epoch and checks `bShuttingDown`, generation pause, and its read-only cancellation token between expensive stages; obsolete work returns through `ProcessQueue`. STRATE CONTENT CUT: tiles ≥ `StrateContentCutMinLevel` pass the player-strate band (`MeshBandChunkLo/Hi` → voxels) to `GenerateMesh` + stamp it on `FChunkResult::BandChunkLo/Hi`; band change re-queues via `BandRemeshQueue` (see `UpdateChunksAroundPosition`). TOO-COARSE SKIP: if one cell is taller than the band (`Step > band height` — level ≥7 territory) the tile is enqueued EMPTY without launching a task (cell-granular cut could only render garbage). F18: `Tile.Level > MaxClipLevel` = SHEET tile → routed to `GenerateSheetMesh` (band mid-chunk = strate ref; band unarmed ⇒ empty; MC-ring sampling density, cells capped 128/axis; carries the XY hole `SheetHole*Vox` — hole moves ⇒ overlapping sheets re-queue via `BandRemeshQueue`, see `UpdateChunksAroundPosition`). §8.10. |
+| `LoadTile` | 7291 | Budget check → `UE::Tasks::Launch` background gen+mesh; RAII task guard. Worker runs `Generator->ClassifyTile` first (T1.d): AllSolid/AllAir ⇒ skip `GenerateMesh`, tile stays empty (capture tiles always generate). It carries `GenerationEpoch`/desired epoch and checks `bShuttingDown`, generation pause, and its read-only cancellation token between expensive stages; obsolete work returns through `ProcessQueue`. STRATE CONTENT CUT: tiles ≥ `StrateContentCutMinLevel` pass the player-strate band (`MeshBandChunkLo/Hi` → voxels) to `GenerateMesh` + stamp it on `FChunkResult::BandChunkLo/Hi`; band change re-queues via `BandRemeshQueue` (see `UpdateChunksAroundPosition`). TOO-COARSE SKIP: if one cell is taller than the band (`Step > band height` — level ≥7 territory) the tile is enqueued EMPTY without launching a task (cell-granular cut could only render garbage). §8.10. |
 | `UnloadTile` | — | Clears tile state; marks any matching generation request obsolete without removing its pending slot, so a late result cannot clear a replacement request; the component is PARKED in the pool (T2.c), not destroyed. |
 | `ApplyMeshToTile` | — | Upload geometry. One component per tile (clipmap keeps count low; supersedes the old region batching); worker-built streams (T1.f) → `CreateSectionGroup(MoveTemp)`. Reuses the component's existing `URealtimeMesh` (no per-apply mesh alloc). **F17: two polygroups** (0 ground / 1 sky-cap, per-triangle class from the mesher) → RMC auto-section per non-empty group; slot 0 = override/default material, slot 1 = `CeilingMaterial` (fallback ground); config gated by `FChunkResult::bHasGroundTris/bHasCeilingTris`. Takes `FChunkResult&`; strate lookups clamp Z into `Result.BandChunkLo/Hi` (strate content cut) — ground at clamped bottom chunk, cap at clamped top (mid = gap fallback). Collision level-0 only (T1.c) both groups; shadow per SECTION: ground casts at level≤1, cap never. **§9.4:** `SetVisibility(false)` when the tile is in `CollisionOnlyTiles` (anchor-only, hidden — collision still cooks). §8.10 + ARCHITECTURE SurfaceWorld row. |
 | `AcquireTileComponent` / `ReleaseTileComponent` | — | **T2.c component pool** (`TileComponentPool`, bounded): park on unload (geometry+collision stripped, hidden, stays registered), pop on apply — no `NewObject`/`RegisterComponent`/GC churn during travel & regen. §8.10. |
-| `GetStrateAtPosition` | 965 | Gameplay query → strate index. |
+| `GetStrateAtPosition` | 8351 | Gameplay query → strate index. |
 | `GetBiomeAtWorldLocation` | — | **BlueprintCallable** biome probe at a world point (undoes actor xf → voxel → `Generator::QueryBiomeAt`). Returns `FVoxelBiomeQuery` for BP debug ("what biome / how many decos under the cursor?"). |
-| `GetVoxelSurfaceHeightAt` | ~1534 | **BlueprintCallable** ground finder (F7 bridge): world XY → terrain + sky-cap world-Z via `Generator::GetSurfaceHeightAt`, NO trace/collision, deterministic, available before the area meshes → self-arranging prefab/ruin BPs snap their parts to the real ground. False (outs=input Z) on non-SurfaceWorld strates; ignores passage/spine carving. |
-| `CarveAtPosition` / `FillAtPosition` | 691 / 709 | Build `FVoxelModification` → `ApplyModification`. |
-| `ApplyModification` | ~1581 | Single funnel for all brushes: DiffLayer → **sync-remesh the brush-centre level-0 tile** (`SyncRemeshTile`, instant hole; skipped if that tile is mid-gen — would race a stale in-flight result) → `RemeshDirtyChunks(..., excludeCenter)` for the neighbours → `RemoveDecorationsInSphere`. |
-| `ClearAllModifications` | 726 | Clears diff layer, regenerates. |
-| `ChangeSeed` | 740 | **Legacy season reset**: new seed everywhere, clear diffs, bump season, reload. Rejected while a cooked season owns the seed. |
+| `GetVoxelSurfaceHeightAt` | 8385 | **BlueprintCallable** ground finder (F7 bridge): world XY → terrain + sky-cap world-Z via `Generator::GetSurfaceHeightAt`, NO trace/collision, deterministic, available before the area meshes → self-arranging prefab/ruin BPs snap their parts to the real ground. False (outs=input Z) on non-SurfaceWorld strates; ignores passage/spine carving. |
+| `CarveAtPosition` / `FillAtPosition` | 8413 / 8422 | Build `FVoxelModification` → `ApplyModification`. |
+| `ApplyModification` | 8431 | Single funnel for all brushes: DiffLayer → **sync-remesh the brush-centre level-0 tile** (`SyncRemeshTile`, instant hole; skipped if that tile is mid-gen — would race a stale in-flight result) → `RemeshDirtyChunks(..., ExcludeTile)` for the neighbours → `RemoveDecorationsInSphere`. |
+| `ClearAllModifications` | 8696 | Clears diff layer, regenerates. |
+| `ChangeSeed` | 8710 | **Legacy season reset**: new seed everywhere, clear diffs, bump season, reload. Rejected while a cooked season owns the seed. |
 | `GetCurrentSeed` / `GetCurrentSeason` / `GetCurrentSeasonContentHash` | — | Effective cooked-or-legacy identity; the hash is the join-time stale-season comparison value. |
-| `RemeshDirtyChunks` | 798 | Queue loaded level-0 dirty tiles onto `DirtyRemeshQueue` (async re-mesh, no pop) + `MarkDirtyVoxelBox` the volume. Optional `ExcludeTile` = the sync'd centre. Drained FIRST in the submit loop at **BackgroundHigh** (ahead of streaming/band) so a dig never waits behind streaming; in-flight tiles stay QUEUED (not dropped) so a stale pre-carve result is corrected once it lands — fixes "hole shows up a beat late / not until I move". |
+| `RemeshDirtyChunks` | 8801 | Queue loaded level-0 dirty tiles onto `DirtyRemeshQueue` (async re-mesh, no pop) + `MarkDirtyVoxelBox` the volume. Optional `ExcludeTile` = the sync'd centre. Drained FIRST in the submit loop at **BackgroundHigh** (ahead of streaming/band) so a dig never waits behind streaming; in-flight tiles stay QUEUED (not dropped) so a stale pre-carve result is corrected once it lands — fixes "hole shows up a beat late / not until I move". |
 
 > **Game-thread profiling (Perf):** `AVoxelWorld::Tick` and its sub-steps are wrapped in `TRACE_CPUPROFILER_EVENT_SCOPE` — `VoxelForge_Tick / UpdateChunks / BuildDesiredTiles / CullTiles / SubmitTiles / ProcessPending / ProcessUnload / UpdateDecorations / UpdateWater`. Capture a `Count/Incl/Excl` Insights timer export and read the `Excl` column to see which step owns the per-frame cost (the actor tick shows as `BP_VoxelWorld_C` if subclassed in BP). `VoxelForge_ClassifyTile` (T1.d) / `VoxelForge_GenerateMesh` + `VoxelForge_BuildStreams` are worker-side (off the frame): the RMC `FRealtimeMeshStreamSet` is now built on the gen worker (`BuildTileStreamSet`) and carried on `FChunkResult::Streams` (TSharedPtr), so `ApplyMeshToTile` is game-thread-cheap — just material/ceiling resolve + `CreateSectionGroup(MoveTemp)`. See ARCHITECTURE §8.10 "Worker-built StreamSet (T1.f)".
 
@@ -343,31 +340,30 @@ This is **where terrain shape lives.**
 | Symbol | .cpp line | Role |
 |--------|-----------|------|
 | `UVoxelGenerator` / `DensityCacheOwnerId` | — | Constructor allocates a process-unique integer identity (relaxed atomic, once per object). `GetDensityAt` includes it in the `CP_*` thread-local key, preventing a worker from serving another generator/world's params, biome context, `CP_UseOpStack`, or stack when `(ChunkCoord, LayoutVersion)` happens to match. Hot-path cost: one `uint64` compare per voxel. Scope is deliberately only the proved `CP_*` path. |
-| `FractalNoise3D` (static) | 25 | fBM (layered Perlin). |
-| `RidgedNoise3D` (static) | 55 | Ridged multifractal — craggy. |
-| `CellularNoise3D` (static) | 101 | Worley/cellular — grotto/scallop. |
-| `ApplyBoundarySeal` (static) | 170 | Solidifies strate top/bottom shells. |
-| `ApplyPassageCarving` (static) | 197 | Punches passages/elevator through the seal. |
-| `InitializeSettings` | 211 | Copies the effective seed, spine radius, and global XY world-bound settings from `UVoxelSettings` (the season owns all three when assigned); radius 0 preserves the unbounded field. |
-| **`GetDensityAt`** | 218 | **Entry point.** Picks strate + generator type, materialises a cooked-season recipe on the existing per-chunk refetch when present, dispatches, then adds disturbances/diff. Its `CP_*` state is keyed by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; workers copy immutable recipe/vector data and never read editor composer state. |
-| **`GetDensityWithParams`** | 277 | TunnelNetwork pipeline (~1000 lines). See §4. ⚠️ Takes **required** `ParamsFingerprint` + `LayoutVersion` since the AUDIT §C2 fix (2026-07-28) — they go into the SDF cache key so a chunk can no longer be evaluated against a neighbour's rooms. Callers compute the CRC **once per chunk** (`CP_TunnelFP`), never per voxel. The optional `voxel.WormBlockSkip` path (default 0) uses `VF_TryGetWormBlockSkip` + a worker-local 4³ lattice-block cache to prove `|N1| >= WormThreshold` and remove both worm noise calls only; it never changes `NetworkMask` or the fallback field path. |
-| **`GetSlabDensity`** | 1306 | FlatPlain/CrystalChamber pipeline. See §4.2. |
+| `FractalNoise3D` (static) | 931 | fBM (layered Perlin). |
+| `RidgedNoise3D` (static) | 949 | Ridged multifractal — craggy. |
+| `CellularNoise3D` (static) | 976 | Worley/cellular — grotto/scallop. |
+| `ApplyBoundarySeal` (static) | 996 | Solidifies strate top/bottom shells. |
+| `InitializeSettings` | 2691 | Copies the effective seed, spine radius, and global XY world-bound settings from `UVoxelSettings` (the season owns all three when assigned); radius 0 preserves the unbounded field. |
+| **`GetDensityAt`** | 2712 | **Entry point.** Picks strate + generator type and, on the per-chunk refetch, builds the chunk's operator stack (editor composer → cooked-season recipe → native archetype stack); evaluates it (TunnelNetwork/Underwater through the fused `GetDensityWithParams`), then adds disturbances, the structural tail and the diff layer. A degenerate strate has no stack and is air. Its `CP_*` state is keyed by `(DensityCacheOwnerId, ChunkCoord, LayoutVersion)`; workers copy immutable recipe/vector data and never read editor composer state. |
+| **`GetDensityWithParams`** | 3749 | TunnelNetwork pipeline (~1000 lines) — the fused evaluator of the TunnelNetwork/Underwater stack in `GetDensityAt`. See §4. ⚠️ Takes **required** `ParamsFingerprint` + `LayoutVersion` since the AUDIT §C2 fix (2026-07-28) — they go into the SDF cache key so a chunk can no longer be evaluated against a neighbour's rooms. Callers compute the CRC **once per chunk** (`CP_TunnelFP`), never per voxel. The optional `voxel.WormBlockSkip` path (default 0) uses `VF_TryGetWormBlockSkip` + a worker-local 4³ lattice-block cache to prove `|N1| >= WormThreshold` and remove both worm noise calls only; it never changes `NetworkMask` or the fallback field path. |
 | `SampleSurfaceStructuralZ` | — | **F20:** the RAW SurfaceWorld heightfield (continents+mountains+detail), BEFORE any terrain op; returns terrain Z + relief M. Cliff re-samples it at an XY offset for a cheap analytic slope. |
-| `ComputeSurfaceTerrainZ` / `GetSurfaceDensity` | — | SurfaceWorld heightfield → terrain Z, then density; biome **output-blend** lerps dominant/neighbour heights (`ParamsD`/`ParamsN`/weight). **F20 surface ops** (`FSurfaceGenerationParams`, biome-selected + slope/relief-conditioned, all default off): Cliff (slope-gated STEEPENING — push height from local mean where steep ⇒ sheer walls; 4 structural resamples only when on), Terrace (relief-gated + `TerraceHardness`), LayerLines (sedimentary shelves) — pure per-column height REMAPS applied here so the single height oracle stays consistent (MC/sheets/ClassifyTile/deco/BP bridge). **Phase 2 OVERHANG** (volumetric — real jutting shelves): in `SurfaceDensityFromColumn`, for AIR voxels in a window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height (tiny low ⇒ air over the void, full high ⇒ borrows the far cliff rock) and unioned in ⇒ a shelf attached to the cliff, tapering out over the void with air beneath (the sketch). Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill `(DirX,DirY)` resolved once in `ComputeSurfaceColumn` (gradient sampled at the REACH scale so a spot over the void can see the cliff), cached on `FSurfaceColumn`. Genuine 3D (per-voxel structural re-eval, gated to steep overhang columns). Off ⇒ byte-identical. The field-preserving LOD0 pass removes only needless temporaries/default construction; every output remains bit-identical. §8.14. |
-| `VF_BuildOpStackForChunk` (file-static) | — | **The archetype → stack mapping, written down once.** `GetDensityAt` and `ClassifyTile` both call it; params are passed in, never fetched here. A second copy would be the worst bug available in this file — a tile skipped on the verdict of a stack that is not the one producing its density is a hole. Returns false (⇒ caller falls back to the `switch`) for an unported archetype, missing params, or a **degenerate strate**, since five archetype functions early-out to air there and the stack deliberately has no such early-out. `Refs.Surface == nullptr` makes it refuse SurfaceWorld, which is how `ClassifyTile` keeps its own exact-lattice proof. |
+| `ComputeSurfaceTerrainZ` / `ComputeSurfaceColumn` | — | SurfaceWorld heightfield → terrain Z (+ sky-cap ceiling and overhang gate per column); biome **output-blend** lerps dominant/neighbour heights (`ParamsD`/`ParamsN`/weight). **F20 surface ops** (`FSurfaceGenerationParams`, biome-selected + slope/relief-conditioned, all default off): Cliff (slope-gated STEEPENING — push height from local mean where steep ⇒ sheer walls; 4 structural resamples only when on), Terrace (relief-gated + `TerraceHardness`), LayerLines (sedimentary shelves) — pure per-column height REMAPS applied here so the single height oracle stays consistent (MC/ClassifyTile/deco/BP bridge). **Phase 2 OVERHANG** (volumetric — real jutting shelves): in the stack's `FOverhangShelfMod`, for AIR voxels in a window `(TerrainZ, TerrainZ+OverhangHeight]` above a steep slope, the heightfield is re-sampled UPHILL (toward the cliff) by a reach that GROWS with height (tiny low ⇒ air over the void, full high ⇒ borrows the far cliff rock) and unioned in ⇒ a shelf attached to the cliff, tapering out over the void with air beneath (the sketch). Per-column `OverhangAmp`(=strength·slope-gate) + unit uphill `(DirX,DirY)` resolved once in `ComputeSurfaceColumn` (gradient sampled at the REACH scale so a spot over the void can see the cliff), cached on `FSurfaceColumn`. Genuine 3D (per-voxel structural re-eval, gated to steep overhang columns). Off ⇒ byte-identical. The field-preserving LOD0 pass removes only needless temporaries/default construction; every output remains bit-identical. §8.14. |
+| `VF_BuildOpStackForChunk` (file-static) | — | **The archetype → stack mapping, written down once.** `GetDensityAt` and `ClassifyTile` both call it; params are passed in, never fetched here. A second copy would be the worst bug available in this file — a tile skipped on the verdict of a stack that is not the one producing its density is a hole. Returns false for an unknown archetype, missing params, or a **degenerate strate** (the stack deliberately has no degenerate early-out): `GetDensityAt` then returns air and `ClassifyTile` returns `Mixed`. `Refs.Surface == nullptr` makes it refuse SurfaceWorld, which is how `ClassifyTile` keeps its own exact-lattice proof. |
 | `ClassifyTile` | — | **T1.d trivial-tile reject. ⛔ Not called by streaming by default since 2026-09-13** (`voxel.OuterClassifierMode=0`; net-negative in game, see ARCHITECTURE §8.10). Cooked/editor recipes now build the exact recipe stack and call its proved `ClassifyBox`; a tile crossing a slot/gap, any diff, or any disturbance returns `Mixed`. This replaces the old global `HasComposerRecipeOverride()` force-to-Mixed. Native cave/surface/gap proofs and all §8.10 caches remain unchanged. |
 | `SampleRelief` / `SampleMoisture` | — | Climate fields (pure XY, [0,1]). Relief = shared source of truth for the relief map M. §8.14. |
 | `SampleBiomeAt` | — | Warped-Voronoi + climate biome query (dominant + neighbour + weight). Reference used by the preview bake + `GetDominantBiomeAt`. §8.14. |
 | `ResolveBiomeSampleAt` / `RebuildBiomeGrid` | — | Hot-path biome resolve (FBiomeSample) via a box-validated per-chunk cell-grid cache. Bit-identical to `SampleBiomeAt`. §8.14, §8.10. |
 | `GetDominantBiomeAt` | — | Game-thread query → dominant biome ASSET (content/atmosphere). §8.14. |
 | `QueryBiomeAt` | — | Rich game-thread biome probe → `FVoxelBiomeQuery` (dominant/neighbour asset, relief/moisture, blend weight, dominant deco count). Diagnostic behind `AVoxelWorld::GetBiomeAtWorldLocation`. §8.14. |
-| `EvaluateTerrainConditions` | ~2548 | **F7 aware placement:** AND-evaluate an entry's `FTerrainCondition[]` (relief/moisture/biome-border) at a candidate voxel XY. Empty = true (zero cost). Pure query (SampleRelief/SampleMoisture/SampleBiomeAt) → worker-safe + game-thread; caller passes the strate's `FBiomeContext` (freq/contrast + Voronoi map). Consumed by deco `BuildCellSpawns` + `SpawnLandmarkInstance`; shared core of the future quest FindFeature locator. |
+| `EvaluateTerrainConditions` | 6973 | **F7 aware placement:** AND-evaluate an entry's `FTerrainCondition[]` (relief/moisture/biome-border) at a candidate voxel XY. Empty = true (zero cost). Pure query (SampleRelief/SampleMoisture/SampleBiomeAt) → worker-safe + game-thread; caller passes the strate's `FBiomeContext` (freq/contrast + Voronoi map). Consumed by deco `BuildCellSpawns` + `SpawnLandmarkInstance`; shared core of the future quest FindFeature locator. |
 
 > **Per-voxel hot-path memos (perf pass 2, all bit-identical — same hashes/math, hoisted per
 > chunk/cell):** `GetDensityAt` uses the DiffLayer snapshot cache (§3.9); `GetDensityWithParams`
 > memoizes the strate index per (chunkZ, `GetLayoutVersion()`); `thread_local` per-cell lattice
-> bakes cover slab columns (`GetSlabDensity` step 4), maze open edges, vertical shafts +
-> cross-connectors, floating-island constants, and the disturbance chasms/bridges/ridges; worm
+> bakes cover slab columns (`FGridColumnMod`), maze open edges (`FLatticeCorridorSource`), vertical
+> shafts + cross-connectors (`FShaftFieldSource`), floating-island constants (`FIslandBlobSource`),
+> and the disturbance chasms/bridges/ridges; worm
 > tunnels short-circuit the 2nd Perlin when N1 ≥ WormThreshold (N2 ≥ 0 ⇒ can't carve). With
 > `voxel.WormBlockSkip=1`, a worker-local cache proves whole 4³ lattice blocks only when the
 > actual 3D Perlin bound (`L = 8.118988160`, including `VOXEL_NOISE_SCALE`) plus a `1e-3`
@@ -438,22 +434,21 @@ is the shared digest used by `Tools/VoxelForgeTest.ps1 -Scenario parity`.
 ### 3.7 Cave morphology (SDF rooms/tunnels) — `Public/VoxelCaveMorphology.h` + `.cpp`
 Header is rich with inline docs. Two namespaces + a per-chunk cache system.
 
-- `namespace VoxelSDF` (h:46): `Sphere`, `Ellipsoid`, `Capsule`, `RoundedBox`,
+- `namespace VoxelSDF` (h:78): `Sphere`, `Ellipsoid`, `Capsule`, `RoundedBox`,
   `TaperedCapsule`, `SmoothMin`, `SmoothMax` — all FORCEINLINE SDF primitives.
-- `namespace VoxelHash` (h:158): `Mix`, `Cell`, `Pair`, `ToFloat01`, `ToFloatSigned`
+- `namespace VoxelHash` (h:210): `Mix`, `Cell`, `Pair`, `ToFloat01`, `ToFloatSigned`
   — deterministic hashing for room/tunnel placement (no storage, infinite worlds).
-- Cache structs (h:224-330): `FCachedRoom`, `FCachedTunnel`, `FCachedPit`,
+- Cache structs (h:520-950): `FCachedRoom`, `FCachedTunnel`, `FCachedPit`,
   `FCachedChimney`, `FCachedColumn`, `FChunkSDFCache`.
 - `namespace VoxelCaveMorphology`:
   | Function | .cpp line | Role |
   |----------|-----------|------|
-  | `BuildChunkCache` | 47 | **Phase 1** (once/chunk): collect rooms, guaranteed backbone (`bTunnelsFlowTowardOrigin`: tree rooted at the (0,0) hub — every room reachable, links flow inward; false = legacy NN forest), slope-aware link metric (`TunnelHorizontalBias` now applies to backbone too), decide tunnels, **cull zero-connection rooms** (no sealed bubbles), store rooms by their OWN reach (fixes origin-room clipping at `MaxInfluence`), pre-bake pits/chimneys/columns via the shared `BakeRoomFeature` hash-placement skeleton (one gate/XY/radius pattern + per-type Emit lambda), hash-roll per-room terrain op. |
-  | `EvaluateSDFCached` | 757 | **Phase 2** (per voxel): SmoothMin over cached rooms/tunnels; returns nearest room idx for terrain-op lookup. **Signature changed (perf pass 2): `RoomShapeVariety` param REMOVED** — the shape roll + capsule trig are pre-baked into `FCachedRoom` (`ShapeType/ShapeA/ShapeB/ShapeR`) by `BuildChunkCache`, bit-identical. |
-  | `EvaluateSDF` | 738 | Convenience wrapper (builds temp cache) for one-off queries. |
+  | `BuildChunkCache` | 6782 | **Phase 1** (once/chunk): collect rooms, guaranteed backbone (`bTunnelsFlowTowardOrigin`: tree rooted at the (0,0) hub — every room reachable, links flow inward; false = legacy NN forest), slope-aware link metric (`TunnelHorizontalBias` now applies to backbone too), decide tunnels, **cull zero-connection rooms** (no sealed bubbles), store rooms by their OWN reach (fixes origin-room clipping at `MaxInfluence`), pre-bake pits/chimneys/columns via the shared `BakeRoomFeature` hash-placement skeleton (one gate/XY/radius pattern + per-type Emit lambda), hash-roll per-room terrain op. |
+  | `EvaluateSDFCached` | 8569 | **Phase 2** (per voxel): SmoothMin over cached rooms/tunnels; returns nearest room idx for terrain-op lookup. **Signature changed (perf pass 2): `RoomShapeVariety` param REMOVED** — the shape roll + capsule trig are pre-baked into `FCachedRoom` (`ShapeType/ShapeA/ShapeB/ShapeR`) by `BuildChunkCache`, bit-identical. |
 
-`MakeStrateSeed` (h:~477) is the shared pure world-seed/strate-index salt used by both
+`MakeStrateSeed` (h:965) is the shared pure world-seed/strate-index salt used by both
 `BuildChunkCache` and the TunnelNetwork/Underwater destination landing queries.
-`VF_SuggestLandingPoint` (h:~550, implemented in `VoxelCaveMorphology.cpp`) is the pure player-fit
+`VF_SuggestLandingPoint` (h:1121, implemented in `VoxelCaveMorphology.cpp`) is the pure player-fit
 landing-site query: it evaluates the local archetype source through the same capsule/support
 contract as the measurement pass — support within step height, walkable slope, and full capsule
 clearance. Room queries use a room-floor core, slabs keep their requested XY, and the sparse
@@ -467,7 +462,7 @@ SurfaceWorld remains refused because its production height can depend on manager
 context. It never touches a generator, operator stack, manager, cache, or mutable state.
 
 `FVoxelPassageLanding`, `VF_BuildPassageLanding`, `VF_EvaluatePassageLandingSDF`, and
-`VF_IsPassageLandingFloor` (h:~56/~189, implemented near `.cpp:2059`) turn each inter-strate mouth
+`VF_IsPassageLandingFloor` (h:57/184-199, implemented near `.cpp:6468`) turn each inter-strate mouth
 into a deterministic rounded room plus a hard support slab. The room is sized from the player
 capsule (minimum 12 voxels / 3 m flat floor, 12 voxels / 3 m clear height, and at least 14 voxels /
 3.5 m authored width); the `(0,0)` origin landing is enlarged for the reserved future shaft, while
@@ -476,62 +471,61 @@ The manager's shared thread-local passage shortlist serves tube, room, and floor
 landing search occurs per voxel. `GeneratePassages` stores the full descriptors and the
 order-independence test compares them bit-for-bit.
 
-  Performance note (h:209-220): caching rooms/tunnels once per chunk instead of per
+  Performance note (h:520-531): caching rooms/tunnels once per chunk instead of per
   voxel is the single biggest CPU win.
 
 ### 3.8 Strate system
 **`Public/VoxelStrateTypes.h`** — shared structs/enums (1228 lines, the data vocabulary):
 | Symbol | Line | Role |
 |--------|------|------|
-| `EVoxelPassageType` | 38 | Sloped/Vertical/Spiral/Cascading/Crack passage shapes. |
-| `ESurfaceType` | 78 | Floor/Wall/Ceiling/Any (decoration placement). |
-| `EVoxelNoiseType` | 99 | FBM/Ridged/Mixed/Cellular. |
-| `ECaveGeneratorType` | 146 | TunnelNetwork / FlatPlain / CrystalChamber. |
-| `EVoxelStrateTransition` | 183 | Gradient / Hard / Interleaved boundary blends. |
-| **`FStrateGenerationParams`** | ~350 | The giant TunnelNetwork param bag (rock, worms, rooms, tunnels, warp, roughness, live terrain-detail fields, dead terrain-op transport slots, boundary seal). `Lerp()` static blends two sets at boundaries — it expands the **`VF_STRATE_PARAM_FIELDS` X-macro** (defined just above the struct): **adding a field to the struct? add it to that list** or blends silently reset it to default. |
-| `FStrateTerrainOpEntry` | 965 | Soft-ptr to a terrain op + Weight + Probability. |
-| **`FSlabGenerationParams`** | 1019 | Floor/ceiling heights, roughness, columns, seal — for slab generators. |
-| **`FPlacementProfile`** | ~1747 | **Shared placement vocabulary** for every scatter primitive (`FStrateDecoration`, `FStrateLandmark`, coming `FStrateSetPiece`): spawn (ActorClass/InstancedMesh), Filter gates (surface/slope/overhang/water/RequiredBiome + **F7 awareness `Conditions[]`** — `FTerrainCondition` relief/moisture/biome-border predicates, AND-ed, evaluated by `Generator::EvaluateTerrainConditions`), Transform (align/offsets/RotationOffset+RandomRotation/scale), Render (cull/shadow). Each primitive embeds it as `Profile` + keeps only its own DISTRIBUTION fields. Per-primitive defaults set in each struct's ctor (deco: scale 0.8-1.2 + RandomRotation.Yaw=360; landmark: Ceiling + no align). |
-| `FStrateDecoration` / `FStrateLandmark` | ~1830 / ~1900 | `Profile` + distribution: deco = StreamTier/SpawnDensity/MaxPerChunk; landmark = SpacingChunks/JitterFraction/SpawnProbability/StreamRadiusChunks + Light-Orb block. |
-| `ELandmarkAnchor` (on `FStrateLandmark`) | ~1940 | F7: `AnchorMode` = HashLattice / PassageMouth + passage toggles + exclusion (`ExclusionRadiusChunks`/`Priority`) folded into `FStrateLandmark` (set-pieces merged in — one primitive, one `Landmarks` list, `UpdateLandmarks`). |
-| `FStrateAmbientActor` / `FStrateCreature` | ~2090 / ~2110 | Content spawn entries (consumed by future systems). |
+| `EVoxelPassageType` | 42 | Sloped/Vertical/Spiral/Cascading/Crack passage shapes. |
+| `ESurfaceType` | 81 | Floor/Wall/Ceiling/Any (decoration placement). |
+| `EVoxelNoiseType` | 128 | FBM/Ridged/Mixed/Cellular. |
+| `ECaveGeneratorType` | 175 | TunnelNetwork / FlatPlain / CrystalChamber. |
+| `EVoxelStrateTransition` | 228 | Gradient / Hard / Interleaved boundary blends. |
+| **`FStrateGenerationParams`** | 373 | The giant TunnelNetwork param bag (rock, worms, rooms, tunnels, warp, roughness, live terrain-detail fields, dead terrain-op transport slots, boundary seal). `Lerp()` static blends two sets at boundaries — it expands the **`VF_STRATE_PARAM_FIELDS` X-macro** (defined just above the struct): **adding a field to the struct? add it to that list** or blends silently reset it to default. |
+| `FStrateTerrainOpEntry` | 1169 | Soft-ptr to a terrain op + Weight + Probability. |
+| **`FSlabGenerationParams`** | 1223 | Floor/ceiling heights, roughness, columns, seal — for slab generators. |
+| **`FPlacementProfile`** | 2000 | **Shared placement vocabulary** for every scatter primitive (`FStrateDecoration`, `FStrateLandmark`; set-pieces are landmarks): spawn (ActorClass/InstancedMesh), Filter gates (surface/slope/overhang/water/RequiredBiome + **F7 awareness `Conditions[]`** — `FTerrainCondition` relief/moisture/biome-border predicates, AND-ed, evaluated by `Generator::EvaluateTerrainConditions`), Transform (align/offsets/RotationOffset+RandomRotation/scale), Render (cull/shadow). Each primitive embeds it as `Profile` + keeps only its own DISTRIBUTION fields. Per-primitive defaults set in each struct's ctor (deco: scale 0.8-1.2 + RandomRotation.Yaw=360; landmark: Ceiling + no align). |
+| `FStrateDecoration` / `FStrateLandmark` | 2207 / 2271 | `Profile` + distribution: deco = StreamTier/SpawnDensity/MaxPerChunk; landmark = SpacingChunks/JitterFraction/SpawnProbability/StreamRadiusChunks + Light-Orb block. |
+| `ELandmarkAnchor` (on `FStrateLandmark`) | 2251 | F7: `AnchorMode` = HashLattice / PassageMouth + passage toggles + exclusion (`ExclusionRadiusChunks`/`Priority`) folded into `FStrateLandmark` (set-pieces merged in — one primitive, one `Landmarks` list, `UpdateLandmarks`). |
+| `FStrateAmbientActor` / `FStrateCreature` | 2405 / 2425 | Content spawn entries (consumed by future systems). |
 
 **`Public/VoxelStrateDefinition.h`** — `UVoxelStrateDefinition : UPrimaryDataAsset`
-(line 36). One asset = one strate *type*. Fields: identity, `StrateHeightInChunks`(60),
-`TransitionType`(79)/`TransitionBlendChunks`(89), `GeneratorType`(102),
-`GenerationParams`(113), `SlabParams`(124), `Biomes[]`+`BiomeMapParams` (the biome list +
-field tuning — empty ⇒ unchanged world, §8.14), `TerrainOperations`(147), visuals/fog/light,
-content lists, audio, `GameplayTags`(223), `bUseOperatorStack` (the OPSTACK A/B opt-in — only bites
-if the archetype is in `UsesOperatorStackForChunk`'s ported list). EditConditions show/hide param
-groups by generator type.
+(line 46). One asset = one strate *type*. Fields: identity, `StrateHeightInChunks`(75),
+`TransitionType`(93)/`TransitionBlendChunks`(103), `GeneratorType`(116),
+`GenerationParams`(137), `SlabParams`(148), `Biomes[]`+`BiomeMapParams` (the biome list +
+field tuning — empty ⇒ unchanged world, §8.14), `TerrainOperations`(252), visuals/fog/light,
+content lists, audio, `GameplayTags`(393). EditConditions show/hide param groups by generator
+type.
 
-**`Public/VoxelStrateManager.h` + `.cpp`** — `UVoxelStrateManager : UObject` (h:108).
+**`Public/VoxelStrateManager.h` + `.cpp`** — `UVoxelStrateManager : UObject` (h:152).
 Maps depth→strate at runtime; owns passages.
-- `FVoxelPassage` (h:39): standing endpoints, radius, type, wandering control points, and
+- `FVoxelPassage` (h:46): standing endpoints, radius, type, wandering control points, and
   upper/lower local landing descriptors (room, floor, and door; no root connector).
-- `FStrateSlot` (h:84): definition + chunk-Z range + index.
+- `FStrateSlot` (h:128): definition + chunk-Z range + index.
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| `Initialize` | 10 | Keeps the existing sequencing through `GeneratePassages`, but selects one slot source: a validated cooked season (exact ordered bounds/vector/recipe) or the unchanged authored fixed+sorted/shuffled pool. Assigned-invalid seasons fail closed. Authored source definitions are duplicated as content bags; generated slots use deterministic C++ defaults and zero auto-passages because schema 2 does not store passage configuration. |
-| `GeneratePassages` | 247 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. Each mouth independently queries its own strate's pure player-fit `VF_SuggestLandingPoint` with its contract seed (cave room salt, otherwise world seed), may move within its archetype-specific budget, then receives a body-sized local room/floor. The origin landing is reserved for the future shaft; no landing-to-root road is generated. Unsupported/no-fit answers preserve the old random reach; a deterministic level dog-leg is inserted when the final ramp needs it to stay ≤44°. All descriptors and bounds are generated without reading another passage. |
-| `EvaluateModifierSDF` | 357 | SDF of passage tubes plus local landing rooms at a point. A per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`; the same cache serves floor membership. `FPassageEvaluationCache::FloorProjections` reuses native/generic floor projections and walkable-air results once per `(sample, passage)` using exact double XYZ equality and unchanged float outputs; `voxel.FloorRound1PassageProjectionCache=0` disables only this A/B cache. §8.10. |
-| `ApplyPassageModifier` | 1319 | Shared legacy/op-stack passage post: carves tube and local landing air through the idempotent landing primitive, then restores the local landing support slab in internal positive-solid density. |
-| `VF_ApplyPassageLandingCarving` | — | Idempotent density-independent landing-air threshold shared by the structural pass and the post-disturbance MC backstop; keeps legacy and operator-stack results bit-identical. |
-| `ApplyPassageLandingFloorMC` | 1347 | Reasserts the same support slab after MC-space disturbances and before the final XY edge seal. |
+| `Initialize` | 1164 | Keeps the existing sequencing through `GeneratePassages`, but selects one slot source: a validated cooked season (exact ordered bounds/vector/recipe) or the unchanged authored fixed+sorted/shuffled pool. Assigned-invalid seasons fail closed. Authored source definitions are duplicated as content bags; generated slots use deterministic C++ defaults and zero auto-passages because schema 2 does not store passage configuration. |
+| `GeneratePassages` | 1659 | Deterministic passages between consecutive strates (per-strate `PassageConfig::Style` control points; auto passages retain the existing `EVoxelPassageType` default); placement and shape values are independently salted hashes of seed + boundary slot + connection index. Each mouth independently queries its own strate's pure player-fit `VF_SuggestLandingPoint` with its contract seed (cave room salt, otherwise world seed), may move within its archetype-specific budget, then receives a body-sized local room/floor. The origin landing is reserved for the future shaft; no landing-to-root road is generated. Unsupported/no-fit answers preserve the old random reach; a deterministic level dog-leg is inserted when the final ramp needs it to stay ≤44°. All descriptors and bounds are generated without reading another passage. |
+| `EvaluateModifierSDF` | 2643 | SDF of passage tubes plus local landing rooms at a point. A per-chunk `thread_local` shortlist (`PassagesVersion`-stamped) → far chunks return `FLT_MAX` without walking `Passages`; the same cache serves floor membership. `FPassageEvaluationCache::FloorProjections` reuses native/generic floor projections and walkable-air results once per `(sample, passage)` using exact double XYZ equality and unchanged float outputs; `voxel.FloorRound1PassageProjectionCache=0` disables only this A/B cache. §8.10. |
+| `ApplyPassageModifier` | 2772 | Shared legacy/op-stack passage post: carves tube and local landing air through the idempotent landing primitive, then restores the local landing support slab in internal positive-solid density. |
+| `VF_ApplyPassageLandingCarving` | — | Idempotent density-independent landing-air threshold shared by the structural pass and the post-disturbance MC backstop, so the two agree bit for bit. |
+| `ApplyPassageLandingFloorMC` | 2983 | Reasserts the same support slab after MC-space disturbances and before the final XY edge seal. |
 | `AnyPassageNearBox` | — | Conservative sphere-vs-AABB test of every passage's bound against a voxel box (+carve blend pad). Per TILE (ClassifyTile guard), never per voxel. |
 | `AnyPassageLandingFloorNearBox` | — | Conservative local-landing-floor AABB guard. It kills the `AllAir` hypothesis wherever a proved landing floor can occur; the op-stack returns `Both` for the same box. |
-| `FindSlotIndexForChunkZ` | 427 | Z → layout index. |
-| `GetStrateAt` / `GetStrateIndex` | 443 / 455 | World-Z queries. |
-| `GetLayoutVersion` | h:161 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize` and by the editor composer override). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so live changes never serve stale data. |
-| `GetStrateForChunk` | 466 | Chunk → definition. |
-| `GetGeneratorTypeForChunk` | 476 | Chunk → generator type. |
-| `UsesOperatorStackForChunk` | 559 | Chunk → should `GetDensityAt` take the operator stack? `bUseOperatorStack` on the definition **AND** archetype in the ported list — **now all 8 of 8** (Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork, Underwater). **That list is written down here and nowhere else.** With every archetype ported the flag is now the *only* thing that decides the path, so ticking the box is no longer a no-op anywhere — it is a real switch onto the operator stack for that strate. |
+| `FindSlotIndexForChunkZ` | 6111 | Z → layout index. |
+| `GetStrateAt` / `GetStrateIndex` | 6127 / 6139 | World-Z queries. |
+| `GetLayoutVersion` | h:250 (inline) | Layout/passage generation counter (= `PassagesVersion`, bumped by every `Initialize` and by the editor composer override). Hot-path callers key `thread_local` memos on it (strate-index memo in `GetDensityWithParams`, passage shortlist) so live changes never serve stale data. |
+| `GetStrateForChunk` | 6150 | Chunk → definition. |
+| `GetGeneratorTypeForChunk` | 6176 | Chunk → generator type. |
+| `UsesOperatorStackForChunk` | 6203 | Chunk → does its slot have an operator stack? True for any in-layout slot with a definition whose archetype is one of the 8 (Maze, FlatPlain, CrystalChamber, SurfaceWorld, VerticalShafts, FloatingIslands, TunnelNetwork, Underwater); false outside the layout. **That list is written down here and nowhere else.** `ClassifyTile` guards on it; `GetDensityAt` uses it to share TunnelNetwork stacks by chunk Z. |
 | `GetRecipeForChunk` | — | Runtime immutable recipe/vector/strate-seed copy for cooked seasons; editor slot overrides use the same worker hand-off. |
-| `GetSlabParamsForChunk` | 490 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
+| `GetSlabParamsForChunk` | 6263 | Slab params with runtime Z bounds (no blend — slabs use Hard). |
 | `GetBiomeContextForChunk` | — | Flatten the strate's `Biomes[]` + `BiomeMapParams` into a POD `FBiomeContext` for the biome field. Empty ⇒ biomes disabled. §8.14. |
-| `GetGenerationParams` | 515 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
+| `GetGenerationParams` | 6509 | **Blended** TunnelNetwork params (handles Gradient/Hard/Interleaved transitions). |
 | `SetComposerOverrideForStrate` / `GetComposerOverrideForChunk` | editor-only | Temporary density-only candidate overlay for one existing slot. Copies immutable params/recipe into the worker refetch path, leaves layout/content/passages intact, and bumps `PassagesVersion` to invalidate generator memos. |
-| `BuildParamsFromDefinition` (static) | 1399 | Returns the definition's base `GenerationParams` only. Terrain-op assets are passed separately to `BuildChunkCache`, which applies one selected op per room and pre-bakes Column/Pit/Chimney features. |
+| `BuildParamsFromDefinition` (static) | 6815 | Returns the definition's base `GenerationParams` only. Terrain-op assets are passed separately to `BuildChunkCache`, which applies one selected op per room and pre-bakes Column/Pit/Chimney features. |
 
 **`Public/VoxelTerrainOpDefinition.h` + `.cpp`** — `UVoxelTerrainOpDefinition : UPrimaryDataAsset`
 (h:67). One asset = one terrain op. `EVoxelTerrainOpType` (h:36): Terrace, LayerLines,
@@ -556,7 +550,7 @@ atmosphere override, `WaterMaterial`, `MaterialPaletteIndex` (F6 — baked to ve
 `UVoxelStrateDefinition::Biomes[]`. Generator-agnostic (surface biomes now, cave biomes later). §8.14.
 
 **`Public/VoxelStrateComposer.h` + `Private/VoxelStrateComposer.cpp`** (Tier 4a/4b + Tier 5) — offline
-`FVoxelStrateCorpus`, `VF_RollStrateParams`, and `VF_RollStrateStructure`. `LoadFromAssetRegistry` enumerates every project
+`FVoxelStrateCorpus`, `VF_RollStrateParamsDetailed`, and `VF_RollStrateStructure`. `LoadFromAssetRegistry` enumerates every project
 `UVoxelStrateDefinition` through the Asset Registry, excludes `Saved/Autosaves` and `Saved/Cooked`
 copies, and adds one `VoxelStrateTypes.h` default vector for each of the eight exact archetypes.
 The corpus is grouped by exact `ECaveGeneratorType`: the 2026-09-04 run loaded **4 project
@@ -668,31 +662,29 @@ text plus independently copied metadata/hash, and retains soft references to any
 `UVoxelSettings::Season` is the only activation switch.
 
 ### 3.9 Player edits — `Public/VoxelDiffLayer.h` + `.cpp`
-`UVoxelDiffLayer : UObject` (h:77). Stores `FVoxelModification` (h:43: Center/Radius/Strength;
+`UVoxelDiffLayer : UObject` (h:137). Stores `FVoxelModification` (h:60: Center/Radius/Strength;
 **negative Strength = carve, positive = fill**) grouped by chunk in `TMap ChunkMods`.
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| `SetBudget` | 10 | From VoxelSettings carving caps. |
-| `CanModify` | 20 | Budget check (no consume) — for UI. |
-| `GetRemainingModifications` / `GetRemainingVolume` | 47 / 53 | -1 = unlimited. |
-| `ApplyModification` | 63 | Enforces budget, stores in all overlapped chunks, returns dirty coords. |
-| `GetDensityOffset` | 131 | Per-voxel combined diff (smoothstep falloff, additive). |
-| `HasModifications` | 160 | Fast reject for hot path. |
-| `HasAnyMods` / `GetModsVersion` | h:238 / h:241 (inline) | Lock-free atomics: any-mod-exists flag + monotonic mod-state version (bumped by `ApplyModification`/`Clear`). |
+| `SetBudget` | 102 | From VoxelSettings carving caps. |
+| `CanModify` | 112 | Budget check (no consume) — for UI. |
+| `GetRemainingModifications` / `GetRemainingVolume` | 169 / 175 | -1 = unlimited. |
+| `ApplyModification` | 185 | Enforces budget, stores in all overlapped chunks, returns dirty coords. |
+| `GetDensityOffset` | 299 | Per-voxel combined diff (smoothstep falloff, additive). |
+| `HasModifications` | 421 | Fast reject for hot path. |
+| `HasAnyMods` / `GetModsVersion` | h:246 / h:249 (inline) | Lock-free atomics: any-mod-exists flag + monotonic mod-state version (bumped by `ApplyModification`/`Clear`). |
 | `GetChunkModsSnapshot` | — | Copy one chunk's mod list under ONE read lock. Workers snapshot per (chunk, version) instead of locking per voxel — `GetDensityAt` keys a `thread_local` 64-slot direct-mapped cache on it (~27 lock ops per tile task instead of ~86k once any carve exists). |
 | `HasAnyModInChunkRange` | — | Any modified chunk key in an inclusive chunk box? One key walk under a read lock — ClassifyTile's diff guard (per tile, conservative by construction: mods are stored in every chunk their radius overlaps). |
 | `EvaluateMods` (static) | — | Lock-free pure evaluation of a mod list at a voxel — shared core of `GetDensityOffset` and the generator's snapshot path. |
-| `Clear` | 170 | Wipe all (season reset). |
-| `GetTotalModificationCount` / `GetModifiedChunkCount` | 182 / 192 | Stats. |
+| `Clear` | 435 | Wipe all (season reset). |
+| `GetTotalModificationCount` / `GetModifiedChunkCount` | 454 / 465 | Stats. |
 
 ### 3.10 Mesher — `Public/VoxelMarchingCubesMesher.h` + `.cpp`
-`UVoxelMarchingCubesMesher : UObject` (h:21). Holds `Generator` ptr, `IsoLevel=0`, skirt params.
-(The dead trio `GetDensity`/`InterpolateEdge`/`ComputeGradientNormal` + `GradientOffset` was
-removed — since T1.b the pre-sampled grid supplies positions AND gradients inline.)
+`UVoxelMarchingCubesMesher : UObject` (h:42). Holds `Generator` ptr, `IsoLevel=0`, skirt params.
+The pre-sampled grid supplies positions AND gradients inline (T1.b).
 | Method | .cpp line | Role |
 |--------|-----------|------|
-| **`GenerateSheetMesh`** | ~455 | **F18 far-field SHEET** (render-distance ring, `Tile.Level > MaxClipLevel`): two displaced heightfield grids per tile — ground (polygroup 0) + sky-cap (polygroup 1) from `GetSurfaceHeightAt` columns (StrateChunkZ = band mid identifies the strate; non-SurfaceWorld ⇒ empty). Classes true BY CONSTRUCTION (no vote/probes). Same conventions as `GenerateMesh` (world-cm positions, planar UVs, F6 colour masks, −N double-faced perimeter skirts per bucket, ground‖cap + `NumCeilingTriangles`). Margin ring keeps normals continuous between sheets. XY HOLE params: cells fully inside the MC-covered box around the player (`AVoxelWorld::SheetHole*Vox`, shrunk 1 tile for seam overlap) are skipped — a partially-covered sheet must not overlay near terrain; hole-edge cells get no skirt. Carved features (passages/spine/chasms) + diff layer NOT represented — accepted at sheet distance. |
-| **`GenerateMesh`** | ~15 | The MC loop over cells; `Step` controls LOD sampling. Sets the T2.b octave bias for the tile (`TGuardValue` on `VoxelGenLOD::OctaveBias`, from `LODOctaveDrop` × log2(Step); 0 at LOD0/off). Edge `t` + grid-gradient normals computed inline (`SampleG`/`GradAt`). Optional `OutCaptureGrid` (4th arg) = CAPTURE-DURING-MESHING: when non-null + full-res (`CellsPerAxis==CHUNK_SIZE`), copies the already-sampled `CHUNK_SIZE³` density grid (quantized via `VF_QuantizeDensity`, VoxelTypes.h) so the density clipmap reuses it instead of re-sampling `GetDensityAt`. Pure read of the grid — §8.10 untouched. **F17 surface class**: each unique vertex is classified sol/sky-cap in `GetOrCreateVertex` (down-facing only → memoized `GetSurfaceHeightAt`, nearer `CeilSurf` = cap); triangles bucket by majority into `GroundTris`/`CapTris` (thread_local), skirts emit per bucket, then `Triangles = ground‖cap` + `FVoxelMeshData::NumCeilingTriangles` (→ polygroups in `BuildTileStreamSet`). Same tris, only index ORDER changes. STRATE CONTENT CUT: optional `BandZMin/MaxVox` params restrict the cz cell loop (+ gz sampling rows) to the player-strate band — coarse straddling tiles mesh ONE strate (kills far-LOD inter-strate aliasing holes); meshed cells bit-identical. |
+| **`GenerateMesh`** | 96 | The MC loop over cells; `Step` controls LOD sampling. Sets the T2.b octave bias for the tile (`TGuardValue` on `VoxelGenLOD::OctaveBias`, from `LODOctaveDrop` × log2(Step); 0 at LOD0/off). Edge `t` + grid-gradient normals computed inline (`SampleG`/`GradAt`). Optional `OutCaptureGrid` (4th arg) = CAPTURE-DURING-MESHING: when non-null + full-res (`CellsPerAxis==CHUNK_SIZE`), copies the already-sampled `CHUNK_SIZE³` density grid (quantized via `VF_QuantizeDensity`, VoxelTypes.h) so the density clipmap reuses it instead of re-sampling `GetDensityAt`. Pure read of the grid — §8.10 untouched. **F17 surface class**: each unique vertex is classified sol/sky-cap in `GetOrCreateVertex` (down-facing only → memoized `GetSurfaceHeightAt`, nearer `CeilSurf` = cap); triangles bucket by majority into `GroundTris`/`CapTris` (thread_local), skirts emit per bucket, then `Triangles = ground‖cap` + `FVoxelMeshData::NumCeilingTriangles` (→ polygroups in `BuildTileStreamSet`). Same tris, only index ORDER changes. STRATE CONTENT CUT: optional `BandZMin/MaxVox` params restrict the cz cell loop (+ gz sampling rows) to the player-strate band — coarse straddling tiles mesh ONE strate (kills far-LOD inter-strate aliasing holes); meshed cells bit-identical. |
 
 **`Public/MarchingCubesTables.h`** — `EdgeTable` + `TriTable` reference data (Paul
 Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs editing.
@@ -711,8 +703,10 @@ Bourke). Cube corner/edge layout documented at top (lines 7-37). Rarely needs ed
 ---
 
 ### 3.12 Automation tests — `Private/Tests/` (added 2026-07-27, `#if WITH_DEV_AUTOMATION_TESTS`)
-The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor's
-**Session Frontend → Automation**, filter `VoxelForge`.
+The plugin's first tests (`Docs/archive/OPSTACK-PLAN.md` Phase 0.5). Run them from the editor's
+**Session Frontend → Automation**, filter `VoxelForge`. The `OpStack.*Equivalence` names are
+historical: those tests check the shipped stacks themselves and no longer compare against a
+second density path.
 
 | File | Test name | What it proves |
 |------|-----------|----------------|
@@ -724,61 +718,74 @@ The plugin's first tests (`OPSTACK-PLAN.md` Phase 0.5). Run them from the editor
 | `VoxelForgeClassifyTileTest.cpp` | `VoxelForge.OpStack.BoxVerdictFold` | Pure-logic walk of the fold in `VoxelDensityOp.h`, case by case — including the seal-forces-AllSolid case that justifies `ClassifyBox` existing. Also the only `.cpp` that includes the op header, so the build actually sees it. |
 | `VoxelForgeHeightStackTest.cpp` | `VoxelForge.OpStack.SurfaceHeightEquivalence` | The height-space stack vs `ComputeSurfaceTerrainZ`, in **altitudes**. Runs twice: defaults, then **all F20 terrain ops ON** — the load-bearing pass, since the ops are off by default and the defaults pass exercises only the structural source. Also brute-forces `MaxDisplacement` (a false bound would be a hole). Bar is bit-identity; a height delta is a visibly different world, not rounding. |
 | `VoxelForgeCrossPlatformTest.cpp` | `VoxelForge.Determinism.CrossPlatformDigest` | SHAPE digest (sign of density = the world) + FIELD digest (bit-for-bit) over a fixed integer grid, plus `NearIso` bounding how many samples could flip sign. Reports rather than asserts until pinned. Run on Windows and Linux and compare. |
-| `VoxelForgeOpStackSlabTest.cpp` | `VoxelForge.OpStack.SlabEquivalence` | **Phase 2's first port.** The same 6-op slab stack vs `GetSlabDensity` over 20k points, run twice — FlatPlain **and** CrystalChamber — which is what demonstrates the two archetypes really are one op. Plus window-invariance and box-verdict brute force. Compares against the reference **as it is now** (post Z-term removal), so green = pure refactor and any visual delta is attributable to §3.1 alone. |
+| `VoxelForgeOpStackSlabTest.cpp` | `VoxelForge.OpStack.SlabEquivalence` | The same 6-op slab stack run three times — FlatPlain, CrystalChamber and a tuned CrystalChamber (the worst case for the `ClassifyBox` amplitude bounds): finite density over 20k points, window-invariance across order and threads, and box-verdict brute force. |
 | `VoxelForgeOpStackTunnelTest.cpp` | `VoxelForge.OpStack.TunnelNetworkSpineEquivalence` | **Stage A of the last port.** Zeroes the 13 detail-op amplitudes so the *original* takes the path stage A ported — that is what makes an incomplete stack verifiable now. Samples in **clusters** (24 chunks × 250 points), because the SDF cache rebuilds when a query leaves its box and uniform sampling would rebuild per point on both paths. Check 3 (two param sets, A/B interleaved) compares each stack **to itself alone, never to the original** — the original would fail it, see AUDIT §C2. Asserts **zero** box verdicts, which is the honest stage-A result. |
 | `VoxelForgeOpStackShaftTest.cpp` | `VoxelForge.OpStack.VerticalShaftEquivalence` | The port that tests **reuse**, not fidelity: three of the five ops are Maze's, unchanged. Forces connectors + ledges on, because both are off or negligible at defaults and a resting param is an untested operator. The source and mirror now share a deterministic inner-3×3-emitted drainage tree whose parents come from rebuild-only ±2/±3 windows in a wider direct-indexed halo (default 9×9 emit / 15×15 roll), plus the old random links. Tree connector Z is exact and ledge-free; tree and random capsules are spatially culled from the cached rebuild. **Fixed 2026-07-29:** its box query used to return `CarveOnly` because a shaft merely *existed* within a `Spacing*1.6` halo — true almost everywhere at `ShaftSpacing 55 / ShaftDensity 0.6`, hence **0 of 60** tiles. It now publishes an isolated interval for tree and random capsules (same row-major cell order ⇒ same `VoxelHash::Pair`, so symmetry of `Pair()` is not assumed), with **Z exact** and XY conservative; the ledge and converter decide their own effects. The sampler was also widened from ±48 voxels to ±440. Every proved tile is brute-forced over its full lattice, and the test reports rebuild-vs-hot cache cost. |
 | `VoxelForgeOpStackIslandTest.cpp` | `VoxelForge.OpStack.FloatingIslandEquivalence` | The port that runs the stack **backwards** — void + fill vs rock + carve, same classes with the opposite sign. Counts interior-solid and open-void samples separately (on this archetype an aggregate "N solid" is dominated by the seal bands and says nothing about the islands). Counts `AllSolid` and `AllAir` verdicts **separately** too: `AllAir` is the one no cave archetype could ever prove, and it is the entire perf argument here. |
-| `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | **Phase 1's load-bearing test.** The 8-op Maze stack vs `GetMazeDensity` over 20k points (bit-identity; a side-of-iso disagreement is the hard fail), plus purity across workers, a 64-seed spanning-tree/connectivity audit, corridor morphology, cache rebuild-vs-hot timing, and brute force on every box verdict the stack emits. Latest audit: **0 tree edge-count violations, 0 tree-disconnected, 0 Maze-disconnected**; interior degrees `d1=15.91%`, `d2=36.60%`, `d3=31.73%`, `d4=12.95%`, `d5=2.56%`, `d6=0.25%`, mean **2.504** versus a cubic grid's degree-6/mean-6.000; runs `min=1 / median=1 / p90=3 / max=18`. Latest focused cache timing: **1.436 μs rebuild**, **0.150 μs hot call**; final namespace timing: **1.130 μs rebuild**, **0.145 μs hot call**. Latest box audit: **104 proved, 152 Mixed, 138,424 voxels, 0 violations**. |
+| `VoxelForgeOpStackMazeTest.cpp` | `VoxelForge.OpStack.MazeEquivalence` | The 8-op Maze stack: decomposition, purity across workers, a 64-seed spanning-tree/connectivity audit, corridor morphology, cache rebuild-vs-hot timing, and brute force on every box verdict the stack emits. Latest audit: **0 tree edge-count violations, 0 tree-disconnected, 0 Maze-disconnected**; interior degrees `d1=15.91%`, `d2=36.60%`, `d3=31.73%`, `d4=12.95%`, `d5=2.56%`, `d6=0.25%`, mean **2.504** versus a cubic grid's degree-6/mean-6.000; runs `min=1 / median=1 / p90=3 / max=18`. Latest focused cache timing: **1.436 μs rebuild**, **0.150 μs hot call**; final namespace timing: **1.130 μs rebuild**, **0.145 μs hot call**. Latest box audit: **104 proved, 152 Mixed, 138,424 voxels, 0 violations**. |
 | `VoxelForgeStrateParamCoverageTest.cpp` | `VoxelForge.Determinism.StrateParamBlendCoverage` | **The X-macro guard** (added 2026-08-17). `FStrateGenerationParams::Lerp` blends the hand-written `VF_STRATE_PARAM_FIELDS` list, **not** the struct — so a field added to one and not the other compiles, tests green, and silently takes its **default** inside every Gradient/Interleaved transition band. This expands the X-macro a **third** way (after LERP and SNAP), into a name list, and diffs it against the struct's UObject reflection. Pure shape test: no fixture, no world, instant. `GExemptFieldNames` is **empty** — every reflected field is covered today, and any exemption must be written down as a decision. Stakes rise with the world composer, which intends to invent parameter sets through this same `Lerp` (`COMPOSER-NOTES.md`). |
 | `VoxelForgeComposerParameterRollTest.cpp` | `VoxelForge.Composer.ParameterRoll` | Asset-Registry corpus audit + complete per-archetype spread/exclusion/clamp table; asserts bit-identical deterministic rerolls and same-archetype parents; measures 64 transient candidate strates with `VF_MeasureStrate` plus the exact unsnapped arrival→departure law; brute-forces every rolled production box verdict. World-scale run: **1,422 applications / 168 distinct fields**; **36/64 survival**, 60 non-vacuous, 58 largest-component, 40 exact-law passes; **1,411 Mixed + 731 AllSolid + 418 AllAir = 1,149 proved boxes**, **1,529,319 lattice voxels checked, 0 violations**, 148.387 s. |
-| ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice, legacy and operator-stack paths; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 24 rows match. |
+| ″ | `VoxelForge.Composer.TerrainDetailLiveness` | Fixed 4,096-point `GetDensityAt` lattice on the TunnelNetwork slot; changes one terrain-detail group at a time with an empty terrain-op pool. Proves 9 live groups / 23 fields and 3 dead groups / 11 fields; all 12 rows must match. |
 | `VoxelForgeComposerPromotionTest.cpp` | `VoxelForge.Composer.Promotion` | Re-measures the 12 project/default members, simulates five deterministic 24-candidate seasons with normalized measured-metric novelty (`<0.20`), cap 6, cumulative JSON promotion, provenance counts, corpus-hash checks, fresh-load gate verification, spread/survival reporting, and deliberate stale-metric corruption. The final landing validation passed the strict existing gates; no assertion was weakened. |
 | `VoxelForgeComposerStructureRollTest.cpp` | `VoxelForge.Composer.StructureRoll` | Rolls root polarity → legal shape source → polarity-derived conversion → 4–8 declaration-legal modifiers → mandatory structural posts; blends the six native parameter families independently, measures 64 novel stacks, captures the same grid for the deterministic filled/contour XZ/XY preview, runs a separate step-1 radius-64 ROI pass for the 33 survivors centred on `LargestComponentPoint`, checks exact arrival→departure connectivity, rerolls every recipe/stack for determinism, and brute-forces every uniform box verdict. World-scale run: **33/64 survival (51.6%)**, **64 distinct recipes**, **0 invalid recipes**, **715 proved custom boxes / 951,665 lattice voxels / 0 violations**, blank plan/card **4/33→5/33**, **174.854 s**, **0 refusals**. |
 | `VoxelForgeComposerShowcaseTest.cpp` | `VoxelForge.Composer.Showcase` | Exhausts the bounded parameter-roll set (seeds **0, 7331**, indices **0–63**), excludes multi-region rolls while the lateral gate is off, and measures every missing-family candidate in all six interior target slots at step 4 / radius 256 / `MaxCells=8,000,000`. Hard gates are non-vacuous, largest air share ≥ **0.50**, and exact unsnapped arrival→departure connectivity; selection score is floor-area fraction + clearance tie-break + projected-surface tie-break. It asserts roll/manifest determinism, density sign, zero `WorldRadiusVoxels`, bit-identical metric reruns, and writes one alphabetized card per archetype to `Saved/VoxelForge/Showcase/index.html`, with step-1 radius-64 filled/contour plan + vertical ROI images centred on `LargestComponentPoint`. The final landing regeneration evaluated **256** rolls (**82** eligible single-region, **174** skipped multi-region), produced **7 fine renders, 1 refusal, 0 blanks**, and retained a diagnostic hard-gate survivor set of **0/8**. |
 | `VoxelForgeComposerSeasonTest.cpp` | `VoxelForge.Composer.Season` | Existing compose/review/393,216-sample round trip plus schema hash tamper rejection, two independent runtime manager/generator instances, season-authoritative seed/spine/radius, unset-season regression, and brute-force verification of every sampled non-Mixed recipe tile verdict (up to 64). |
 | `VoxelForgeComposerCorpusFreeTest.cpp` | `VoxelForge.Composer.CorpusFree` | Shares each structure recipe across today's corpus blend, naive independent uniform rolls, and constraint-sampled rolls. The completed equal-arm world-scale run uses **16 candidates per arm**, step 4 / radius 256 / `MaxCells=8,000,000`, fixed passage-law mouths, and 40 box probes per candidate. Result: **10/16, 9/16, 8/16** survival; survivor feature-scale ranges are **8..268**, **8..60**, **8..92** voxels. Box checks: **185/246,235**, **260/346,060**, **299/397,969** proved/voxels, **0 violations** in every arm; constraint parameter and box-stop violations were also 0. |
 | `VoxelForgeLayoutOrderIndependenceTest.cpp` | `VoxelForge.Determinism.LayoutOrderIndependence` | Builds a known transient soft-pointer pool, then rebuilds it in original, reversed, and swapped orders. Requires a non-empty layout and passage set, and compares every slot's definition/Z/height plus passage endpoints, landing descriptors, control geometry, and bounds bit-for-bit. |
-| `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check both generated mouths against independent source queries, then audits all inter-strate landing ends: body-derived room dimensions, final-density flat-floor slope, local floor/join geometry, seal containment, hot-call/rebuild timing, and targeted `ClassifyTile` box soundness. Reports source-fit/refused mouths and per-archetype landing slopes; fails on any floor, join, seal, or box violation. |
+| `VoxelForgePassageOpenSpaceTest.cpp` | `VoxelForge.Determinism.PassageLandsInOpenSpace` | Uses the real fixture density path to check both generated mouths against independent source queries (Maze/VerticalShafts/FloatingIslands footings are probed on the archetype stack built without a strate manager, i.e. without passage carving), then audits all inter-strate landing ends: body-derived room dimensions, final-density flat-floor slope, local floor/join geometry, seal containment, hot-call/rebuild timing, and targeted `ClassifyTile` box soundness. Reports source-fit/refused mouths and per-archetype landing slopes; fails on any floor, join, seal, or box violation. |
 | `VoxelForgeStrateConnectivityTest.cpp` | `VoxelForge.Generation.StrateConnectivity` / `VoxelForge.Generation.StrateConnectivityRefinement` / `VoxelForge.Generation.VerticalShaftSeamFreedom` | Bounded strate metrics with density-polarity and solid-gap controls, deterministic route rechecks, and refinement sweeps. The refinement test uses the bounded 4-chunk density fixture, fits each measurement AABB to the arrival/departure mouth pair plus three shaft spacings (the prescribed local tree fallback), and caps the fitted control at 120,000,000 cells. It reports exact before/after seed-6 cell counts, reruns every negative with the fitted margin doubled, measures tree orphan candidates/path reachability and roughness-bubble proxies, asserts mouths remain inside the deterministic shaft feature core (the exact axis is an unsupported open cylinder), checks source/mirror physical paths, and requires 16/16 effective arrival→departure results across the 16 VerticalShafts seeds. Margin-binding negatives are reported as measurement limits, never as gap findings. The shaft seam test re-evaluates cell-boundary positions after warming distinct neighbouring chunk contexts. |
-| `VoxelForgeMazeSeamTest.cpp` | `VoxelForge.Generation.MazeSeamFreedom` | Re-evaluates **42** cell-boundary probes after warming six different neighbouring chunk contexts in both legacy and operator-stack paths. Latest result: **0 legacy mismatches, 0 operator mismatches**. The Maze source's 2×2×2 lower-node window is deliberately local; no wide collect is involved. |
-| `VoxelForgeClipmapNoOverlapTest.cpp` | `VoxelForge.Streaming.ClipmapDesiredTilesNoOverlapCoverage` | Sweeps 6,174 centres (negative coords, every parity) × radius/level/render-distance/vertical-clamp/sheet combinations: **zero overlapping desired pairs AND coverage ⊇ the frozen `7486c29` selector**. Failed on `7486c29` (1,022,679 overlapping pairs) as intended. |
+| `VoxelForgeMazeSeamTest.cpp` | `VoxelForge.Generation.MazeSeamFreedom` | Re-evaluates **42** cell-boundary probes through `GetDensityAt` after warming six different neighbouring chunk contexts; must report **0 mismatches**. The Maze source's 2×2×2 lower-node window is deliberately local; no wide collect is involved. |
+| `VoxelForgeClipmapNoOverlapTest.cpp` | `VoxelForge.Streaming.ClipmapDesiredTilesNoOverlapCoverage` | Sweeps 5,145 cases (343 centres with negative coords and every parity × 5 radius/level/render-distance settings × 3 vertical clamps): **zero overlapping desired pairs AND coverage ⊇ the frozen `7486c29` selector**. Failed on `7486c29` (1,022,679 overlapping pairs) as intended. |
 | `VoxelForgeDensityBlockEquivalenceTest.cpp` | `VoxelForge.Density.OperatorBlockMatchesScalarGrid` | Block evaluation (`EvalBlock` after `BuildActiveOpList` pruning) vs scalar, **bit-identical**: 5.1M mesher-grid samples (6 seeds × 8 archetypes × levels 0–5, with edits) + 300k direct `EvalBlock` samples. Scopes `voxel.UseFusedEvaluator=0` so the real block path runs. An injected optimistic `FPassageCarveOp::EffectOverBox` produced 5,612 mismatches. |
 | `VoxelForgeWorldEdgeSealTest.cpp` | `VoxelForge.Generation.WorldEdgeSeal` | Positive samples outside the radius across every fixture strate, bit-identical interior negative control against radius 0, monotonic smooth-ramp check, radius-0 no-op, radial `ClassifyBox`/T1.d proofs brute-forced for every reported voxel, and synthetic plus generated near-rim passage coverage. Emits one aggregate summary with proved-box and voxel counts. |
+| `VoxelForgeCorrectnessRoundTest.cpp` | `VoxelForge.Determinism.DiffApiBoundary` / `DiffLayerIdentity` / `EmptyPassageVersion` / `SurfaceBiomeCacheIdentity` / `TileCacheContextSwitch` / `ZeroTransitionBlend` | Regression coverage for the cold-audit correctness fixes (diff-layer API edges, cache identities, empty-passage layout version, zero transition blend). |
+| `VoxelForgeDescentCorridorTest.cpp` | `VoxelForge.Descent.OwnerPassageCorridor` / `VoxelForge.Descent.OwnerSeedSweep` | Samples the authored A-to-B passage as a body-sized walking corridor in the final owner field. |
+| `VoxelForgeDetSinCosTest.cpp` | `VoxelForge.Determinism.DetSinCos` | Pinned contract for `VoxelMath::DetSin` / `DetCos` / `DetSinCos`. |
+| `VoxelForgeIsFiniteTest.cpp` | `VoxelForge.Math.IsFiniteExact` | Bit-exact equivalence of the generation-path finite predicate (`VoxelMath::IsFinite`). |
+| `VoxelForgeLargeSeedTest.cpp` | `VoxelForge.Determinism.LargeSeedSurvives` | AUDIT C1: the world must still be a world at a large seed (bounded `VoxelHash::SeedOffset`). |
+| `VoxelForgeLateralRegionsTest.cpp` | `VoxelForge.Composer.LateralRegions` | Tier 4d lateral region partition, density blending, conservative box proofs, and the arrival→departure gate (asserts `VF_LateralRegionsAreShippable` stays false while the seam rate is imperfect). |
+| `VoxelForgeOpStackChannelTest.cpp` | `VoxelForge.OpStack.ChannelDAG` | Channel/resource declarations are executable stack-assembly metadata (`FVoxelOpStack::ValidateChannelOrder`). |
+| `VoxelForgeScaleDiagnosisTest.cpp` | `VoxelForge.Composer.ScaleDiagnosis` | Measurement-only scale diagnosis for the player-fit showcase. |
+| `VoxelForgeSealedSolidProofTest.cpp` | `VoxelForge.Determinism.SealedSolidProofSoundness` | Sealed-solid tile proof soundness and invalidation (one-sided: may say false too often, never a wrong true). |
+| `VoxelForgeTilePostReachTest.cpp` | `VoxelForge.Correctness.TilePostReachProof` | The tile-reach proof must fail loudly when its envelope is deliberately made too small. |
+| `VoxelForgeVerticalStrateReachTest.cpp` | `VoxelForge.Streaming.VerticalStrateReach` | Surface-strate streaming keeps the ground visible when the pawn is high in the same strate. |
+| `VoxelForgeWormBlockSkipTest.cpp` | `VoxelForge.Determinism.WormBlockSkipSoundness` | Soundness and coverage of the worker-local worm N1 block proof (`voxel.WormBlockSkip`). |
+| `VoxelForgePlayerFitWindow.h` | — | Shared measurement-window policy for player-fit diagnostics (test/editor side only). |
 
 ## 4. The density pipeline (most-edited hot path)
 
-### 4.1 `GetDensityWithParams` (TunnelNetwork) — VoxelGenerator.cpp:277
+### 4.1 `GetDensityWithParams` (TunnelNetwork) — VoxelGenerator.cpp:3749
 Stage order (negative=solid throughout). Each stage's anchor:
 | Step | Line | What |
 |------|------|------|
-| 1 — Vertical scale | 307 | Stretch Z before noise (`VerticalScale`). |
-| 2 — Base density | 316 | Everything starts solid at `BaseDensity`. |
-| 3 — Cave warp | 321 | Domain-warp the SDF query coords (organic shapes). |
-| 4 — SDF morphology | 368 | Rooms+tunnels via `BuildChunkCache`/`EvaluateSDFCached`. |
-| 4b — Surface roughness | 564 | Volumetric noise near surfaces (fBM/Ridged/Mixed). |
-| 4c–4h — Terrain ops | 688 | Per-room op applied near surfaces. Sub-anchors below. |
-| · Terracing | 727 | Step-like ledges. |
-| · Layer lines | 823 | Horizontal grooves (sin of Z). |
-| · Ribbing | 853 | Parallel ridges (sin of Z). |
-| · Overhangs | 882 | Low-Z-freq noise shelves. |
-| · Cliff sharpening | 918 | Amplify vertical gradient. |
-| · Scallop | 962 | Cellular erosion bowls. |
-| · Arch/Bridge | 998 | Hash-placed capsules across voids. |
-| 4d — Columns | 1053 | Pre-baked vertical cylinders. |
-| 4g — Domes | 1077 | Room-relative hemispherical ceilings. |
-| 4h — Pinch | 1142 | Passage bottlenecks. |
-| 5 — Worm tunnels | 1241 | abs(noise1)+abs(noise2), masked by distance-to-network (`WormNetworkRange`: braids hugging rooms/tunnels, no far-field speckle; 0 = legacy unmasked). |
-| 6 — Boundary seal | 1274 | Solid top/bottom shells (`ApplyBoundarySeal`). |
-| 7 — Inter-strate passages + landings | `GetDensityWithParams`: 2217; `GetSlabDensity`: 2434+ | Carve wandering passage tubes and deterministic local landing rooms, restore their support floors, then leave the final XY seal to the outer MC post (`ApplyPassageModifier` / `ApplyPassageLandingFloorMC`). |
+| 1 — Vertical scale | 3799 | Stretch Z before noise (`VerticalScale`). |
+| 2 — Base density | 3808 | Everything starts solid at `BaseDensity`. |
+| 3 — Cave warp | 3813 | Domain-warp the SDF query coords (organic shapes). |
+| 4 — SDF morphology | 3863 | Rooms+tunnels via `BuildChunkCache`/`EvaluateSDFCached`. |
+| 4b — Surface roughness | 4267 | Volumetric noise near surfaces (fBM/Ridged/Mixed). |
+| 4c–4h — Terrain ops | 4395 | Per-room op applied near surfaces. Sub-anchors below. |
+| · Terracing | 4437 | Step-like ledges. |
+| · Layer lines | 4534 | Horizontal grooves (sin of Z). |
+| · Ribbing | 4564 | Parallel ridges (sin of Z). |
+| · Overhangs | 4593 | Low-Z-freq noise shelves. |
+| · Cliff sharpening | 4629 | Amplify vertical gradient. |
+| · Scallop | 4673 | Cellular erosion bowls. |
+| · Arch/Bridge | 4709 | Hash-placed capsules across voids. |
+| 4d — Columns | 4738 | Pre-baked vertical cylinders. |
+| 4g — Domes | 4766 | Room-relative hemispherical ceilings. |
+| 4h — Pinch | 4831 | Passage bottlenecks. |
+| 5 — Worm tunnels | 4905 | abs(noise1)+abs(noise2), masked by distance-to-network (`WormNetworkRange`: braids hugging rooms/tunnels, no far-field speckle; 0 = legacy unmasked). |
+| 6 — Boundary seal | 4987 | Solid top/bottom shells (`ApplyBoundarySeal`). |
+| 7 — Inter-strate passages + landings | 5008 | Carve wandering passage tubes and deterministic local landing rooms, restore their support floors, then leave the final XY seal to the outer MC post (`ApplyPassageModifier` / `ApplyPassageLandingFloorMC`). |
 
-### 4.2 `GetSlabDensity` (FlatPlain / CrystalChamber) — VoxelGenerator.cpp:1306
-| Step | Line | What |
-|------|------|------|
-| 1 — Floor surface | 1317 | Noisy floor height. |
-| 2 — Ceiling surface | 1343 | Formations hang downward (`abs(noise)`). |
-| 3 — Void→base density | 1379 | Solid outside [floor,ceiling]. |
-| 4 — Columns | 1399 | World-space hash grid, full-height. |
-| 5+6 — Seal + passages | 1461 | Same seal, passage-tube, landing-room, connector, and support-floor path as TunnelNetwork. |
+### 4.2 `BuildSlabStack` (FlatPlain / CrystalChamber) — VoxelDensityOpStack.cpp
+| Step | Op | What |
+|------|----|------|
+| 1 — Floor surface | `FSlabVoidSource` | Noisy floor height (XY-pure). |
+| 2 — Ceiling surface | `FSlabVoidSource` | Formations hang downward (`abs(noise)`). |
+| 3 — Void→base density | `FSlabVoidSource` | Solid outside [floor,ceiling]. |
+| 4 — Columns | `FGridColumnMod` | World-space hash grid, full-height. |
+| 5+6 — Seal + passages | `AppendStructuralPost` | Spine, vertical seal, passage tube/landing floor, XY seal — the same structural post as every stack. |
 
 ---
 
@@ -786,25 +793,25 @@ Stage order (negative=solid throughout). Each stage's anchor:
 
 | Goal | Location |
 |------|----------|
-| Chunk size / voxel scale | `VoxelTypes.h:19-23` (rebuild everything). |
+| Chunk size / voxel scale | `VoxelTypes.h:211-213` (rebuild everything). |
 | View distance / task budget / LOD distances | `VoxelSettings.h` (no recompile of logic — data asset). |
-| LOD step mapping | `AVoxelWorld::LODToStep` VoxelWorld.cpp:268; `GetLODForChunk` :242. |
-| How chunks stream in/out | `UpdateChunksAroundPosition` VoxelWorld.cpp:362. |
-| Async threading / stale-result handling | `LoadTile` :445, `ProcessPendingChunks` :301, generation Epoch + per-request cancellation token. |
+| LOD step mapping | `LoadTile` VoxelWorld.cpp:7329-7335: extent `CHUNK_SIZE << Level`, cells from `FullResClipLevels`/`CoarseTileCells`, `Step = Extent / Cells`; tile selection in `VoxelClipmapDesiredTiles::Build` (`Private/VoxelClipmapDesiredTiles.h`). |
+| How chunks stream in/out | `UpdateChunksAroundPosition` VoxelWorld.cpp:6870. |
+| Async threading / stale-result handling | `LoadTile` :7291, `ProcessPendingChunks` :5856, generation Epoch + per-request cancellation token. |
 | Add a new cave feature / terrain op | Add enum in `VoxelTerrainOpDefinition.h:36`, params there, `ApplyTo` (.cpp:6), transport fields in `FStrateGenerationParams`, consume it in a new Step inside `GetDensityWithParams`. |
-| Tweak room/tunnel shapes | `VoxelCaveMorphology.cpp` `BuildChunkCache` :47 / `EvaluateSDFCached` :757. |
-| Worm tunnel behavior | `GetDensityWithParams` Step 5, VoxelGenerator.cpp:1241. |
-| Strate stacking / which strate where | `UVoxelStrateManager::Initialize` :10. |
+| Tweak room/tunnel shapes | `VoxelCaveMorphology.cpp` `BuildChunkCache` :6782 / `EvaluateSDFCached` :8569. |
+| Worm tunnel behavior | `GetDensityWithParams` Step 5, VoxelGenerator.cpp:4905. |
+| Strate stacking / which strate where | `UVoxelStrateManager::Initialize` :1164. |
 | Publish/use an offline season | Create `UVoxelSeasonAsset`, set `SourceManifestJson`, press `ImportSeasonManifestJson`, then assign it to `UVoxelSettings::Season`. |
-| Boundary blend between strates | `GetGenerationParams` :515 + `FStrateGenerationParams::Lerp` (expands `VF_STRATE_PARAM_FIELDS`, StrateTypes.h — new fields go in that list). |
-| Passages / landing geometry between strates | `GeneratePassages` :146 + `EvaluateModifierSDF` :371 + `ApplyPassageModifier` / `ApplyPassageLandingFloorMC` (StrateManager.cpp) + `ClassifyTile` floor guard (Generator.cpp). |
-| Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:691/709 → `UVoxelDiffLayer::ApplyModification` :63. |
+| Boundary blend between strates | `GetGenerationParams` :6509 + `FStrateGenerationParams::Lerp` (expands `VF_STRATE_PARAM_FIELDS`, StrateTypes.h — new fields go in that list). |
+| Passages / landing geometry between strates | `GeneratePassages` :1659 + `EvaluateModifierSDF` :2643 + `ApplyPassageModifier` / `ApplyPassageLandingFloorMC` (StrateManager.cpp) + `ClassifyTile` floor guard (Generator.cpp). |
+| Player carve/fill | `CarveAtPosition`/`FillAtPosition` VoxelWorld.cpp:8413/8422 → `UVoxelDiffLayer::ApplyModification` :185. |
 | Mesh smoothness / normals | Grid-gradient in `GenerateMesh` (`GradAt` lambda), `IsoLevel` (h). |
-| New slab/flat-world generator | `GetSlabDensity` Generator.cpp:1306 + `FSlabGenerationParams` (StrateTypes.h:1019). |
+| New slab/flat-world generator | `VoxelDensityOps::BuildSlabStack` + `FSlabVoidSource` / `FGridColumnMod` (VoxelDensityOpStack.cpp) + `FSlabGenerationParams` (StrateTypes.h:1223). |
 | Biome placement / layout | `BiomeMapParams` on the strate (cell size, warp, climate freqs) + each biome's climate box. Bake `AVoxelWorld::BakeBiomePreview` to tune. §8.14. |
-| What a biome does to terrain | A full archetype param override on the biome (`bOverrideTerrain` + `SurfaceParams`); surface output-blends dominant/neighbour heights in `GetSurfaceDensity`. Caves = content/atmosphere only (determinism, §8.14). |
+| What a biome does to terrain | A full archetype param override on the biome (`bOverrideTerrain` + `SurfaceParams`); surface output-blends dominant/neighbour heights in the surface stack (`BuildSurfaceStack` with per-biome params) and in `ComputeSurfaceColumn`. Caves = content/atmosphere only (determinism, §8.14). |
 | Add a biome / biome content | New `UVoxelBiomeDefinition` asset → add to the strate's `Biomes[]`. §8.14 / §8.12. |
-| Season reset | `AVoxelWorld::ChangeSeed` :740. |
+| Season reset | `AVoxelWorld::ChangeSeed` :8710. |
 
 ---
 

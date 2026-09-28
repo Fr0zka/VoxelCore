@@ -1,34 +1,32 @@
 // VoxelDensityOp.h
 // LE CONTRAT de la pile d'opérateurs de densité / THE density operator stack CONTRACT.
-// Phase 1 de OPSTACK-PLAN.md. The contract is implemented by the opt-in stack path in
-// UVoxelGenerator::GetDensityAt; the legacy archetype switch remains for non-opt-in strates.
+// Design : Docs/archive/OPSTACK-PLAN.md. The contract is implemented by the stack path in
+// UVoxelGenerator::GetDensityAt, which generates every strate.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // POURQUOI / WHY
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// UVoxelGenerator::GetDensityAt est aujourd'hui un `switch` sur 8 ECaveGeneratorType, chacun
-// possédant sa fonction de densité et son struct de params. Conséquences : une nouvelle idée de
-// monde coûte ~6 sites d'édition, et surtout LES IDÉES NE PEUVENT PAS SE COMBINER — un archétype
-// possède le voxel entier. On ne peut pas écrire « une strate de surface dont les montagnes
-// contiennent un réseau de salles, avec des îles flottantes dans le vide au-dessus », à aucun prix.
+// Chaque archétype (ECaveGeneratorType) est une composition d'opérateurs, pas une fonction de
+// densité monolithique qui posséderait le voxel entier. Une idée de monde s'exprime en empilant
+// sources, combinateurs et modificateurs — et les idées peuvent donc SE COMBINER : « une strate de
+// surface dont les montagnes contiennent un réseau de salles, avec des îles flottantes au-dessus ».
 //
-// GetDensityAt is today a `switch` over 8 ECaveGeneratorType, each owning a bespoke density
-// function and param struct. A new world idea costs ~6 edit sites, and — the real problem —
-// IDEAS CANNOT COMBINE: one archetype owns the whole voxel.
+// Each archetype (ECaveGeneratorType) is a composition of operators, not a monolithic density
+// function that owns the whole voxel. A world idea is expressed by stacking sources, combiners and
+// modifiers — so ideas can COMBINE.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // ⚠️ CE N'EST PAS L'ANCIEN SYSTÈME DE « ROOM OPERATIONS » / THIS IS NOT THE OLD ROOM-OPS SYSTEM
 // ─────────────────────────────────────────────────────────────────────────────────────────
 // UVoxelTerrainOpDefinition (Terrace, Ribbing, Cliff, Scallop, Overhang, Arch, Column, Pit…) ne
 // sait que PERTURBER une densité près d'une surface qui existe déjà. Il ne décide jamais ce que le
-// champ EST — cette décision vit dans le `switch`. Une pile d'opérateurs qui se contenterait de
-// cela aurait reconstruit le switch avec des étapes en plus.
+// champ EST — c'est le rôle des sources de champ ci-dessous.
 //
 // D'où QUATRE RÔLES, dont l'ancien système n'occupait que le troisième :
 //
 //   1. FIELD SOURCE      — fabrique un champ À PARTIR DE RIEN. C'est ce qui fait qu'une grotte est
 //                          une grotte et qu'un monde ouvert est un monde ouvert. Chaque archétype
-//                          d'aujourd'hui est fondamentalement l'une de ces sources.
+//                          est fondamentalement l'une de ces sources.
 //   2. COMBINER          — comment deux champs fusionnent (min/max/smooth/mask). C'EST le rôle qui
 //                          achète la composition ; sans lui il n'y a pas de refactor.
 //   3. DETAIL MODIFIER   — l'ancien système, rétrogradé à un rôle sur quatre. Inchangé.
@@ -56,9 +54,8 @@
 // An SDF-only writer reports an SDF interval; a later converter folds that interval through its own
 // response. Each operator answers for itself, so an unverified composition remains sound.
 //
-// La première version de cette interface n'avait qu'une direction numérique. Presque tout opérateur
-// existant est UNIDIRECTIONNEL : il ne fait que creuser, ou que remplir. Cela suffit à reproduire
-// GÉNÉRIQUEMENT chaque garde écrite à la main dans ClassifyTile :
+// Presque tout opérateur est UNIDIRECTIONNEL : il ne fait que creuser, ou que remplir. La direction
+// suffit donc à exprimer GÉNÉRIQUEMENT les gardes de ClassifyTile :
 //
 //     « passages ⇒ bCanSolid = false »        EST     CarveOnly
 //     « ponts/arêtes ⇒ bCanAir = false »      EST     FillOnly
@@ -71,26 +68,16 @@
 // it never lets an SDF writer impersonate a downstream neighbour.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// LE GROS LOT PERF : les strates de grotte ne sautent AUCUNE tuile aujourd'hui
-// THE PERF PRIZE: cave strates skip ZERO tiles today
+// CLASSIFYTILE
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// ClassifyTile conserve ses preuves exactes pour les gaps de bedrock et SurfaceWorld ; les
-// archétypes de cave opt-in passent maintenant par le même pliage `ClassifyBox`. Le post XY fournit
-// en plus la première preuve globale de coque : une tuile entièrement dans la bande forcée peut être
+// ClassifyTile garde ses preuves exactes pour les gaps de bedrock et SurfaceWorld ; les slots de
+// cave passent par le pliage `ClassifyBox` de la pile même qui produit leur densité. Le post XY
+// fournit en plus une preuve globale de coque : une tuile entièrement dans la bande forcée peut être
 // sautée sans connaître l'archétype ou le Z.
 //
-// **Traiter cela comme un livrable explicite de chaque portage, pas comme un effet de bord.**
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// ÉTAT / STATUS
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// Les huit archétypes ont maintenant une pile derrière l'opt-in `bUseOperatorStack`, et ClassifyTile
-// utilise cette pile pour les slots de cave opt-in. Le chemin legacy reste disponible pour les
-// strates non opt-in; les tests d'équivalence servent de garde de portage.
-//
-// All eight archetypes now have an operator-stack path behind `bUseOperatorStack`, and ClassifyTile
-// uses that stack for opt-in cave slots. The legacy switch remains available for opt-out strates;
-// equivalence tests are port-correctness guards.
+// ClassifyTile keeps its exact proofs for bedrock gaps and SurfaceWorld; cave slots go through the
+// `ClassifyBox` fold of the same stack that produces their density. The XY post adds a global
+// shell proof: a tile entirely inside the forced band is skipped without knowing archetype or Z.
 //
 // NOTE sur les UENUM : ces types sont volontairement du C++ nu (pas d'UHT, pas de .generated.h).
 // Ils deviendront UENUM/USTRUCT en Phase 3, quand les opérateurs deviendront des data assets et
@@ -337,11 +324,6 @@ struct FVoxelOpSample
     // FLT_MAX = "no surface nearby" — the initial state, and the early-out placed sources use.
     float Sdf = FLT_MAX;
 
-    // Deprecated structural-floor compatibility fields. Graph tunnels now carry their floor in
-    // the swept shape itself; the production stack does not use these fields to write a slab.
-    bool bProtectedStructuralFloor = false;
-    float StructuralFloorMinimumDensity = 0.0f;
-
     // Block evaluation keeps the room source's per-sample selection explicit.  The scalar path
     // still uses the source's worker-local state, but a later block-capable modifier must never
     // observe the state belonging to the last sample of the preceding operator.
@@ -353,7 +335,6 @@ struct FVoxelOpSample
     // consulting a last-sample TLS value after an op-major evaluation.
     bool bHasTunnelCoreWorldEvaluation = false;
     float TunnelCoreWorldSDF = FLT_MAX;
-    bool bTunnelCoreSupportFloor = false;
     bool bTunnelCoreRoomFloor = false;
     bool bHasTunnelCoreSweptFloor = false;
     float TunnelCoreSweptFloorZ = -FLT_MAX;
@@ -720,13 +701,12 @@ public:
     /**
      * DIAGNOSTIC UNIQUEMENT — le nom que les rapports de test impriment pour cet opérateur.
      *
-     * ⚠️ POURQUOI CETTE MÉTHODE EXISTE, ET CE QU'ELLE A COÛTÉ DE NE PAS AVOIR. Le premier build de
-     * l'`EffectOverBox` spatial est revenu **vert avec 0 tuile prouvée sur 40**, et la seule chose
-     * que le rapport pouvait dire était « ou bien les tuiles traversent toutes une grotte, ou bien
-     * la source n'atteint pas sa branche `Identity` ». Deux causes, zéro nombre pour les
-     * départager — exactement le piège que ce projet a déjà payé plusieurs fois. La vraie cause
-     * était un TROISIÈME opérateur (le ver, qui rendait `CarveOnly` partout). Avec un nom par
-     * opérateur, `ClassifyBoxAttributed` répond « c'est celui-là » au lieu de laisser deviner.
+     * ⚠️ POURQUOI CETTE MÉTHODE EXISTE. Sans nom par opérateur, un rapport « 0 tuile prouvée sur
+     * 40 » ne peut dire que « ou bien les tuiles traversent toutes une grotte, ou bien la source
+     * n'atteint pas sa branche `Identity` » — deux causes, zéro nombre pour les départager, alors
+     * que la vraie cause peut être un TROISIÈME opérateur (p. ex. un ver qui rend `CarveOnly`
+     * partout). Avec un nom par opérateur, `ClassifyBoxAttributed` répond « c'est celui-là » au
+     * lieu de laisser deviner.
      *
      * N'entre dans AUCUNE clé de cache, dans aucun hash, dans aucune décision de génération : le
      * changer ne peut pas changer le monde. Le défaut est volontairement laconique — un opérateur

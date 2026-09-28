@@ -8,6 +8,7 @@
 #include "Misc/AutomationTest.h"
 
 #include "VoxelCaveMorphology.h"
+#include "VoxelDensityOpStack.h"
 #include "VoxelDensityPrimitives.h"
 #include "VoxelForgeTestFixture.h"
 #include "VoxelPassageGeometry.h"
@@ -900,11 +901,27 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
             ++NumFootingChecked;
 
             // The live world's passage modifier is intentionally absent here. The endpoint is
-            // already known to be passage-carved, so this second generator checks the archetype
-            // source itself: air at the landing and solid immediately below it.
-            TStrongObjectPtr<UVoxelGenerator> SourceOnlyGenerator(
-                NewObject<UVoxelGenerator>(GetTransientPackage(), NAME_None, RF_Transient));
-            SourceOnlyGenerator->InitializeSettings(World.Settings.Get());
+            // already known to be passage-carved, so the archetype's own stack, built without a
+            // strate manager (hence without passage carving), checks the source itself: air at
+            // the landing and solid immediately below it.
+            const UVoxelGenerator& LiveGenerator = *World.Generator;
+            FVoxelOpStack SourceStack;
+            FVoxelOpContext SourceContext;
+            SourceContext.Seed = (uint32)LiveGenerator.Seed;
+            SourceContext.LayoutVersion = World.StrateManager->GetLayoutVersion();
+            SourceContext.StrateTopWorldZ = StrateTopZ;
+            SourceContext.StrateBottomWorldZ = StrateBottomZ;
+            SourceContext.WorldRadiusVoxels = LiveGenerator.WorldRadiusVoxels;
+            SourceContext.EdgeSealThickness = LiveGenerator.EdgeSealThickness;
+            // The generator resets the shaft-connector hand-off around every density query; a
+            // direct stack evaluation must model that boundary too.
+            auto EvalSource = [&SourceStack](float QueryX, float QueryY, float QueryZ)
+            {
+                VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+                const float SourceDensity = SourceStack.EvalMC(QueryX, QueryY, QueryZ);
+                VoxelPassageGeometry::ResetVerticalShaftConnectorAirMarker();
+                return SourceDensity;
+            };
 
             float LandingDensity = 0.0f;
             float FootingDensity = 0.0f;
@@ -915,13 +932,16 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                     FMazeGenerationParams P = Definition->MazeParams;
                     P.StrateTopWorldZ = StrateTopZ;
                     P.StrateBottomWorldZ = StrateBottomZ;
-                    LandingDensity = SourceOnlyGenerator->GetMazeDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z, P);
+                    VoxelDensityOps::BuildMazeStack(SourceStack, P, LiveGenerator.Seed,
+                        LiveGenerator.OriginSpineRadius, /*StrateManager*/nullptr);
+                    SourceStack.PrepareChunk(SourceContext);
+                    LandingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z);
                     const float FloorProbeZ = SuggestedPoint.Z
                         - FMath::Max(P.CorridorRadius, 0.5f)
                         - P.SurfaceRoughness * VOXEL_NOISE_SCALE * 1.5f - 3.0f;
-                    FootingDensity = SourceOnlyGenerator->GetMazeDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, FloorProbeZ, P);
+                    FootingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, FloorProbeZ);
                     break;
                 }
 
@@ -930,11 +950,14 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                     FVerticalShaftParams P = Definition->VerticalShaftParams;
                     P.StrateTopWorldZ = StrateTopZ;
                     P.StrateBottomWorldZ = StrateBottomZ;
-                    LandingDensity = SourceOnlyGenerator->GetVerticalShaftDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z, P);
+                    VoxelDensityOps::BuildVerticalShaftStack(SourceStack, P, LiveGenerator.Seed,
+                        LiveGenerator.OriginSpineRadius, /*StrateManager*/nullptr);
+                    SourceStack.PrepareChunk(SourceContext);
+                    LandingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z);
                     const float FloorProbeZ = StrateBottomZ + P.BoundarySealThickness * 0.5f;
-                    FootingDensity = SourceOnlyGenerator->GetVerticalShaftDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, FloorProbeZ, P);
+                    FootingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, FloorProbeZ);
                     break;
                 }
 
@@ -943,10 +966,13 @@ bool FVoxelForgePassageLandsInOpenSpaceTest::RunTest(const FString& Parameters)
                     FFloatingIslandParams P = Definition->FloatingIslandParams;
                     P.StrateTopWorldZ = StrateTopZ;
                     P.StrateBottomWorldZ = StrateBottomZ;
-                    LandingDensity = SourceOnlyGenerator->GetFloatingIslandDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z, P);
-                    FootingDensity = SourceOnlyGenerator->GetFloatingIslandDensity(
-                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z - 1.0f, P);
+                    VoxelDensityOps::BuildFloatingIslandStack(SourceStack, P, LiveGenerator.Seed,
+                        LiveGenerator.OriginSpineRadius, /*StrateManager*/nullptr);
+                    SourceStack.PrepareChunk(SourceContext);
+                    LandingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z);
+                    FootingDensity = EvalSource(
+                        SuggestedPoint.X, SuggestedPoint.Y, SuggestedPoint.Z - 1.0f);
                     break;
                 }
 

@@ -29,7 +29,8 @@ try to run anything.
 - **Determinism:** all randomness = hash of (coord, seed, strateIndex). No RNG state — same seed ⇒
   same world. Player edits (diff layer) are the only non-deterministic overlay.
 - **Async safety:** worker tasks only READ Generator/Mesher, must check `bShuttingDown`, and return via
-  `ProcessQueue` (must stay `EQueueMode::Mpsc`). `EndPlay` blocks on `ActiveTaskCount → 0`.
+  the result queues — `ProcessQueue` and its `CriticalProcessQueue` / `EditedProcessQueue` /
+  `NearProcessQueue` siblings (all must stay `EQueueMode::Mpsc`). `EndPlay` blocks on `ActiveTaskCount → 0`.
 - **Carry the `Epoch`** through any new async path (stale results are dropped on mismatch).
 - **Don't "optimize" the perf invariants** in ARCHITECTURE `§8.10` — the `thread_local` box-valid
   caches, two-pass MC loop, SSE noise, and clipmap streaming are intentional.
