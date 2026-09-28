@@ -1246,8 +1246,8 @@ public:
     // Desired-set membership STAMPÉE : clé → numéro du dernier crossing où la tuile était désirée.
     // BuildDesiredTiles upserte le stamp courant puis balaie la map UNE fois : les entrées à stamp
     // périmé sont les "leavers" (retirées + renvoyées). Le cull ne considère que ces leavers + la
-    // TransitionHold — fini le scan O(toutes-les-tuiles-chargées) à chaque crossing (le spike
-    // CullTiles ~1.6 ms/crossing de la trace 2026-07-05).
+    // TransitionHold — pas de scan O(toutes-les-tuiles-chargées) à chaque crossing (un tel scan
+    // coûtait ~1.6 ms/crossing dans CullTiles).
     TMap<FVoxelTileKey, uint32> DesiredStamped;
     uint32 DesiredStamp = 0;
     bool IsDesired(const FVoxelTileKey& T) const

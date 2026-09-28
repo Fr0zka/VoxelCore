@@ -91,8 +91,7 @@ void UVoxelMarchingCubesMesher::InitializeConsoleSwitches()
 //=============================================================================
 // MAIN ALGORITHM
 //=============================================================================
-// (L'ancien trio GetDensity / InterpolateEdge / ComputeGradientNormal a été retiré :
-//  mort depuis T1.b — la grille pré-échantillonnée fournit positions ET gradients.)
+// La grille pré-échantillonnée fournit positions ET gradients.
 
 FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, int32 Step, int32 InCellsPerAxis,
                                                        TArray<uint8>* OutCaptureGrid,
@@ -141,8 +140,8 @@ FVoxelMeshData UVoxelMarchingCubesMesher::GenerateMesh(FIntVector OriginVoxels, 
     //=========================================================================
     // Le discriminant est SÉMANTIQUE, pas géométrique (fable-idea F17) : un vertex orienté vers
     // le bas est un sky-cap seulement s'il est proche de CeilSurf ; proche de TerrainZ c'est un
-    // surplomb de terrain (reste "sol" — l'ancien vote par tuile mettait le matériau ciel sous
-    // les surplombs des tuiles majoritairement plafond). Un futur toit de grotte (aussi down-
+    // surplomb de terrain (reste "sol" — un vote par tuile mettrait le matériau ciel sous les
+    // surplombs des tuiles majoritairement plafond). Un futur toit de grotte (aussi down-
     // facing, mais SOUS TerrainZ) tombera correctement côté "sol/roche" par la même règle.
     // Coût : GetSurfaceHeightAt (pile XY complète) UNIQUEMENT pour les vertex down-facing,
     // mémoïsé par colonne quantifiée au pas de la grille → ≤ (colonnes touchées) appels ;

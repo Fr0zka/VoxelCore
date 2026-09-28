@@ -234,8 +234,8 @@ namespace
 {
     // One projection result per passage is enough for the current voxel sample.  The surrounding
     // passage cache already moves with (manager, layout, chunk); a generation invalidates old flags
-    // before any caller can observe them.  Keeping the entries indexed by passage avoids the TMap
-    // rehash path that this hot loop used to carry, while a collision-free hit remains exact.
+    // before any caller can observe them.  Keeping the entries indexed by passage avoids a TMap
+    // rehash path in this hot loop, while a collision-free hit remains exact.
     struct FPassageFloorProjectionCacheEntry
     {
         // The sample key lives once in FPassageEvaluationCache.  A monotonically increasing
@@ -1804,13 +1804,13 @@ void UVoxelStrateManager::GeneratePassages()
         case ECaveGeneratorType::TunnelNetwork:
         case ECaveGeneratorType::Underwater:
             // Une salle est une CIBLE ÉPARSE en XY, exactement comme un couloir de labyrinthe : le
-            // budget doit donc être réel. Zéro ici était un bug — la requête trouvait la salle la
-            // plus proche puis atterrissait à côté d'elle dans 92,8 % des cas (balayage d'un million
-            // de seeds). Un espacement de salles est le voisinage local naturel.
+            // budget doit donc être réel. Zéro ici est un bug — la requête trouve la salle la plus
+            // proche puis atterrit à côté d'elle dans 92,8 % des cas (balayage d'un million de
+            // seeds). Un espacement de salles est le voisinage local naturel.
             //
             // A room is an XY-SPARSE target, exactly like a maze corridor, so the budget must be
-            // real. Zero here was the bug: the query found the nearest room and then landed beside
-            // it 92.8% of the time (million-seed sweep). One room spacing is the natural local
+            // real. Zero here is a bug: the query finds the nearest room and then lands beside it
+            // 92.8% of the time (million-seed sweep). One room spacing is the natural local
             // neighbourhood, and it protects the configured spine-distance distribution.
             return FMath::Max(Definition.GenerationParams.RoomSpacing, 1.0f);
 
@@ -2771,9 +2771,9 @@ float UVoxelStrateManager::EvaluateModifierSDF(float WorldX, float WorldY, float
     {
         const FVoxelPassage& P = PassageData[PIdx];
         // BOUNDING-SPHERE REJECT: skip passages this voxel can't possibly be inside.
-        // EvaluateModifierSDF runs PER VOXEL and used to evaluate every passage's full
-        // capsule chain unconditionally — the dominant lag source once passages became
-        // 12-segment worms. Now far passages cost a single squared-distance compare.
+        // EvaluateModifierSDF runs PER VOXEL; evaluating every passage's full capsule chain
+        // unconditionally is the dominant lag source with 12-segment worm passages. Far
+        // passages cost a single squared-distance compare.
         if (FVector::DistSquared(Pos, P.BoundCenter) > P.BoundRadiusSq) continue;
         if (VoxelDensityProfile::AreCountersEnabled())
         {
@@ -3254,8 +3254,8 @@ void UVoxelStrateManager::ApplyPassageStructuralPostsMC(
         }
     }
 
-    // The graph tunnel no longer exposes a separate support slab.  Inter-strate landing carving
-    // remains independent and is still composed here when its own reach proof allows it.
+    // The graph tunnel does not expose a separate support slab.  Inter-strate landing carving
+    // is independent and is composed here when its own reach proof allows it.
     if (!bDisableLandingPosts
         && !bAnyLandingFloor && !bLegacyTunnelSupportFloor && MinLandingSDF < FLT_MAX)
     {
@@ -4773,7 +4773,7 @@ bool UVoxelStrateManager::AnyPassageAirPostNearLattice(
 
     // The union above is conservative but can be much smaller than the queried box. Restrict the
     // exact walk to its lattice intersection; a false positive still pays the exact predicates,
-    // while a far-away long-passage sphere no longer does.
+    // while a far-away long-passage sphere does not.
     if (!VF_LatticeAxisRange(
             FMath::Max((float)VoxelBox.Min.X, PotentialMinX),
             FMath::Min((float)VoxelBox.Max.X, PotentialMaxX),
@@ -6307,22 +6307,21 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
     // and falls back to the switch, so the box can be ticked anywhere without breaking anything.
     switch (Def->GeneratorType)
     {
-    case ECaveGeneratorType::Maze:            return true;   // Phase 1
-    case ECaveGeneratorType::FlatPlain:                      // Phase 2 — les deux partagent
+    case ECaveGeneratorType::Maze:            return true;
+    case ECaveGeneratorType::FlatPlain:                      // les deux partagent
     case ECaveGeneratorType::CrystalChamber:  return true;   //   UNE seule pile (BuildSlabStack)
 
     case ECaveGeneratorType::SurfaceWorld:
-        // ✅ La garde « pas de biomes » est TOMBÉE (étape 2c) : le combiner `Mask` existe, donc une
-        // strate à biomes mélange bien ses hauteurs comme le chemin d'origine. Les trois archétypes
-        // du dessus plus celui-ci font 5 des 8 portés.
-        // The no-biome guard is GONE: the Mask combiner exists, so a biome strate blends its heights
+        // Pas de garde « pas de biomes » : le combiner `Mask` existe, donc une strate à biomes
+        // mélange bien ses hauteurs comme le chemin d'origine.
+        // No no-biome guard: the Mask combiner exists, so a biome strate blends its heights
         // exactly as the original path does.
         return true;
 
-    case ECaveGeneratorType::VerticalShafts:  return true;   // Phase 2 — 3 ops repris de Maze tels quels
+    case ECaveGeneratorType::VerticalShafts:  return true;   // 3 ops repris de Maze tels quels
 
     case ECaveGeneratorType::FloatingIslands:
-        // Phase 2 — la pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
+        // La pile qui tourne à l'ENVERS : source de VIDE + fill, au lieu de source de ROC
         // + carve, avec les MÊMES opérateurs au signe près.
         return true;
 
@@ -6331,15 +6330,13 @@ bool UVoxelStrateManager::UsesOperatorStackForChunk(const FIntVector& ChunkCoord
         // côté rendu. `GetDensityAt` les met dans le même `case`, et `WaterLevelRelative` n'est lu
         // que par `GetWaterLevel*` de ce manager — jamais par la densité (vérifié, pas supposé).
     case ECaveGeneratorType::TunnelNetwork:
-        // Phase 2, LE DERNIER, et le plus gros : ~1080 lignes portées en trois étapes (squelette
-        // SDF → douze modificateurs de détail → override d'op par salle), 19 opérateurs, dont
-        // `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached` au lieu de les
-        // transcrire — c'est là que vit la discipline d'invariance de fenêtre d'ARCHITECTURE §8.4,
-        // et en forker une copie aurait été le pire résultat possible de ce refactor.
+        // Le plus gros : squelette SDF → douze modificateurs de détail → override d'op par salle,
+        // 19 opérateurs, dont `FRoomGraphSource` qui **APPELLE** `BuildChunkCache`/`EvaluateSDFCached`
+        // au lieu de les transcrire — c'est là que vit la discipline d'invariance de fenêtre
+        // d'ARCHITECTURE §8.4 ; en forker une copie la casserait.
         //
-        // **8 SUR 8.** Le `switch` d'archétypes a désormais un jumeau en pile d'opérateurs, opt-in
-        // par strate, chacun vérifié par un test d'équivalence bit à bit contre sa fonction
-        // d'origine. Ce qui n'est PAS fait : `ClassifyTile` n'utilise toujours pas `ClassifyBox`.
+        // **8 SUR 8.** Le `switch` d'archétypes a un jumeau en pile d'opérateurs, opt-in par
+        // strate, chacun vérifié par un test d'équivalence bit à bit contre sa fonction d'origine.
         return true;
 
     default:                                  return false;
@@ -6903,7 +6900,7 @@ FStrateGenerationParams UVoxelStrateManager::GetGenerationParams(const FIntVecto
 //=============================================================================
 // Returns the definition's base GenerationParams (cave shape, SDF, roughness, etc.).
 //
-// NOTE: Terrain op fields (TerraceStepHeight, ColumnDensity, etc.) are no longer
+// NOTE: Terrain op fields (TerraceStepHeight, ColumnDensity, etc.) are not
 // merged here. They default to 0 (disabled) in the base params, and are applied
 // per-room during BuildChunkCache() via FCachedRoom::RoomOp — each room hash-rolls
 // one op from the strate's probability pool (FStrateTerrainOpEntry::Probability).

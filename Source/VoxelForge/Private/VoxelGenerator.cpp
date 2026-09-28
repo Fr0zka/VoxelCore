@@ -16,7 +16,7 @@
 #include "VoxelWormField.h"
 #include "VoxelDensityAblation.h" // fingerprinted development-only stage measurements
 #include "VoxelDensityPrimitives.h"   // spine / seals / passage — shared with the operator stack
-#include "VoxelDensityOpStack.h"      // OPSTACK Phase 1: the opt-in per-strate operator stack
+#include "VoxelDensityOpStack.h"      // the opt-in per-strate operator stack
 #include "VoxelHeightOp.h"            // IVoxelBiomeField — the adapter below implements it
 #include "VoxelStats.h"
 #include "VoxelDensityProfile.h"
@@ -969,12 +969,11 @@ static float RidgedNoise3D(const FVector3f& Position, int32 Octaves = 4,
 // Using F2-F1 (difference of two closest distances) gives smooth cell
 // boundaries with ridges between cells — more interesting than raw distance.
 
-// Le CORPS a déménagé dans Public/VoxelCaveMorphology.h (namespace VoxelNoise), au plus bas point
+// Le CORPS vit dans Public/VoxelCaveMorphology.h (namespace VoxelNoise), au plus bas point
 // qui voit déjà `VoxelHash` : la pile d'opérateurs a besoin exactement du même bruit pour la
 // rugosité (4b, type Cellular) et pour les festons (4f), et deux copies d'une fonction pure finissent
 // par diverger — c'est littéralement `AUDIT §C1`. Ce forwarder garde les ~3 sites d'appel ci-dessous
-// inchangés, comme l'ont fait FractalNoise3D et RidgedNoise3D lors de T2.a. Le chemin chaud garde
-// maintenant les coordonnées en float : la compatibilité d'arrondi historique est abandonnée.
+// inchangés, comme FractalNoise3D et RidgedNoise3D. Le chemin chaud garde les coordonnées en float.
 static float CellularNoise3D(const FVector3f& Position)
 {
     return VoxelNoise::Cellular3D(Position);
@@ -1198,9 +1197,9 @@ static void ApplyDisturbances(float& MC, float X, float Y, float Z,
     }
 }
 
-// The disturbance pass is deterministic and spatially sparse.  ClassifyTile used to treat a
-// non-zero density as a world-wide influence, which made an otherwise proven all-solid/all-air
-// LOD0 box fall back to the full mesher.  These predicates are deliberately one-sided: they only
+// The disturbance pass is deterministic and spatially sparse.  Treating a non-zero density as a
+// world-wide influence would make an otherwise proven all-solid/all-air LOD0 box fall back to the
+// full mesher.  These predicates are deliberately one-sided: they only
 // prove that no hash-placed primitive can touch the queried box.  An intersecting candidate, an
 // invalid range, or an unknown parameter keeps the conservative Mixed result.
 static FORCEINLINE bool VF_DisturbanceBandTouchesBox(
@@ -2860,7 +2859,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
         // tile-window context. A cache hit moves the prepared stack/core out of these TLS values;
         // when the other context misses, this bit must force the rebuild guard below to run.
         thread_local bool                      CP_UsesTileCacheWindow = false;
-        // OPSTACK Phase 1 — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
+        // OPSTACK — la pile d'opérateurs, construite dans le MÊME bloc de refetch que les
         // params (donc même clé owner+chunk+version, aucune logique d'invalidation en plus). Vide tant que
         // la strate n'a pas coché `bUseOperatorStack` ET que son archétype n'est pas porté.
         thread_local FVoxelOpStack            CP_OpStack;
@@ -3086,7 +3085,7 @@ float UVoxelGenerator::GetDensityAt(float WorldX, float WorldY, float WorldZ) co
             }
             CP_Dist = StrateManager->GetDisturbanceParamsForChunk(ChunkCoord);
 
-            // ── OPSTACK Phase 1 : (re)construire la pile si cette strate l'a demandée. ──
+            // ── OPSTACK : (re)construire la pile si cette strate l'a demandée. ──
             // Une seule branche ajoutée au chemin densité, et elle est FROIDE : la construction est
             // par chunk (comme le refetch de params juste au-dessus), jamais par voxel.
             CP_UseOpStack = bUseChunkRoutingCache
@@ -3999,7 +3998,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     thread_local float CachedSMinY = 0.0f, CachedSMaxY = 0.0f;
     thread_local int32 CachedStrate = INT32_MIN;
     thread_local uint32 CachedSeed = 0;
-    // ⚠️ AUDIT §C2 (corrigé le 2026-07-28). Les deux lignes qui manquaient à cette clé.
+    // ⚠️ AUDIT §C2 — `CachedFingerprint` et `CachedLayout` ci-dessous sont OBLIGATOIRES dans cette clé.
     // La clé ci-dessus décrit la GÉOMÉTRIE de la fenêtre (boîte, strate, seed) et rien de ce qui
     // détermine les PARAMS avec lesquels les salles ont été cuites. Comme `GetGenerationParams`
     // blende à l'intérieur d'une strate (`Alpha` = f(chunk Z), et f(chunk XY) aussi en
@@ -4010,7 +4009,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     // Pourquoi ça ne casse PAS l'invariant de perf de §8.10 : la clé reste une BOÎTE, donc les
     // sondes de gradient à `WorldX ± 1` ne font toujours pas tourner le cache. Ce qui le fait
     // tourner en plus, c'est un changement RÉEL de params — une fois par chunk dans une bande de
-    // transition, ce qui est le nombre de reconstructions que ce cache aurait toujours dû faire.
+    // transition, ce qui est exactement le nombre de reconstructions nécessaire.
     thread_local uint32 CachedFingerprint = 0xFFFFFFFFu;
     thread_local uint32 CachedLayout      = 0xFFFFFFFFu;
     thread_local bool CachedUsesFusedCacheWindow = false;
@@ -4518,7 +4517,7 @@ float UVoxelGenerator::GetDensityWithParams(float WorldX, float WorldY, float Wo
     //
     // We copy Params and apply the nearest room's terrain op on top.
     // Base Params has all terrain op fields = 0 (disabled) since
-    // BuildParamsFromDefinition no longer merges them globally.
+    // BuildParamsFromDefinition does not merge them globally.
     //
     // Result: voxels inside different rooms see different terrain ops.
     // Rooms with no assigned op leave terrain fields at 0 → no terrain op. Clean.
@@ -5931,10 +5930,9 @@ bool UVoxelGenerator::GetSurfaceHeightAt(float WorldX, float WorldY, int32 Chunk
 //=============================================================================
 // ~84 % des tuiles générées sortent VIDES (tout-roc sous le terrain, tout-air
 // au-dessus, cap solide) mais payaient quand même le pré-échantillonnage 33³+
-// complet (trace 2026-07-05 : 83 925 GenerateMesh pour 13 227 maillages réels).
-// Une 1re tentative (2026-06-26) a été REVERTÉE : borne analytique GLOBALE du
-// plafond pas assez conservative (cap bas ⇒ trous dans le toit). Ici on suit la
-// prescription du revert : les colonnes sont ÉCHANTILLONNÉES sur le treillis
+// complet (une trace : 83 925 GenerateMesh pour 13 227 maillages réels).
+// ⚠️ Pas de borne analytique GLOBALE du plafond : pas assez conservative (cap
+// bas ⇒ trous dans le toit). Les colonnes sont donc ÉCHANTILLONNÉES sur le treillis
 // exact du mesher (mêmes fonctions ⇒ mêmes floats ⇒ verdict exact, pas une
 // estimation), et le cas tout-solide porte des gardes spine/passages/
 // disturbances/diff. Tout ce qui n'est pas prouvable ⇒ Mixed (le seul coût d'un
@@ -6293,9 +6291,9 @@ static EVoxelTileClass VF_ClassifyBoxRefined(const FVoxelOpStack& Stack,
             && (StructuralManager->AnyLandingFloorAtLattice(
                     Box, Context.LatticeOriginVoxels, Context.Step)
                 // The passage's authored D-floor is a final MC-space writer, not part of the
-                // interpreted stack. It was deliberately left out of the old support-floor query
-                // when the legacy slab was removed; omitting the native-floor reach here lets an
-                // exact core-lattice AllAir claim skip a tile whose final density is solid.
+                // interpreted stack, and no support-floor query covers it; omitting the
+                // native-floor reach here lets an exact core-lattice AllAir claim skip a tile
+                // whose final density is solid.
                 || StructuralManager->AnyPassageStructuralPostNearLattice(
                     Box, Context.LatticeOriginVoxels, Context.Step));
         const bool bHasStructuralCandidate = Whole == EVoxelTileClass::AllSolid
@@ -6994,14 +6992,14 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
                 // même endroit, que `GetDensityAt`.
                 if (!StrateManager->UsesOperatorStackForChunk(CC))
                 {
-                    // Attribution DIAGNOSTIQUE uniquement : l'ancien compteur mélangeait une
-                    // strate cave entièrement désactivée avec une tuile de frontière qui avait
-                    // rencontré un slot désactivé avant la garde « slot différent » ci-dessous.
+                    // Attribution DIAGNOSTIQUE uniquement : distingue une strate cave entièrement
+                    // désactivée d'une tuile de frontière qui a rencontré un slot désactivé avant
+                    // la garde « slot différent » ci-dessous.
                     // On résout les bornes APRÈS l'échec du même prédicat ; elles ne changent ni
                     // la condition, ni le point de retour, ni le verdict.
-                    // Diagnostic attribution only: the old counter mixed a wholly disabled cave
-                    // slot with a boundary tile that met a disabled slot before the different-slot
-                    // guard below. Resolve bounds only after the same predicate fails; classification
+                    // Diagnostic attribution only: separates a wholly disabled cave slot from a
+                    // boundary tile that met a disabled slot before the different-slot guard
+                    // below. Resolve bounds only after the same predicate fails; classification
                     // control flow and return value stay unchanged.
                     int32 FailedTopCZ = 0, FailedBotCZ = 0;
                     if (!StrateManager->GetStrateChunkZBounds(ChunkZ, FailedTopCZ, FailedBotCZ))
@@ -7140,8 +7138,8 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         bCanAir = false;
     }
     // Native passage D-floors are authored structural posts applied after the operator stack.
-    // They are not the removed legacy support slab, but they still add solid MC samples and
-    // therefore must kill the AllAir hypothesis before a tile can be skipped.
+    // They add solid MC samples and therefore must kill the AllAir hypothesis before a tile can
+    // be skipped.
     if (bHasPassageStructuralPostCandidate)
     {
         bCanAir = false;
@@ -7179,7 +7177,7 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
         // `GetGenerationParams` et ses homologues BLENDENT les params dans les bandes de transition :
         // `Alpha` dépend du chunk Z pour `Gradient`, et du chunk XY EN PLUS pour `Interleaved`. Deux
         // chunks d'une même sous-boîte peuvent donc porter des params différents — c'est le constat de
-        // `AUDIT §C2`, confirmé par lecture le 2026-07-28 — et UNE pile ne peut pas représenter DEUX
+        // `AUDIT §C2` — et UNE pile ne peut pas représenter DEUX
         // champs. On construit donc les params pour CHAQUE coordonnée de chunk que la boîte touche et
         // on exige qu'ils soient identiques bit à bit.
         //
@@ -8383,12 +8381,10 @@ float UVoxelGenerator::GetFloatingIslandDensity(float WorldX, float WorldY, floa
     // organic instead of perfect circles. Computed once per voxel and shared by all nearby
     // islands (each samples a different part of the field → distinct silhouettes).
     const float WarpAmp = (Params.IslandMinRadius + Params.IslandMaxRadius) * 0.5f * 0.35f;
-    // ⚠️ AUDIT §C1 — DERNIER SITE DU PLUGIN, trouvé en portant cet archétype (2026-07-28). Le
-    // balayage du 2026-07-27 cherchait le motif `SeedF * K` et celui-ci s'écrit `(float)S * K`, donc
-    // il a survécu : à Seed = 2e9 le terme atteint ~1.4e6, où l'ULP du float vaut 0.125 contre un pas
-    // de 0.04 par voxel — le warp s'aplatit et les îles redeviennent des cercles parfaits. Corrigé
-    // dans les DEUX chemins (ici et FIslandBlobSource) en une passe, pour que le test d'équivalence
-    // reste un oracle valable.
+    // ⚠️ AUDIT §C1 — ne pas écrire l'offset de seed `(float)S * K` : à Seed = 2e9 le terme atteint
+    // ~1.4e6, où l'ULP du float vaut 0.125 contre un pas de 0.04 par voxel — le warp s'aplatit et
+    // les îles redeviennent des cercles parfaits. `VoxelHash::SeedOffset` est utilisé dans les DEUX
+    // chemins (ici et FIslandBlobSource), pour que le test d'équivalence reste un oracle valable.
     // NOTE : `SeedOffset` quantifie la clé de site par ×100, donc 0.0007 → site 0. Unique aujourd'hui
     // (toutes les autres clés du plugin sont ≥ 0.19) ; la prochaine clé sous 0.005 devra en choisir
     // une autre plutôt que de collisionner en silence.

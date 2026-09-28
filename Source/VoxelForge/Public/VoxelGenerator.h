@@ -205,9 +205,8 @@ public:
      * Utilisée en interne par GetDensityAt quand la strate est de ce type.
      * Exposée pour permettre des tests isolés avec des params custom.
      *
-     * ⚠️ `ParamsFingerprint` ET `LayoutVersion` SONT OBLIGATOIRES, ET C'EST LE CORRECTIF
-     * D'`AUDIT §C2` (2026-07-28). Le cache SDF interne est clé sur (boîte XY, strate, seed) et
-     * PAS sur les params. Or `GetGenerationParams` BLENDE les params à l'intérieur d'une même
+     * ⚠️ `ParamsFingerprint` ET `LayoutVersion` SONT OBLIGATOIRES (`AUDIT §C2`). Le cache SDF
+     * interne est clé sur (boîte XY, strate, seed) et PAS sur les params. Or `GetGenerationParams` BLENDE les params à l'intérieur d'une même
      * strate — `Alpha` dépend du chunk Z en mode `Gradient` (le DÉFAUT, avec
      * `TransitionBlendChunks = 2`) et du chunk XY en plus en mode `Interleaved`. Deux chunks de la
      * même strate, même seed, donc même clé, mais des params DIFFÉRENTS : le worker évalue le

@@ -43,11 +43,11 @@ void UVoxelAtmosphereManager::UpdateForPlayer(const FVector& PlayerWorldPos)
     if (!O) return;
 
     // Le champ de densite est en espace ACTEUR : les requetes de strate et de biome veulent des
-    // coordonnees LOCALES. Le placement d acteurs, lui, veut du MONDE. Les deux cohabitent ici, ce
-    // qui est exactement pourquoi ce fichier supposait "acteur a l origine" avant le 2026-08-17.
+    // coordonnees LOCALES. Le placement d acteurs, lui, veut du MONDE. Les deux cohabitent ici : ne
+    // pas supposer "acteur a l origine".
     // The density field is in ACTOR space: strate and biome queries want LOCAL coordinates, while
-    // actor placement wants WORLD. Both live in this function - which is exactly why it used to
-    // assume "actor at origin / identity".
+    // actor placement wants WORLD. Both live in this function - do not assume "actor at origin /
+    // identity".
     const FTransform Xf = O->GetActorTransform();
     const FVector LocalPos = Xf.InverseTransformPosition(PlayerWorldPos);
 

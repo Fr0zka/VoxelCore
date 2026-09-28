@@ -203,11 +203,10 @@ namespace VoxelMath
 // Pourquoi 32 ? Puissance de 2 → astuces bit à bit + bon alignement GPU.
 // VOXEL_SIZE = 25 cm/voxel (Unreal travaille en centimètres). 1 chunk = 8 m.
 //
-// NOTE: 64³ a été essayé ("B", 2026-06-16) pour couper les draw calls (8× moins de
-// chunks) mais le streaming devenait trop saccadé (briques 8× plus lourdes → applies
-// + spawns de contenu en gros à-coups sur le game thread). Reverté à 32³ : le fps se
-// règle côté RENDU (ombres off sur LOD lointain, voir ApplyMeshToChunk), pas via la
-// taille de chunk. La taille de chunk reste le levier streaming-vs-draws si besoin.
+// NOTE: 64³ coupe les draw calls (8× moins de chunks) mais rend le streaming trop
+// saccadé (briques 8× plus lourdes → applies + spawns de contenu en gros à-coups sur
+// le game thread). Le fps se règle côté RENDU (ombres off sur LOD lointain, voir
+// ApplyMeshToChunk), pas via la taille de chunk. La taille de chunk reste le levier streaming-vs-draws si besoin.
 
 constexpr int32 CHUNK_SIZE = 32;
 

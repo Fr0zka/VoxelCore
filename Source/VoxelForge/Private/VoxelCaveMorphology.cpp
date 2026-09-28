@@ -51,7 +51,7 @@ namespace
     // Density coordinates and cached cull radii are float-valued.  FVector is double-valued in
     // UE5, so using FVector::DistSquared here needlessly widens every candidate reject.  Keep the
     // cull in the same build-fixed float domain as the density query; the exact field output is
-    // intentionally no longer required to match the pre-optimization double round-trip.
+    // intentionally not required to match a double-precision round-trip.
     FORCEINLINE float VF_FloatDistSquared(
         float X, float Y, float Z, const FVector& Center)
     {
@@ -1356,7 +1356,7 @@ namespace
         }
 
         // Never turn a malformed authored bound into a giant allocation.  A failed build is
-        // deliberately indistinguishable from the old path to the density evaluator.
+        // deliberately indistinguishable from the unindexed linear scan to the density evaluator.
         constexpr int64 MaxBuckets = 1024 * 1024;
         constexpr int64 MaxReferences = 4 * 1024 * 1024;
         TArray<int32> ItemMinX;
@@ -3626,11 +3626,11 @@ namespace
         // Once the lower and upper ends bracket the room, the authored room/floor field is
         // monotone through this narrow vertical landing band for the finite parameter envelope
         // used by the generator.  Find the one-voxel bucket with a logarithmic search, then run
-        // the exact legacy bisection in that bucket.  The latter is kept byte-for-byte in its
-        // arithmetic and iteration count so the endpoint remains identical to the old scan.
+        // the exact bisection in that bucket.  The latter is kept byte-for-byte in its arithmetic
+        // and iteration count so the endpoint is identical to the one-voxel walk below.
         // If the bracket is not monotone (or the local bucket check cannot reproduce the crossing),
-        // fall back to the original one-voxel walk below; malformed/unsupported inputs therefore
-        // retain the old behavior.
+        // fall back to that one-voxel walk; malformed/unsupported inputs therefore keep its
+        // result.
         auto BisectBracket = [&](float BracketLow, float BracketHigh,
                                  float BracketLowValue) -> bool
         {
@@ -7120,14 +7120,14 @@ void VoxelCaveMorphology::BuildChunkCache(
     // (Frontier rooms with no closer candidate in reach fall back to plain NN — a far
     // cluster stays internally chained even when it can't bridge to the origin side.)
     //
-    // bTunnelsFlowTowardOrigin = false (legacy): plain nearest-neighbor pairing. NOTE:
-    // despite what this comment used to claim, an NN-graph is a FOREST of small clusters,
-    // not a connected tree — isolated cave pockets are expected in this mode.
+    // bTunnelsFlowTowardOrigin = false (legacy): plain nearest-neighbor pairing. NOTE: an
+    // NN-graph is a FOREST of small clusters, not a connected tree — isolated cave pockets
+    // are expected in this mode.
     //
     // Selection metric (not the reach filter) penalizes vertical separation via
     // TunnelHorizontalBias, so the GUARANTEED links also prefer walkable slopes —
-    // previously only the random TunnelDensity extras were biased, which is why
-    // backbone tunnels could come out absurdly steep.
+    // biasing only the random TunnelDensity extras lets backbone tunnels come out
+    // absurdly steep.
     TArray<int32, TInlineAllocator<64>> NearestNeighbor;
     NearestNeighbor.SetNumUninitialized(NumRooms);
 
@@ -8266,7 +8266,7 @@ void VoxelCaveMorphology::BuildChunkCache(
         MaxExtent += FloorReliefEnvelope + BlendEnvelope * 3.0f;
 
         // --- PRE-BAKED SHAPE ---
-        // Same hash roll + thresholds + capsule trig the evaluator used to redo PER VOXEL;
+        // Same hash roll + thresholds + capsule trig the evaluator would otherwise redo PER VOXEL;
         // done once here → EvaluateSDFCached just switches on ShapeType. Bit-identical output.
         {
             const uint32 ShapeHash = VoxelHash::Mix(CR.Hash ^ 0xDEADBEEFu);
@@ -8758,7 +8758,7 @@ float VoxelCaveMorphology::EvaluateSDFCached(
     // A room owns every point inside its authored body. The short mouth ownership fade below
     // handles the fillet outside the wall; this broader test is the hard A > B rule for the room
     // interior. The exact raw shape sign was captured during the room SDF pass above, so this
-    // point no longer performs a second spatial-index traversal.
+    // point does not perform a second spatial-index traversal.
     auto EvaluateTunnel = [&](int32 TunnelIdx)
     {
         const FCachedTunnel& Tunnel = TunnelData[TunnelIdx];

@@ -2,7 +2,7 @@
 // La PILE : un conteneur ordonné d'opérateurs, plus les fabriques d'opérateurs concrets.
 // The STACK: an ordered container of operators, plus the concrete-operator factories.
 //
-// ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN (depuis OPSTACK-PLAN §4, Phase 1, point 3).
+// ⚠️ CECI ALIMENTE LE JEU, MAIS SEULEMENT SUR OPT-IN.
 // `UVoxelGenerator::GetDensityAt` construit la pile par chunk et l'évalue à la place du `switch`
 // UNIQUEMENT quand `UVoxelStrateManager::UsesOperatorStackForChunk` rend true — c.-à-d. quand la
 // strate a coché `bUseOperatorStack` ET que son archétype figure dans la liste des portés :
@@ -18,18 +18,17 @@
 // archetypes; gaps and SurfaceWorld retain their exact hand-written proofs.
 //
 // ⛔ NE JAMAIS faire tourner les deux chemins dans le même monde.
-// ⚠️ EN REVANCHE, LES COMPARER EST DEVENU LÉGITIME — cette ligne disait l'inverse et elle est
-// périmée. `AUDIT §C10` (le résidu ~1 ULP) est CLOS depuis `FPSemantics = Precise` : les cinq tests
-// d'équivalence comparent bit à bit et sont verts. Ils ne sont plus des contrôles de FIDÉLITÉ (la
-// barre `§2.6.1` n'exige aucune ressemblance avec l'ancien monde) mais des oracles de
-// CORRECTION DE PORTAGE — une faute de transcription reste un vrai bug, et l'ancienne fonction est
+// ⚠️ EN REVANCHE, LES COMPARER EST LÉGITIME. `AUDIT §C10` (le résidu ~1 ULP) est clos par
+// `FPSemantics = Precise` : les cinq tests d'équivalence comparent bit à bit. Ce ne sont pas des
+// contrôles de FIDÉLITÉ (la barre `§2.6.1` n'exige aucune ressemblance avec l'ancien monde) mais
+// des oracles de CORRECTION DE PORTAGE — une faute de transcription reste un vrai bug, et l'ancienne fonction est
 // le moyen le moins cher de l'attraper.
 //
 // POURQUOI CETTE FORME / WHY THIS SHAPE
-// La question à laquelle la Phase 1 doit répondre n'est pas « est-ce que ça marche ? » mais
+// La question à laquelle cette forme répond n'est pas « est-ce que ça marche ? » mais
 // **« est-ce que la séparation source / modifier tombe naturellement du code existant ? »**
-// (OPSTACK-PLAN §4, le déclencheur d'arrêt). En portant Maze hors du chemin chaud et en le
-// comparant à l'original, cette question reçoit une réponse MESURÉE plutôt qu'une opinion.
+// (OPSTACK-PLAN §4). Chaque archétype porté est comparé bit à bit à l'original : la réponse est
+// MESURÉE plutôt qu'une opinion.
 
 #pragma once
 
@@ -229,11 +228,11 @@ public:
 
         // The room-graph source publishes the authored floor ownership while evaluating the
         // shape, but it must not be reasserted here.  This stack is followed by the common
-        // disturbance/passage writers; composing the floor at this point made every authored
-        // floor sample look like a post-hoc clamp (and counted 100% of them).  The generator now
+        // disturbance/passage writers; composing the floor at this point would make every authored
+        // floor sample look like a post-hoc clamp (and counted 100% of them).  The generator
         // consumes the same immutable core result after those writers and composes the floor once,
         // at the final MC boundary.  The metadata remains on the sample for that hand-off and for
-        // diagnostics, but it is no longer allowed to modify density inside the operator stack.
+        // diagnostics, but it is not allowed to modify density inside the operator stack.
         return S;
     }
 

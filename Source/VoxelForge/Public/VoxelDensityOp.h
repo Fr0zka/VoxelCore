@@ -1,6 +1,6 @@
 // VoxelDensityOp.h
 // LE CONTRAT de la pile d'opérateurs de densité / THE density operator stack CONTRACT.
-// Phase 1 de Docs/archive/OPSTACK-PLAN.md. The contract is implemented by the opt-in stack path in
+// Design : Docs/archive/OPSTACK-PLAN.md. The contract is implemented by the opt-in stack path in
 // UVoxelGenerator::GetDensityAt; the legacy archetype switch remains for non-opt-in strates.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────
@@ -714,13 +714,12 @@ public:
     /**
      * DIAGNOSTIC UNIQUEMENT — le nom que les rapports de test impriment pour cet opérateur.
      *
-     * ⚠️ POURQUOI CETTE MÉTHODE EXISTE, ET CE QU'ELLE A COÛTÉ DE NE PAS AVOIR. Le premier build de
-     * l'`EffectOverBox` spatial est revenu **vert avec 0 tuile prouvée sur 40**, et la seule chose
-     * que le rapport pouvait dire était « ou bien les tuiles traversent toutes une grotte, ou bien
-     * la source n'atteint pas sa branche `Identity` ». Deux causes, zéro nombre pour les
-     * départager — exactement le piège que ce projet a déjà payé plusieurs fois. La vraie cause
-     * était un TROISIÈME opérateur (le ver, qui rendait `CarveOnly` partout). Avec un nom par
-     * opérateur, `ClassifyBoxAttributed` répond « c'est celui-là » au lieu de laisser deviner.
+     * ⚠️ POURQUOI CETTE MÉTHODE EXISTE. Sans nom par opérateur, un rapport « 0 tuile prouvée sur
+     * 40 » ne peut dire que « ou bien les tuiles traversent toutes une grotte, ou bien la source
+     * n'atteint pas sa branche `Identity` » — deux causes, zéro nombre pour les départager, alors
+     * que la vraie cause peut être un TROISIÈME opérateur (p. ex. un ver qui rend `CarveOnly`
+     * partout). Avec un nom par opérateur, `ClassifyBoxAttributed` répond « c'est celui-là » au
+     * lieu de laisser deviner.
      *
      * N'entre dans AUCUNE clé de cache, dans aucun hash, dans aucune décision de génération : le
      * changer ne peut pas changer le monde. Le défaut est volontairement laconique — un opérateur

@@ -39,8 +39,8 @@ void FVoxelForgeModule::StartupModule()
 		RequestedFma3,
 		Fma3After);
 #endif
-	// These parsers used to be entered lazily by worker-side density/mesher calls.  Resolve the
-	// command line once while the module is starting, before any generation task is submitted.
+	// Resolve the command line once while the module is starting, before any generation task is
+	// submitted, instead of lazily from worker-side density/mesher calls.
 	VoxelGenLOD::InitializeConsoleSwitches();
 	UVoxelMarchingCubesMesher::InitializeConsoleSwitches();
 	UE_LOG(LogTemp, Log, TEXT("VoxelForge module started!"));

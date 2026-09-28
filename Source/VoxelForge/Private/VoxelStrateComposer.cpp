@@ -4872,7 +4872,7 @@ FVoxelStrateRollInfo VF_RollStrateParamsDetailed(const FVoxelStrateCorpus& Corpu
                        Repeat.ArchetypeParams, Result.ArchetypeParams, Result.Archetype)
                    && Repeat.ParentEntryIndices == Result.ParentEntryIndices
                    && Repeat.ParentWeights == Result.ParentWeights,
-               TEXT("VF_RollStrateParams lost determinism for the same corpus/seed/index."));
+               TEXT("VF_RollStrateParamsDetailed lost determinism for the same corpus/seed/index."));
     }
 #endif
     return Result;

@@ -9,7 +9,7 @@ namespace VoxelClipmapDesiredTiles
         int32 ClipRadius = 3;
         int32 MaxClipLevel = 4;
         int32 RenderDistanceChunks = 0;
-        // Far sheet ring selection. AVoxelWorld always passes false (the runtime no longer meshes
+        // Far sheet ring selection. AVoxelWorld always passes false (the runtime does not mesh
         // sheets); it stays here because the clipmap automation tests still exercise it.
         bool bFarSheetRing = true;
         int32 FarSheetSpanLevels = 2;

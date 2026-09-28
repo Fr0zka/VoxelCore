@@ -68,8 +68,8 @@ FORCEINLINE void VF_ApplyBoundarySeal(float& Density, float WorldZ,
 // CARVE DE PASSAGE / PASSAGE CARVING
 //=============================================================================
 // Creuse un passage inter-strates. Évalué APRÈS le seal pour que les passages puissent percer à
-// travers le bouchon solide. Le rayon de blend hard-codé à 4.0f correspond à l'ancienne valeur —
-// à exposer via UVoxelSettings si on veut pouvoir le tweaker.
+// travers le bouchon solide. Le rayon de blend est hard-codé à 4.0f — à exposer via
+// UVoxelSettings si on veut pouvoir le tweaker.
 FORCEINLINE void VF_ApplyPassageCarving(float& Density, float ModSDF,
     float BaseDensity, float SealThickness)
 {

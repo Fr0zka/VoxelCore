@@ -23,11 +23,10 @@
 #include "VoxelTilePostReach.h"
 #include "VoxelClipmapDesiredTiles.h"
 // IWYU (FPSemantics = Precise ⇒ plus de PCH partagé) : GetPlayerPosition déréférence le pawn, donc
-// APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController était
-// complet par transitivité seulement : on l'inclut explicitement, c'est exactement la fragilité
-// qu'on est en train de retirer.
+// APawn doit être COMPLET — `Casts.h` n'en donne qu'une déclaration avant. APlayerController n'est
+// complet que par transitivité : on l'inclut explicitement.
 // GetPlayerPosition dereferences the pawn, so APawn must be COMPLETE — Casts.h only forward-declares
-// it. APlayerController was complete transitively only; include it explicitly.
+// it. APlayerController is complete only transitively; include it explicitly.
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PawnMovementComponent.h"
@@ -185,11 +184,11 @@ AVoxelWorld::AVoxelWorld()
 //=============================================================================
 // T1.f — build the RMC geometry buffers OFF the game thread.
 //=============================================================================
-// FRealtimeMeshStreamSet is plain CPU data; the per-vertex/per-triangle builder loop used to run
-// in ApplyMeshToTile ON THE GAME THREAD, where it was the dominant streaming cost (game thread
-// >6 ms while moving, GPU/draw idle). It touches ONLY the POD MeshData arrays — no UObject, no
-// generator — so it's safe on the gen worker. The game thread then just uploads the finished
-// streams (CreateSectionGroup). Byte-identical geometry; the only thing that moved is WHERE it runs.
+// FRealtimeMeshStreamSet is plain CPU data; on the game thread (in ApplyMeshToTile) the
+// per-vertex/per-triangle builder loop is the dominant streaming cost (game thread >6 ms while
+// moving, GPU/draw idle). It touches ONLY the POD MeshData arrays — no UObject, no generator — so
+// it's safe on the gen worker. The game thread then just uploads the finished streams
+// (CreateSectionGroup). Byte-identical geometry; only WHERE it runs differs.
 static void BuildTileStreamSet(RealtimeMesh::FRealtimeMeshStreamSet& Streams, const FVoxelMeshData& MeshData)
 {
     RealtimeMesh::TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2DHalf, 1> Builder(Streams);
@@ -8044,7 +8043,7 @@ void AVoxelWorld::UnloadTile(const FVoxelTileKey& Tile)
     CollisionNotRequiredTiles.Remove(Tile);
     CollisionSolidTiles.Remove(Tile);
     PendingCollisionCooks.Remove(Tile);
-    // Water + decorations are no longer tile-bound (water is one player-following ocean plane via
+    // Water + decorations are not tile-bound (water is one player-following ocean plane via
     // UpdateWater; decorations stream by distance via UpdateDecorations) — nothing to clear per tile.
     if (URealtimeMeshComponent** Comp = TileComponents.Find(Tile))
     {
@@ -8220,7 +8219,7 @@ bool AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
     }
     BindRealtimeMeshCollisionEvent(RTMesh);
     // Shadow casting: far (level >= 2) tiles never cast; the sky-cap SECTION never casts either
-    // — otherwise the high rock ceiling shadows the entire terrain below it. F17: shadow is now
+    // — otherwise the high rock ceiling shadows the entire terrain below it. F17: shadow is
     // PER SECTION, so a mixed tile keeps its ground shadow while its cap stays shadowless.
     const bool bCastShadow = (Tile.Level <= 1);
     MeshComp->SetCastShadow(bCastShadow);
@@ -8340,7 +8339,7 @@ bool AVoxelWorld::ApplyMeshToTile(FChunkResult& Result)
             TotalSeconds);
     }
 
-    // Water is no longer spawned per tile — it's a single player-following ocean plane (UpdateWater,
+    // Water is not spawned per tile — it's a single player-following ocean plane (UpdateWater,
     // driven from Tick), so it renders at every LOD and to the horizon with no per-tile gaps.
     return true;
 }
@@ -9022,9 +9021,9 @@ void AVoxelWorld::UpdateOrbLightMPC()
             const FVoxelActiveOrb& O = Orbs[i];
             V = FLinearColor((float)O.WorldPos.X, (float)O.WorldPos.Y, (float)O.WorldPos.Z, O.FalloffWorld);
         }
-        // ALWAYS write, even when unchanged. A skip-if-identical cache was tried here and BROKE the
-        // lighting: the MPC's world INSTANCE can be reset/recreated behind our back (PIE init order,
-        // asset recompile), and a cached skip then leaves it holding defaults forever. The per-frame
+        // ALWAYS write, even when unchanged. A skip-if-identical cache BREAKS the lighting: the
+        // MPC's world INSTANCE can be reset/recreated behind our back (PIE init order, asset
+        // recompile), and a cached skip then leaves it holding defaults forever. The per-frame
         // rewrite is what makes the collection self-healing — and 4 vector writes cost nothing.
         UKismetMaterialLibrary::SetVectorParameterValue(this, OrbLightMPC, OrbNames[i], V);
     }

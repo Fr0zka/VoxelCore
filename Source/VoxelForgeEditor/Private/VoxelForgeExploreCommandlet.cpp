@@ -739,7 +739,7 @@ bool ParseArguments(const FString& Params, FExploreArguments& OutArguments, FStr
         OutError = TEXT("rendermaxdistance must be finite and in (0,2048] voxels.");
         return false;
     }
-    // Render no longer budgets density samples: pixels are rasterised from the one canonical
+    // Render does not budget density samples: pixels are rasterised from the one canonical
     // mesh. Keep the legacy renderstep/maxdistance arguments for compatible invocations and use
     // only maxdistance as the raster depth clip.
     if (OutArguments.ExportSize < CHUNK_SIZE

@@ -177,9 +177,9 @@ private:
     void  LaunchPendingFills();               // flush PendingFills onto the dedicated fill thread
     void  DrainResults();                     // apply finished fills into the toroidal arrays (+ GPU dirty)
 
-    // DEDICATED FILL THREAD. The volume fill used to run on the shared UE::Tasks pool (BackgroundLow),
-    // where it STARVED behind mesh-gen (10 s to resolve shadows at a fresh spot). It now runs on its own
-    // thread (off the pool) so it's fast AND never steals a core from mesh-gen. Game thread enqueues
+    // DEDICATED FILL THREAD. On the shared UE::Tasks pool (BackgroundLow) the volume fill STARVES
+    // behind mesh-gen (10 s to resolve shadows at a fresh spot). It runs on its own thread (off the
+    // pool) so it's fast AND never steals a core from mesh-gen. Game thread enqueues
     // FPendingFill (Spsc), the thread re-evaluates GetDensityAt and pushes FFillResult into Results
     // (existing Mpsc, drained on the game thread by DrainResults). Capture still short-circuits most of
     // this (cache hits blit on the game thread, no fill); the thread is the backstop for misses.

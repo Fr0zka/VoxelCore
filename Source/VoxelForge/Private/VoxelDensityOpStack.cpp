@@ -1,6 +1,6 @@
 // VoxelDensityOpStack.cpp
-// Les opérateurs concrets de la Phase 1 : la décomposition de Maze + le post-traitement structurel.
-// The concrete Phase 1 operators: the Maze decomposition + the structural post-process.
+// Les opérateurs concrets : les décompositions d'archétypes + le post-traitement structurel.
+// The concrete operators: the archetype decompositions + the structural post-process.
 //
 // Ces opérateurs alimentent le jeu derrière l'opt-in décrit dans l'en-tête de VoxelDensityOpStack.h.
 //
@@ -92,23 +92,20 @@ namespace
      * gradients.) Se tromper ici coûte une boîte de recherche un peu plus large, jamais un
      * verdict faux : plus large ⇒ SUR-ensemble de primitives ⇒ `Identity` plus rare.
      *
-     * ⚠️⚠️ **CORRIGÉ DE 2.0 À 1.5 LE 2026-07-28, ET CETTE CONSTANTE ÉTAIT LE TERME DOMINANT DE
-     * TOUTE LA FONCTION PENDANT TROIS BUILDS.** À lire avant d'y retoucher.
+     * ⚠️⚠️ **CETTE CONSTANTE EST LE TERME DOMINANT DE TOUTE LA FONCTION.** À lire avant d'y
+     * retoucher.
      *
      * La dilatation vaut `CaveWarpStrength · VOXEL_NOISE_SCALE · CETTE BORNE`. Avec les défauts
-     * (`CaveWarpStrength = 8`, `SCALE = 1.25`) elle valait **20 voxels** — appliquée des deux
-     * côtés de chaque axe d'une tuile de **10 voxels**, soit une boîte de requête de 50 voxels,
-     * **125× le volume de la tuile**. Trois passes de resserrement (le ver, les colonnes,
-     * l'échantillonneur, la disjonction des tunnels) ont été faites AUTOUR de ce terme sans que
-     * personne ne le mesure. Le test des tunnels, annoncé « un ordre de grandeur plus serré », ne
-     * gagnait en pratique que 25 % — exactement parce que `BoxHalfDiag` était dominé par cette
-     * dilatation et non par la géométrie.
+     * (`CaveWarpStrength = 8`, `SCALE = 1.25`), une borne de 2.0 vaut **20 voxels** — appliquée
+     * des deux côtés de chaque axe d'une tuile de **10 voxels**, soit une boîte de requête de
+     * 50 voxels, **125× le volume de la tuile** : `BoxHalfDiag` est alors dominé par cette
+     * dilatation et non par la géométrie, et tout resserrement ailleurs ne gagne presque rien.
      *
-     * ⚠️ ET LE RESTE DU PLUGIN N'A JAMAIS ÉTÉ AUSSI PRUDENT : `BuildChunkCache` est appelée avec
+     * ⚠️ LE RESTE DU PLUGIN EST MOINS PRUDENT : `BuildChunkCache` est appelée avec
      * `Expansion = CaveWarpStrength + 2` (ici comme dans `GetDensityWithParams`), ce qui suppose
-     * `|Perlin3D| · SCALE ≤ CaveWarpStrength`, donc `|Perlin3D| ≤ 0.8`. Le code qui tourne en
-     * production depuis toujours parie déjà là-dessus. Prendre 2.0 était 2,5× plus conservateur
-     * que l'hypothèse dont dépend déjà la correction du cache.
+     * `|Perlin3D| · SCALE ≤ CaveWarpStrength`, donc `|Perlin3D| ≤ 0.8`. Le code de production
+     * parie déjà là-dessus. 2.0 serait 2,5× plus conservateur que l'hypothèse dont dépend déjà la
+     * correction du cache.
      *
      * LA BORNE 1.5, DÉMONTRÉE (et non observée) :
      *   1. `GradDot` rend `±u ± v` où `u` et `v` sont deux composantes **distinctes** de l'offset
@@ -122,11 +119,10 @@ namespace
      * est la borne qui se démontre sans analyse de cas sur les hash. `√3/2 ≈ 0.87`, la borne
      * classique de Perlin 3D, dépend du jeu de gradients : on ne s'appuie pas dessus.)
      *
-     * Was 2.0, and that constant was the dominant term of this whole function for three builds:
-     * it inflated a 10-voxel tile into a 50-voxel query box (125x the volume), which is why the
-     * "order of magnitude tighter" tunnel test only won 25%. The rest of the plugin has always
-     * assumed |Perlin3D| <= 0.8 (BuildChunkCache's Expansion = CaveWarpStrength + 2). 1.5 is
-     * PROVED above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
+     * This bound is the dominant term of the whole function: 2.0 would inflate a 10-voxel tile
+     * into a 50-voxel query box (125x the volume). The rest of the plugin already assumes
+     * |Perlin3D| <= 0.8 (BuildChunkCache's Expansion = CaveWarpStrength + 2). 1.5 is PROVED
+     * above from GradDot's two-distinct-axes form and the per-axis weighted bound of 0.5.
      */
     static constexpr float VF_PerlinAbsBound = 1.5f;
 
@@ -356,7 +352,7 @@ namespace
     // ⚠️ CE QUE ÇA COÛTE, dit franchement : l'original teste UNE fois et saute les douze ; la pile
     // teste douze fois. Douze comparaisons flottantes parfaitement prédites par voxel de roc profond
     // — mesurable, mais c'est exactement le genre de chose que `AUDIT §C10` dit de MESURER avant
-    // d'optimiser. Noté dans OPSTACK-PROGRESS comme poste de perf, pas « corrigé » à l'aveugle.
+    // d'optimiser. C'est un poste de perf connu, pas à « corriger » à l'aveugle.
     //
     // STAGE B5 DECISION: repeated early-out in each op, NOT a scoping container — the stack is a flat
     // list that ClassifyBox folds op by op, and an op that only exists inside a container is not
@@ -874,25 +870,22 @@ namespace
         bool IsAdditive() const override { return false; }
         void PrepareChunk(const FVoxelOpContext&) override {}
 
-        // ⚠️⚠️ CORRIGÉ 2026-07-27 : c'était `true`, ET C'ÉTAIT FAUX.
+        // ⚠️⚠️ `false`, ET NE PAS LE PASSER À `true`.
         //
         // Le contrat de `IsXYPure` est « **`Eval`** ne dépend pas de Z » — pas « les surfaces ne
         // dépendent pas de Z ». Or `Eval` calcule `min(Z - sol, plafond - Z)` : il dépend de Z de
         // la façon la plus directe qui soit. §3.1 a rendu les SURFACES pures en XY ; la DENSITÉ,
         // elle, ne l'a jamais été et ne peut pas l'être — c'est une distance à une surface.
         //
-        // Latent seulement parce que personne ne lit encore ce drapeau. Le jour où le cache de
-        // colonnes T1.a devient générique (l'étape suivante), un `true` ici ferait partager UNE
-        // valeur de densité sur TOUTE la pile verticale de chunks — un monde silencieusement faux,
-        // que `ValidateDeterminism` ne verrait pas parce qu'il échantillonne le long d'un bord X.
-        // C'est exactement le piège que l'avertissement de `VoxelDensityOp.h` décrit, et je suis
-        // tombé dedans en écrivant l'opérateur qui le cite.
+        // Le jour où un cache de colonnes générique lit ce drapeau, un `true` ici ferait partager
+        // UNE valeur de densité sur TOUTE la pile verticale de chunks — un monde silencieusement
+        // faux, que `ValidateDeterminism` ne verrait pas parce qu'il échantillonne le long d'un
+        // bord X. C'est exactement le piège que l'avertissement de `VoxelDensityOp.h` décrit.
         //
-        // ⚠️ FIXED: this said `true` and was WRONG. The contract is "**Eval** does not depend on Z",
-        // and Eval computes min(Z - floor, ceil - Z). §3.1 made the SURFACES XY-pure; the DENSITY
-        // never was and cannot be — it is a distance to a surface. Latent only because nothing reads
-        // the flag yet; a generic T1.a column cache would have shared one density down the whole
-        // vertical chunk stack.
+        // ⚠️ Must stay `false`. The contract is "**Eval** does not depend on Z", and Eval computes
+        // min(Z - floor, ceil - Z). §3.1 made the SURFACES XY-pure; the DENSITY never was and
+        // cannot be — it is a distance to a surface. A generic column cache reading `true` here
+        // would share one density down the whole vertical chunk stack.
         //
         // C'est précisément cette distinction qui justifie l'espace-hauteur (`VoxelHeightOp.h`) :
         // ce qui est pur en XY, ce sont les HAUTEURS, et elles y sont dans un type qui n'a pas de Z.
@@ -956,8 +949,8 @@ namespace
         }
 
     private:
-        // The surface coordinates stay in float; the old FVector round-trip only preserved
-        // legacy rounding and is no longer part of the output contract.
+        // The surface coordinates stay in float; an FVector (double) round-trip is not part of
+        // the output contract.
         float SurfaceFloor(float WorldX, float WorldY) const
         {
             if (FloorRoughness <= 0.0f) { return FloorZ; }
@@ -1307,29 +1300,29 @@ namespace
         bool IsXYPure() const override { return false; }   // voir le bloc ci-dessus
 
         /**
-         * ⚠️ C'EST ICI QUE SE JOUE LA PERF DE CET ARCHÉTYPE — corrigé 2026-07-27 après mesure.
+         * ⚠️ C'EST ICI QUE SE JOUE LA PERF DE CET ARCHÉTYPE.
          *
-         * Le mémo de colonne était clé sur `InstanceId`, qui change à CHAQUE reconstruction de pile,
-         * c'est-à-dire à chaque chunk. Résultat : une strate haute de 4 chunks recalculait ses
-         * colonnes **4 fois**, resamples du cliff compris. Le chemin d'origine ne fait pas ça —
-         * `GSurfColCache` est clé sur `(boîte XY, StrateKey, Seed, LayoutVersion)` **SANS ChunkZ**,
-         * délibérément, « shared down the whole vertical strate stack ». Cette pile reprend la
-         * même identité de strate/layout/seed, en ajoutant l'empreinte obligatoire des params pour
-         * protéger ses sorties propres ; son mémo est maintenant un LRU spatial de six boîtes.
+         * Ne PAS clé ce mémo sur `InstanceId` : il change à CHAQUE reconstruction de pile,
+         * c'est-à-dire à chaque chunk, et une strate haute de 4 chunks recalculerait ses colonnes
+         * **4 fois**, resamples du cliff compris. `GSurfColCache` est clé sur
+         * `(boîte XY, StrateKey, Seed, LayoutVersion)` **SANS ChunkZ**, délibérément, « shared down
+         * the whole vertical strate stack ». Cette pile reprend la même identité de
+         * strate/layout/seed, en ajoutant l'empreinte obligatoire des params pour protéger ses
+         * sorties propres ; son mémo est un LRU spatial de six boîtes.
          *
          * Donc la clé garde l'identité partagée : ce qui rend deux colonnes interchangeables, c'est
          * la STRATE, le seed, la version de layout et les params, pas le chunk. Le mémo étant
-         * `thread_local`, il SURVIT à la reconstruction de la pile — seule la clé l'invalidait.
+         * `thread_local`, il SURVIT à la reconstruction de la pile — seule la clé l'invalide.
          *
          * POURQUOI C'EST SÛR : les hauteurs sont XY-pures par construction (c'est tout l'objet de
          * `VoxelHeightOp.h`, où le type n'a pas de Z), et le champ de biomes est documenté
          * XY-pur — « ZERO Z dependence: the climate/Voronoi fields are pure-XY ». C'est exactement
          * la justification sur laquelle `GSurfColCache` repose déjà.
          *
-         * The memo was keyed on InstanceId, which changes every chunk, so a 4-chunk strate recomputed
-         * every column 4x. GSurfColCache deliberately omits ChunkZ and shares down the whole vertical
-         * stack; this now shares the same strate/layout/seed identity and adds the required params
-         * fingerprint for its own outputs. The six-box LRU keeps independent XY regions alive. Safe
+         * Do not key the memo on InstanceId: it changes every chunk, so a 4-chunk strate would
+         * recompute every column 4x. GSurfColCache deliberately omits ChunkZ and shares down the whole
+         * vertical stack; this shares the same strate/layout/seed identity and adds the required
+         * params fingerprint for its own outputs. The six-box LRU keeps independent XY regions alive. Safe
          * because heights are XY-pure by type and the biome field is documented Z-independent.
          */
         void PrepareChunk(const FVoxelOpContext& Ctx) override
@@ -1973,8 +1966,7 @@ namespace
          *
          * (Le `ClassifyTile` actuel n'a pas cette marge — il exclut simplement ces z du test de
          * colonne. La fenêtre est infime et demande que l'archétype produise de l'air pile à ce z,
-         * mais elle est réelle ; notée plutôt que corrigée en douce, puisque le chemin d'aujourd'hui
-         * n'est pas touché par cette Phase 1.)
+         * mais elle est réelle.)
          */
         EVoxelTileClass ClassifyBox(const FBox& VoxelBox, const FVoxelOpContext&) const override
         {
@@ -2879,19 +2871,15 @@ namespace
     //
     // ⚠️ ÉCART ASSUMÉ AVEC `OPSTACK-DECOMPOSITION §7`, qui décrivait un `FRAME IslandWarp` enveloppant
     // la source. Le warp reste À L'INTÉRIEUR de l'opérateur, et c'est délibéré : `§7` compte trois
-    // usages de frames (îles, caves de TunnelNetwork, tunnels), mais **deux d'entre eux ne sont pas
-    // encore portés**. Inventer l'infrastructure de frame pour son unique utilisateur actuel, c'est
-    // la concevoir contre un seul exemple — précisément ce que ce refactor a évité jusqu'ici en
-    // n'abstrayant qu'à la deuxième occurrence (cf. `IVoxelBiomeField`, né d'un besoin réel).
-    // ✅ RÉPONDU (2026-08-16) : TunnelNetwork EST porté, et le deuxième usage réel a dissous la
-    // question au lieu de la trancher. Voir `BuildTunnelNetworkStack` : `CaveWarp` n'enveloppe
-    // qu'UN opérateur (donc c'est une variable locale, pas un frame) et `VerticalScale` est une
-    // fonction pure d'un scalaire. **Zéro frame sur trois candidats.** Ne pas rouvrir : le warp
-    // reste local ICI pour la même raison qu'il est resté local là-bas.
+    // usages de frames (îles, caves de TunnelNetwork, tunnels), et aucun n'en a besoin. Voir
+    // `BuildTunnelNetworkStack` : `CaveWarp` n'enveloppe qu'UN opérateur (donc c'est une variable
+    // locale, pas un frame) et `VerticalScale` est une fonction pure d'un scalaire. **Zéro frame
+    // sur trois candidats.** Ne pas rouvrir : le warp reste local ICI pour la même raison qu'il
+    // est resté local là-bas. On n'abstrait qu'à la deuxième occurrence réelle (cf.
+    // `IVoxelBiomeField`, né d'un besoin réel).
     //
-    // The warp stays INSIDE the op against §7's FRAME suggestion. ✅ ANSWERED 2026-08-16: this said
-    // "revisit when TunnelNetwork brings the second real use" — TunnelNetwork is ported, and the
-    // second use dissolved the question rather than settling it. See BuildTunnelNetworkStack:
+    // The warp stays INSIDE the op against §7's FRAME suggestion. TunnelNetwork is ported, and the
+    // second real use dissolved the question rather than settling it. See BuildTunnelNetworkStack:
     // CaveWarp wraps exactly ONE operator (a local variable, not a frame) and VerticalScale is a
     // pure function of a scalar. ZERO frames out of three candidates. Do not reopen.
     class FIslandBlobSource final : public IVoxelDensityOp
@@ -3111,8 +3099,8 @@ namespace
          * ⚠️ LA CLÉ INCLUT `BoundarySealThickness`, QUE L'ORIGINAL OMET. `SpreadZ` s'en sert
          * (`H·0.5 − max(TopHalf, UnderDepth) − Seal`), donc dans `GetFloatingIslandDensity` une
          * édition à chaud qui ne change QUE l'épaisseur de seal sert des îles périmées. Même famille
-         * que `AUDIT §C2` et que la régression d'overhang du 2026-07-27 : une clé de cache
-         * incomplète ne se voit pas, elle produit du terrain plausible. Ajouter le champ ne coûte
+         * que `AUDIT §C2` : une clé de cache incomplète ne se voit pas, elle produit du terrain
+         * plausible. Ajouter le champ ne coûte
          * qu'un recalcul, jamais une valeur différente — donc l'égalité binaire tient.
          *
          * The key includes BoundarySealThickness, which the original omits although SpreadZ reads it.
@@ -3953,10 +3941,9 @@ namespace
             // clé « égalité de chunk » se retournait à chaque cellule de bord et reconstruisait le
             // cache (coûteux) en boucle. Comme le cache couvre la boîte + MaxInfluence, toute requête
             // DANS la boîte est correcte. Ne pas « simplifier » en clé de chunk.
-            // (Les champs de cache vivent maintenant dans `FState`, au-dessus, pour que les
-            // modificateurs de détail de l'étape B puissent les lire. Même durée de vie, même
-            // partage entre instances qu'avant : ce sont les mêmes `thread_local`, déménagés.)
-            // ⚠️ AJOUTÉ PAR RAPPORT À L'ORIGINAL — la leçon du 2026-07-27 (régression d'overhang).
+            // (Les champs de cache vivent dans `FState`, au-dessus, pour que les modificateurs de
+            // détail puissent les lire ; ce sont des `thread_local` partagés entre instances.)
+            // ⚠️ LA CLÉ INCLUT LES PARAMS, CONTRAIREMENT À L'ORIGINAL.
             // L'original ne clé QUE sur (boîte, strate, seed) : deux jeux de params différents dans
             // la MÊME strate au MÊME seed se servent mutuellement leur cache. En production
             // `RebuildStrates` masque le trou en bougeant la strate ; en test, deux piles construites
@@ -8243,7 +8230,7 @@ namespace
     // sortie, ce qui est la raison pour laquelle l'ordre de `BuildTunnelNetworkStack` reste celui
     // de l'original, ligne pour ligne.
     //
-    // TIER 3b AUDIT (2026-09-04): this op is intentionally still separate. Ten operators lie
+    // This op is intentionally separate from 4b. Ten operators lie
     // between 4b and this phase (4c through 4h), and every one reads+writes Density. Moving this
     // phase next to 4b would reorder those density updates, so a bit-identical fuse is not legal.
     class FFloorBiasMod final : public IVoxelDensityOp
@@ -9381,7 +9368,7 @@ namespace VoxelDensityOps
                            TUniquePtr<IVoxelBiomeField> BiomeField,
                            bool bAppendStructuralPosts)
     {
-        // ARCHÉTYPE COMPLET depuis l'étape 2c : vide + overhang + mélange de biomes.
+        // ARCHÉTYPE COMPLET : vide + overhang + mélange de biomes.
         // `PerBiomeParams` vide ⇒ chemin sans biomes, strictement inchangé.
         TUniquePtr<FSurfaceColumnSource> ColumnSource =
             MakeUnique<FSurfaceColumnSource>(P, Seed, PerBiomeParams, MoveTemp(BiomeField));
@@ -9427,8 +9414,7 @@ namespace VoxelDensityOps
         // opérateurs ci-dessous sont ceux de Maze, **repris sans une ligne de changement** —
         // `ConstantRock`, `SdfRoughness`, `SdfCarve`. Dans le `switch`, Maze et VerticalShafts sont
         // deux fonctions de ~100 lignes qui n'ont rien en commun à l'œil ; en opérateurs, ce sont
-        // les MÊMES trois ops avec une source différente. C'est exactement ce que `§2.5` prédisait
-        // et ce que la Phase 1 avait parié.
+        // les MÊMES trois ops avec une source différente. C'est exactement ce que `§2.5` prédisait.
         //
         // THREE of the five ops below are Maze's, reused without a line changed. In the switch,
         // Maze and VerticalShafts are two unrelated ~100-line functions; as operators they are the
@@ -9472,20 +9458,6 @@ namespace VoxelDensityOps
         // plus proche appliqué ; les onze modificateurs concernés y lisent leurs champs au lieu des
         // leurs. La rugosité (4b) NON — dans l'original elle précède la déclaration du shadow.
         //
-        // ⚠️ CE PARAGRAPHE ÉTAIT PÉRIMÉ ET DISAIT LE CONTRAIRE DU CODE (corrigé 2026-08-16).
-        // Il annonçait « étape A sur trois, les douze modificateurs et l'override par salle ne sont
-        // pas encore portés, c'est pour ça que `UsesOperatorStackForChunk` rend **false** pour
-        // TunnelNetwork ». Les trois étapes sont terminées : les douze modificateurs sont ajoutés
-        // douze lignes plus bas, l'override C1 est en place, et `UsesOperatorStackForChunk` rend
-        // **true** pour TunnelNetwork. Un commentaire qui contredit le code sous lui est
-        // exactement le piège « lire le code, pas le commentaire » à l'envers.
-        //
-        // STALE PARAGRAPH REMOVED 2026-08-16. It claimed "stage A of three, the detail modifiers and
-        // the per-room override are not ported yet, which is why the archetype is still off in
-        // UsesOperatorStackForChunk". All three stages are done, the twelve modifiers are added a
-        // dozen lines below, and that function returns TRUE for TunnelNetwork. A comment that
-        // contradicts the code beneath it is the "read the code, not the comment" trap in reverse.
-        //
         //---------------------------------------------------------------------
         // ⚠️ CE PORTAGE RETIRE L'IDÉE DE « FRAME OPS » (OPSTACK-DECOMPOSITION §1)
         //---------------------------------------------------------------------
@@ -9499,7 +9471,7 @@ namespace VoxelDensityOps
         //     qu'ajouter un canal pour éviter une division.
         // Il restait le warp d'îles (§7), déjà gardé local pour la même raison. **Zéro frame sur
         // trois candidats** : ce n'était pas une infrastructure manquante, c'était trois fois la
-        // même chose vue de loin. Noté ici plutôt que laissé en TODO permanent.
+        // même chose vue de loin.
         constexpr float CarveMinDivisor = 1.0f;   // TunnelNetwork plancher son diviseur, cf. FSdfConvertOp
 
         // La source de salles est retenue par pointeur non possédant : les terrasses re-interrogent
