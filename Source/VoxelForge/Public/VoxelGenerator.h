@@ -3,8 +3,8 @@
 //
 // Pipeline density-only: plus de grille de blocs, plus de surface heightfield.
 // Le mesher appelle GetDensityAt() par voxel pour reconstruire la géométrie.
-// Toute la logique de caves vit dans GetDensityWithParams / GetSlabDensity,
-// pilotée par les params de strate récupérés auprès du StrateManager.
+// Chaque strate est générée par sa pile d'opérateurs (VoxelDensityOpStack.h), pilotée par les
+// params de strate récupérés auprès du StrateManager.
 
 #pragma once
 
@@ -202,7 +202,7 @@ public:
 
     /**
      * Densité pour une strate TunnelNetwork (rooms + tunnels + worm noise).
-     * Utilisée en interne par GetDensityAt quand la strate est de ce type.
+     * C'est l'évaluateur fusionné de la pile TunnelNetwork/Underwater dans GetDensityAt.
      * Exposée pour permettre des tests isolés avec des params custom.
      *
      * ⚠️ `ParamsFingerprint` ET `LayoutVersion` SONT OBLIGATOIRES (`AUDIT §C2`). Le cache SDF
@@ -242,56 +242,8 @@ public:
                                bool bCollectFusedDiagnostics = false,
                                // Optional same-sample hand-off from EvaluateSDFCached. This is
                                // only a room-shape ownership bit; it does not alter the scalar
-                               // result and avoids a duplicate room-index query in native paths.
-                               bool* OutRoomOwnsBottom = nullptr,
-                               // Optional same-sample warped position. Native GetDensityAt uses
-                               // this to feed the core post without applying the cave warp twice.
-                               FVector* OutWarpedPosition = nullptr) const;
-
-    /**
-     * Densité pour une strate Slab (FlatPlain / CrystalChamber).
-     * Vide horizontal entre un sol bruité et un plafond bruité.
-     */
-    float GetSlabDensity(float WorldX, float WorldY, float WorldZ,
-                         const FSlabGenerationParams& Params) const;
-
-    /**
-      * Densité pour une strate Maze — couloirs sur un treillis 3D déterministe, avec les décisions
-      * parent/boucle reconstruites par cellule dans un cache thread-local; le hot path ne parcourt
-      * que les capsules déjà émises.
-     */
-    float GetMazeDensity(float WorldX, float WorldY, float WorldZ,
-                         const FMazeGenerationParams& Params) const;
-
-    /**
-     * Densité pour une strate SurfaceWorld — terrain à ciel ouvert (collines,
-     * montagnes, plages) sous un plafond solide, avec nappe d'eau optionnelle.
-     *
-     * Biome output-blend: the heightfield is evaluated with ParamsD (the voxel's dominant
-     * biome) and, when NeighborWeight > 0, also with ParamsN (its nearest neighbour); the
-     * two surface HEIGHTS are lerped. This stays seamless across ANY param difference
-     * (frequencies included). With no biomes, pass ParamsD == ParamsN and weight 0 →
-     * bit-identical to the single-param terrain. Structural fields (Z bounds, seal, base,
-     * water level) must be equal in both (forced from the strate).
-     */
-    float GetSurfaceDensity(float WorldX, float WorldY, float WorldZ,
-                            const FSurfaceGenerationParams& ParamsD,
-                            const FSurfaceGenerationParams& ParamsN,
-                            float NeighborWeight) const;
-
-    /**
-     * Densité pour une strate VerticalShafts — puits verticaux pleine hauteur,
-     * vires horizontales, et connecteurs horizontaux occasionnels.
-     */
-    float GetVerticalShaftDensity(float WorldX, float WorldY, float WorldZ,
-                                  const FVerticalShaftParams& Params) const;
-
-    /**
-     * Densité pour une strate FloatingIslands — masses de terre suspendues dans
-     * un grand vide ouvert (îles flottantes), sommets aplatis, dessous rugueux.
-     */
-    float GetFloatingIslandDensity(float WorldX, float WorldY, float WorldZ,
-                                   const FFloatingIslandParams& Params) const;
+                               // result and avoids a duplicate room-index query.
+                               bool* OutRoomOwnsBottom = nullptr) const;
 
     //=========================================================================
     // CLIMATE & BIOME FIELDS  (pure XY, deterministic, window-invariant)
@@ -308,32 +260,25 @@ public:
      * La chaîne de hauteur complète de SurfaceWorld : structural → cliff → terrace → layer lines →
      * plage. Rend une ALTITUDE monde en voxels, pas une densité.
      *
-     * PUBLIQUE pour la même raison que `GetSlabDensity` / `GetMazeDensity` : permettre un test
-     * isolé. C'est la référence de `VoxelForge.OpStack.SurfaceHeightEquivalence`, qui compare la
-     * pile d'opérateurs de hauteur (`VoxelHeightOp.h`) à cette fonction point par point.
-     * Public so the height-op stack can be measured against it — same reason as GetSlabDensity.
+     * PUBLIQUE pour permettre un test isolé : c'est la référence de
+     * `VoxelForge.OpStack.SurfaceHeightEquivalence`, qui compare la pile d'opérateurs de hauteur
+     * (`VoxelHeightOp.h`) à cette fonction point par point.
+     * Public so the height-op stack can be measured against it.
      */
     float ComputeSurfaceTerrainZ(float WorldX, float WorldY, const FSurfaceGenerationParams& Params) const;
 
     /**
      * La colonne de surface : terrain Z, plafond, et le gate d'OVERHANG résolu par colonne
-     * (amplitude + direction amont). PUBLIQUES toutes deux pour la même raison que ci-dessus :
-     * c'est le seul chemin qui calcule l'overhang — `GetSurfaceDensity` passe `OverhangAmp = 0` —
-     * donc c'est la seule référence possible pour `FOverhangShelfMod`.
-     * Public because this is the ONLY path that computes the overhang (GetSurfaceDensity passes 0),
-     * so it is the only possible reference for the ported op.
+     * (amplitude + direction amont). C'est la colonne que `ClassifyTile` teste pour SurfaceWorld ;
+     * publique pour que les tests puissent placer des échantillons dans la fenêtre d'overhang.
+     * The surface column ClassifyTile tests for SurfaceWorld; public so tests can aim samples at
+     * the overhang window.
      */
     void ComputeSurfaceColumn(float WorldX, float WorldY, int32 ChunkZ,
         const FSurfaceGenerationParams& BaseSurface, const FBiomeContext& BiomeCtx,
         const TArray<FSurfaceGenerationParams>& BiomeParams, FChunkBiomeCache& BiomeCache,
         float& OutTerrainZ, float& OutCeilSurf,
         float& OutOverhangAmp, float& OutDirX, float& OutDirY) const;
-
-    /** Le combine par voxel : colonne → densité, overhang compris, puis le post structurel. */
-    float SurfaceDensityFromColumn(float WorldX, float WorldY, float WorldZ,
-                                   float TerrainZ, float CeilSurf,
-                                   float OverhangAmp, float DirX, float DirY,
-                                   const FSurfaceGenerationParams& S) const;
 
     /**
      * Moisture field at a world XY → [0,1]. The second climate axis for biome placement.
@@ -466,11 +411,6 @@ private:
     void ResolveSurfaceChunkParams(const FIntVector& ChunkCoord,
                                    FSurfaceGenerationParams& OutSurface, FBiomeContext& OutBiomeCtx,
                                    TArray<FSurfaceGenerationParams>& OutBiomeParams) const;
-
-    // ComputeSurfaceColumn et SurfaceDensityFromColumn ont été DÉPLACÉES en `public` (voir plus
-    // haut) : c'est le seul chemin qui calcule l'overhang, donc la seule référence possible pour
-    // VoxelForge.OpStack.SurfaceHeightEquivalence. Une seule déclaration chacune.
-    // Moved to public above — the only path that computes the overhang, hence the only oracle.
 
     /** (Re)build the per-chunk biome cell grid covering chunk (X,Y) footprint + margin. */
     void RebuildBiomeGrid(int32 ChunkX, int32 ChunkY, int32 ChunkZ,

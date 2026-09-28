@@ -5303,9 +5303,9 @@ namespace
     }
 
     // The slab source is an XY height band. Evaluate the same two pure height fields as
-    // GetSlabDensity, then choose their midpoint after intersecting the seal-free interior.
+    // FSlabVoidSource, then choose their midpoint after intersecting the seal-free interior.
     // La source slab est une bande de hauteurs XY : on recalcule les deux champs purs comme
-    // GetSlabDensity, puis on prend leur milieu après intersection avec l'intérieur sans seal.
+    // FSlabVoidSource, puis on prend leur milieu après intersection avec l'intérieur sans seal.
     bool VF_SuggestSlabLandingPoint(
         const FSlabGenerationParams& Params,
         int32 Seed,
@@ -5444,7 +5444,8 @@ namespace
 
     // Maze corridors are lattice edges. Only a horizontal edge is a useful landing source: a
     // vertical edge can prove air, but cannot prove a place to stand. The edge set and Z levels
-    // below use the same origin-directed tree + loop contract as GetMazeDensity, with no cache.
+    // below use the same origin-directed tree + loop contract as FLatticeCorridorSource, with no
+    // cache.
     bool VF_SuggestMazeLandingPoint(
         const FMazeGenerationParams& Params,
         int32 Seed,
@@ -5879,7 +5880,7 @@ namespace
     };
 
     // Evaluate only the island source, in the same internal-density convention as
-    // GetFloatingIslandDensity (positive = solid, negative = void). This is intentionally a
+    // FIslandBlobSource (positive = solid, negative = void). This is intentionally a
     // local pure evaluator: it lets the query bracket the actual blob top instead of treating a
     // nominal island centre as footing. Full-octave noise is used because this query has no LOD
     // state by design and GeneratePassages runs before a tile's LOD is selected.
@@ -5916,7 +5917,7 @@ namespace
         for (int32 IslandIndex = 0; IslandIndex < NumIslands; ++IslandIndex)
         {
             const FVFIslandSite& Island = Islands[IslandIndex];
-            // Production GetFloatingIslandDensity evaluates exactly this 3x3 cell neighbourhood
+            // Production FIslandBlobSource evaluates exactly this 3x3 cell neighbourhood
             // for the queried XY. The outer search may collect more candidates so a lateral snap
             // can be found, but those distant blobs must not influence the returned footing.
             if (FMath::Abs(Island.CellX - BaseCellX) > 1

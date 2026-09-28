@@ -211,10 +211,10 @@ bool FVoxelForgeClassifyTileTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("no tile was classified uniform while containing a surface (a false verdict is a hole)"),
               NumHoles, 0);
 
-    // ── Stabilité du verdict : ClassifyTile partage GSurfColCache avec GetDensityAt, donc le
-    //    brute-force ci-dessus a réchauffé les caches. Re-classifier doit rendre le MÊME verdict.
-    //    Verdict stability: ClassifyTile shares GSurfColCache with GetDensityAt, so the brute force
-    //    above warmed the caches. Re-classifying must yield the SAME verdict.
+    // ── Stabilité du verdict : le premier ClassifyTile a réchauffé son cache de colonnes et le
+    //    brute-force ci-dessus les caches de GetDensityAt. Re-classifier doit rendre le MÊME verdict.
+    //    Verdict stability: the first ClassifyTile warmed its column cache and the brute force
+    //    above warmed GetDensityAt's caches. Re-classifying must yield the SAME verdict.
     for (const FTileSpec& Spec : ToVerify)
     {
         const EVoxelTileClass A = Gen->ClassifyTile(Spec.Origin, Spec.Step, Spec.Cells);

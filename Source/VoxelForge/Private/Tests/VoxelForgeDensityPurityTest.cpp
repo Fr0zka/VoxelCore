@@ -13,8 +13,8 @@
 //   seam, and in multiplayer a world divergence.
 //
 // POURQUOI CE TEST EXISTE / WHY THIS TEST EXISTS:
-//   ~30 caches thread_local à clé manuelle vivent sous GetDensityAt (CP_*, GSurfColCache, les
-//   slots de diff, le cache SDF). Chacun est correct exactement tant que sa CLÉ contient toutes
+//   ~30 caches thread_local à clé manuelle vivent sous GetDensityAt (CP_*, les mémos par cellule
+//   et par colonne des piles, les slots de diff, le cache SDF). Chacun est correct exactement tant que sa CLÉ contient toutes
 //   les entrées dont dépend la valeur cachée. Une entrée oubliée ne casse rien tout de suite :
 //   elle produit une mauvaise valeur seulement quand le cache est chaud pour une AUTRE entrée —
 //   c'est-à-dire de façon intermittente, dépendante de l'ordre, et invisible en jeu jusqu'à ce
@@ -351,7 +351,7 @@ bool FVoxelForgeLiveEditInvalidationTest::RunTest(const FString& Parameters)
             TEXT("STALE PARAMS (AUDIT C2): the SurfaceWorld heightfield params were tripled and the ")
             TEXT("layout rebuilt, yet all %d probe densities are bit-identical. A per-chunk cache is ")
             TEXT("still keyed on ChunkCoord alone and skipped its refetch. Suspects, in order: ")
-            TEXT("CP_Chunk/CP_Version in GetDensityAt, the GSurfColCache box key, and the ")
+            TEXT("CP_Chunk/CP_Version in GetDensityAt, the FSurfaceColumnSource column memo key, and the ")
             TEXT("FChunkBiomeCache validity box (which says nothing about the FBiomeContext its ")
             TEXT("cells were classified against)."), Probes.Num()));
     }

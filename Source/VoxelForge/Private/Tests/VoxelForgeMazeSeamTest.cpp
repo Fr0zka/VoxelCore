@@ -108,36 +108,37 @@ bool FVoxelForgeMazeSeamTest::RunTest(const FString& Parameters)
         return false;
     }
 
-    int32 Top = 0, Bottom = 0;
-    if (!World.GetSlotVoxelZRange(FTestWorld::SlotMaze, Top, Bottom))
+    int32 MazeTopZ = 0, MazeBottomZ = 0;
+    if (!World.GetSlotVoxelZRange(FTestWorld::SlotMaze, MazeTopZ, MazeBottomZ))
     {
         AddError(TEXT("The seam fixture has no Maze slot."));
         return false;
     }
-    const int32 MidChunkZ = ((Top + Bottom) / 2) / CHUNK_SIZE;
-    const FMazeGenerationParams Params = World.StrateManager->GetMazeParamsForChunk(
-        FIntVector(0, 0, MidChunkZ));
+    const int32 MazeMidChunkZ = ((MazeTopZ + MazeBottomZ) / 2) / CHUNK_SIZE;
+    const FMazeGenerationParams MazeParams = World.StrateManager->GetMazeParamsForChunk(
+        FIntVector(0, 0, MazeMidChunkZ));
 
-    TArray<FVector> Probes;
-    AddMazeBoundaryProbes(Params, Bottom, Top, Probes);
+    TArray<FVector> SeamProbes;
+    AddMazeBoundaryProbes(MazeParams, MazeBottomZ, MazeTopZ, SeamProbes);
 
-    int32 First = INDEX_NONE;
-    float Before = 0.0f, After = 0.0f;
-    const int32 Mismatches = CountContextMismatches(World, Probes, First, Before, After);
+    int32 FirstProbe = INDEX_NONE;
+    float FirstBefore = 0.0f, FirstAfter = 0.0f;
+    const int32 NumMismatches = CountContextMismatches(
+        World, SeamProbes, FirstProbe, FirstBefore, FirstAfter);
 
-    TestEqual(TEXT("Maze has no chunk-context seam mismatches"), Mismatches, 0);
-    TestTrue(TEXT("Maze seam test sampled cell-boundary probes"), Probes.Num() > 0);
+    TestEqual(TEXT("Maze has no chunk-context seam mismatches"), NumMismatches, 0);
+    TestTrue(TEXT("Maze seam test sampled cell-boundary probes"), SeamProbes.Num() > 0);
 
-    if (First != INDEX_NONE)
+    if (FirstProbe != INDEX_NONE)
     {
         AddError(FString::Printf(TEXT("Maze seam mismatch at probe %d: %.9g -> %.9g"),
-                                 First, Before, After));
+                                 FirstProbe, FirstBefore, FirstAfter));
     }
 
     AddInfo(FString::Printf(
         TEXT("Maze seam freedom: %d boundary probes, mismatches=%d; "
              "local window=2x2x2 child nodes ({-1,0}^3), no wide collect."),
-        Probes.Num(), Mismatches));
+        SeamProbes.Num(), NumMismatches));
     return true;
 }
 

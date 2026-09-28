@@ -190,10 +190,10 @@ public:
         return EvalSample(WorldX, WorldY, WorldZ).Density;
     }
 
-    /** L'état COMPLET (densité + SDF) après toute la pile. Diagnostic : quand une comparaison
-     *  avec l'ancien chemin diverge, c'est le canal SDF qui dit si l'écart naît avant ou après
-     *  la conversion. / The full state after the stack — the SDF channel is what says whether a
-     *  divergence is born before or after the carve. */
+    /** L'état COMPLET (densité + SDF) après toute la pile. Diagnostic : quand deux évaluations
+     *  divergent, c'est le canal SDF qui dit si l'écart naît avant ou après la conversion.
+     *  / The full state after the stack — the SDF channel is what says whether a divergence is
+     *  born before or after the carve. */
     FVoxelOpSample EvalSample(float WorldX, float WorldY, float WorldZ) const
     {
         FVoxelOpSample S;
@@ -578,9 +578,8 @@ namespace VoxelDensityOps
      * FlatPlain ET CrystalChamber — la même pile, **sans branchement sur le type** :
      *   SlabVoidSource → GridColumnMod → [structural post ×4]
      *
-     * C'est le premier vrai gain du refactor (OPSTACK-PLAN §4) : deux des huit archétypes
-     * disparaissent dans un opérateur, et leur différence redevient ce qu'elle était déjà dans
-     * `GetSlabDensity` — un jeu de valeurs par défaut, pas du code.
+     * Deux des huit archétypes tiennent dans un opérateur (OPSTACK-PLAN §4) : leur différence est
+     * un jeu de valeurs par défaut, pas du code.
      */
     VOXELFORGE_API void BuildSlabStack(FVoxelOpStack& OutStack, const FSlabGenerationParams& P,
                                        int32 Seed, float SpineRadius,
@@ -592,10 +591,8 @@ namespace VoxelDensityOps
      *   ConstantRock → ShaftField → SdfRoughness → SdfCarve → ShaftLedge
      *   → ShaftConnectorAir → ShaftConnectorFloor → [structural post ×4]
      *
-     * C'est la démonstration que `§2.5` promettait : dans le `switch`, Maze et VerticalShafts sont
-     * deux fonctions de ~100 lignes sans rien de commun à l'œil ; en opérateurs, ce sont les mêmes
-     * trois ops avec une source différente et d'autres réglages (fréquence 0.1 au lieu de 0.12,
-     * fenêtre `rough + 4` au lieu de `R + rough + 2`).
+     * Trois de ces ops sont ceux de Maze (`§2.5`), avec une source différente et d'autres réglages
+     * (fréquence 0.1 au lieu de 0.12, fenêtre `rough + 4` au lieu de `R + rough + 2`).
      */
     VOXELFORGE_API void BuildVerticalShaftStack(FVoxelOpStack& OutStack, const FVerticalShaftParams& P,
                                                 int32 Seed, float SpineRadius,

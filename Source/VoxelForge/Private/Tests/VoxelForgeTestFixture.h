@@ -230,8 +230,8 @@ namespace VoxelForgeTest
     /**
      * A spread of world sample points that deliberately crosses chunk boundaries, strate
      * boundaries and bedrock gaps — the exact conditions under which a per-chunk cache with a
-     * missing key input produces a wrong answer. Integer XY on purpose: that is the branch
-     * GetDensityAt's T1.a column cache actually takes (fractional XY bypasses the cache).
+     * missing key input produces a wrong answer. Integer XY on purpose: that is the lattice the
+     * mesher samples, and the one the per-column memos are keyed on.
      */
     inline void BuildSamplePoints(const FTestWorld& World, int32 Count, int32 Seed,
                                   TArray<FVector>& OutPoints)

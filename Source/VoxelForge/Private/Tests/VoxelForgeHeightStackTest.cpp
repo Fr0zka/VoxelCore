@@ -8,23 +8,15 @@
 // voudrait dire soit un canal par-voxel pour une propriété de COLONNE, soit un seul opérateur
 // opaque — ce que `OPSTACK-PLAN §2.5` appelle exactement l'échec du refactor.
 //
-// D'où une seconde famille, `VoxelHeightOp.h`. **Ce test est ce qui dit si elle était une bonne
-// idée** — la même méthode que la Phase 1 a appliquée à la densité : décomposer, puis MESURER
-// contre l'original, avant de construire par-dessus.
+// D'où une seconde famille, `VoxelHeightOp.h`, mesurée ici contre `ComputeSurfaceTerrainZ`.
 //
 // ⚠️ CE QUE CE TEST COUVRE
 //   ✅ la pile de HAUTEUR du sol, contre `ComputeSurfaceTerrainZ` (défauts puis tous les ops F20) ;
-//   ✅ les canaux de densité courants : ordre, fenêtre et overhang ;
+//   ✅ la pile de densité SurfaceWorld : décomposition, ordre des canaux, densité finie, overhang ;
 //   ✅ le mélange synthétique à poids zéro.
 //
-// The old GetSurfaceDensity helper remains a differential diagnostic only: it does not carry the
-// current common structural post. The assertions target the height stack and the density stack
-// used by the owner path, so room ownership and the authored-floor removal are not mistaken for
-// a failed height port.
-//
-// LA BARRE : **bit à bit** remains the rule for height-space operations. Density comparisons to
-// the retired direct helper are reported, not asserted, because room ownership and the common
-// MC post intentionally make those paths different.
+// LA BARRE : **bit à bit** pour les opérations en espace hauteur.
+// The bar is bit-identity for height-space operations.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -285,18 +277,9 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
     // ÉTAPE 2a — LE PONT VERS L'ESPACE DENSITÉ
     //=========================================================================
     // `FSurfaceColumnSource` consomme les DEUX piles de hauteur (sol + voûte) et rend une densité.
-    // La référence est `GetSurfaceDensity`, qui est exactement la variante **sans overhang**
-    // (il passe `OverhangAmp = 0`) et **sans biomes** (ParamsD == ParamsN, poids 0) — donc la
-    // comparaison est nette plutôt qu'approximative.
-    //
-    // ⚠️ Ce que ce bloc NE teste PAS, et qu'il ne faut pas croire testé : l'overhang et le mélange
-    // de biomes. Tous deux arrivent à l'étape 2b, avec le chemin CACHÉ pour référence — c'est le
-    // seul qui les calcule.
+    // Cette passe est la variante **sans overhang** et **sans biomes** ; l'overhang a sa propre
+    // passe juste en dessous. / No-overhang, no-biome variant; the overhang has its own pass below.
     {
-        // ⚠️ `OverhangStrength = 0` EXPLICITEMENT : `GetSurfaceDensity` passe `OverhangAmp = 0`,
-        // donc il n'en calcule aucun. Comparer une pile qui en produit à une référence qui n'en
-        // produit pas ferait échouer le test pour la seule raison que la référence est incomplète.
-        // L'overhang a sa propre passe juste en dessous, avec le bon oracle.
         FSurfaceGenerationParams P = AllOps;
         P.OverhangStrength = 0.0f;
 
@@ -318,8 +301,7 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
         Ctx.StrateBottomWorldZ = P.StrateBottomWorldZ;
         Stack.PrepareChunk(Ctx);
 
-        int32 NumDiff = 0, NumSideDisagree = 0, WorstIdx = -1, NumNonFinite = 0;
-        float WorstDelta = 0.0f;
+        int32 NumNonFinite = 0;
 
         FRandomStream Rng(5150);
         for (int32 i = 0; i < NumHeightSamples; ++i)
@@ -327,44 +309,23 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
             const float X = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
             const float Y = (float)Rng.RandRange(-4 * CHUNK_SIZE, 4 * CHUNK_SIZE);
             const float Z = (float)Rng.RandRange(BottomVoxelZ, TopVoxelZ);
-
-            // ParamsD == ParamsN, poids 0 ⇒ une seule évaluation, pas de biomes.
-            const float Old = Gen->GetSurfaceDensity(X, Y, Z, P, P, 0.0f);
-            const float New = Stack.EvalMC(X, Y, Z);
-            if (!FMath::IsFinite(New))
+            if (!FMath::IsFinite(Stack.EvalMC(X, Y, Z)))
             {
                 ++NumNonFinite;
             }
-
-            if (!BitEqual(Old, New))
-            {
-                ++NumDiff;
-                const float Delta = FMath::Abs(Old - New);
-                if (Delta > WorstDelta) { WorstDelta = Delta; WorstIdx = i; }
-            }
-            if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
         }
 
-        AddInfo(FString::Printf(
-            TEXT("SurfaceWorld density legacy diagnostic: %d of %d samples differ from "
-                 "GetSurfaceDensity (largest |delta| %.9g), %d side disagreements; "
-                 "current stack non-finite samples=%d."),
-            NumDiff, NumHeightSamples, WorstDelta, NumSideDisagree, NumNonFinite));
         TestEqual(TEXT("surface: current density stack has no non-finite samples"),
                   NumNonFinite, 0);
     }
 
     //=========================================================================
-    // ÉTAPE 2b — L'OVERHANG, contre le SEUL oracle qui le calcule
+    // ÉTAPE 2b — L'OVERHANG
     //=========================================================================
-    // `GetSurfaceDensity` passe `OverhangAmp = 0`. La seule référence est donc le chemin caché :
-    // `ComputeSurfaceColumn` (qui résout le gate et la direction amont par colonne) suivi de
-    // `SurfaceDensityFromColumn` (qui applique l'union par voxel). Les deux viennent d'être
-    // exposées pour ça.
-    //
-    // C'est aussi la passe qui vérifie le MÉMO DE COLONNE de `FSurfaceColumnSource` : l'op overhang
-    // lit la colonne produite par la source, et s'ils divergeaient d'un XY, l'union se ferait au
-    // mauvais endroit. Un mémo mal clé se verrait ici.
+    // `ComputeSurfaceColumn` résout le gate et la direction amont par colonne ; la moitié des
+    // échantillons est placée DANS la fenêtre d'overhang qu'il rapporte, pour que l'op overhang de
+    // la pile soit réellement exercé. / Half the samples are placed inside the overhang window that
+    // ComputeSurfaceColumn reports, so the stack's overhang op is actually exercised.
     {
         FSurfaceGenerationParams P = AllOps;
         P.OverhangStrength        = 0.8f;
@@ -391,8 +352,7 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
         TArray<FSurfaceGenerationParams> NoBiomeParams;
         FChunkBiomeCache BiomeCache;
 
-        int32 NumDiff = 0, NumSideDisagree = 0, NumInWindow = 0, NumNonFinite = 0;
-        float WorstDelta = 0.0f;
+        int32 NumInWindow = 0, NumNonFinite = 0;
 
         FRandomStream Rng(1337);
         for (int32 i = 0; i < NumHeightSamples; ++i)
@@ -418,27 +378,16 @@ bool FVoxelForgeHeightStackTest::RunTest(const FString& Parameters)
                 Z = (float)Rng.RandRange(BottomVoxelZ, TopVoxelZ);
             }
 
-            const float Old = Gen->SurfaceDensityFromColumn(X, Y, Z, TerrainZ, CeilSurf,
-                                                            Amp, DirX, DirY, P);
-            const float New = Stack.EvalMC(X, Y, Z);
-            if (!FMath::IsFinite(New))
+            if (!FMath::IsFinite(Stack.EvalMC(X, Y, Z)))
             {
                 ++NumNonFinite;
             }
-
-            if (!BitEqual(Old, New))
-            {
-                ++NumDiff;
-                WorstDelta = FMath::Max(WorstDelta, FMath::Abs(Old - New));
-            }
-            if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
         }
 
         AddInfo(FString::Printf(
-            TEXT("Overhang legacy diagnostic: %d of %d samples differ from "
-                 "SurfaceDensityFromColumn (largest |delta| %.9g), %d side disagreements, "
-                 "%d deliberately inside the overhang window; current stack non-finite samples=%d."),
-            NumDiff, NumHeightSamples, WorstDelta, NumSideDisagree, NumInWindow, NumNonFinite));
+            TEXT("Overhang: %d of %d samples deliberately inside the overhang window; current "
+                 "stack non-finite samples=%d."),
+            NumInWindow, NumHeightSamples, NumNonFinite));
         TestEqual(TEXT("overhang: current density stack has no non-finite samples"),
                   NumNonFinite, 0);
 

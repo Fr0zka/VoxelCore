@@ -2,21 +2,11 @@
 // Les opérateurs concrets : les décompositions d'archétypes + le post-traitement structurel.
 // The concrete operators: the archetype decompositions + the structural post-process.
 //
-// Ces opérateurs alimentent le jeu derrière l'opt-in décrit dans l'en-tête de VoxelDensityOpStack.h.
+// Ces opérateurs génèrent chaque strate du jeu (voir l'en-tête de VoxelDensityOpStack.h).
+// These operators generate every strate in the game (see the VoxelDensityOpStack.h header).
 //
-// FIDÉLITÉ / FIDELITY
-// Chaque corps ci-dessous est une transcription LITTÉRALE du bloc correspondant de
-// `UVoxelGenerator::GetMazeDensity` — mêmes hashes, mêmes constantes, même ordre d'opérations
-// flottantes, même convention de signe (INTERNE : positif = solide). L'objectif est
-// l'égalité BIT à BIT, vérifiée par `VoxelForge.OpStack.MazeEquivalence`.
-//
-// `OPSTACK-PLAN §2.6` n'EXIGE pas l'identité binaire avec l'ancien système — mais Maze se
-// décompose si proprement qu'on peut l'obtenir, et quand on peut l'obtenir il faut la prendre :
-// une égalité binaire transforme « je crois que la décomposition est correcte » en preuve.
-//
-// §2.6 does not REQUIRE bit-identity with the old system — but Maze decomposes cleanly enough that
-// it is achievable, and when it is achievable it should be taken: bit-equality turns "I believe the
-// decomposition is right" into a proof.
+// Convention de signe INTERNE : positif = solide ; la pile négative une fois pour le MC.
+// Internal sign convention: positive = solid; the stack negates once for MC.
 
 #include "VoxelDensityOpStack.h"
 #include "VoxelStrateComposer.h"
@@ -674,7 +664,7 @@ namespace
             , CorridorRadius(FMath::Max(P.CorridorRadius, 0.5f))
             , BranchProbability(P.BranchProbability)
             , Verticality(P.Verticality)
-            , Salt((uint32)Seed ^ 0x4D617A65u)   // 'Maze' — identique à GetMazeDensity
+            , Salt((uint32)Seed ^ 0x4D617A65u)   // 'Maze'
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -765,7 +755,7 @@ namespace
         }
 
         /**
-         * Le cache par CELLULE, partagé avec le même contrat que GetMazeDensity. Il est `thread_local` et non
+         * Le cache par CELLULE. Il est `thread_local` et non
          * membre parce que la pile est PARTAGÉE entre workers en lecture — un membre mutable serait
          * une course. La reconstruction seule inspecte le petit voisinage ; Eval ne refait aucune
          * décision de parent ou de boucle.
@@ -829,16 +819,13 @@ namespace
     //=========================================================================
     // RÔLE 1 — SOURCE : DALLE / SLAB VOID  (FlatPlain ET CrystalChamber)
     //=========================================================================
-    // Transcription littérale des ÉTAPES 1-3 de `GetSlabDensity` : surface de sol, surface de
-    // plafond, puis `Density = -min(distAuSol, distAuPlafond)`.
+    // Surface de sol, surface de plafond, puis `Density = -min(distAuSol, distAuPlafond)`.
     //
-    // DEUX archétypes, UN opérateur. `GetSlabDensity` est appelé pour FlatPlain et
-    // CrystalChamber sans le moindre branchement sur le type — CrystalChamber n'est rien d'autre
-    // que FlatPlain avec un `CeilingRoughness` plus grand. C'est le premier vrai gain du refactor
-    // (OPSTACK-PLAN §4) : deux des huit archétypes disparaissent dans un seul opérateur, et la
-    // différence entre eux redevient ce qu'elle a toujours été — un jeu de valeurs par défaut.
+    // DEUX archétypes, UN opérateur, sans le moindre branchement sur le type — CrystalChamber
+    // n'est rien d'autre que FlatPlain avec un `CeilingRoughness` plus grand (OPSTACK-PLAN §4) :
+    // la différence entre eux est un jeu de valeurs par défaut.
     //
-    // Two archetypes, ONE op: GetSlabDensity is called for both with no branch on the type.
+    // Two archetypes, ONE op, with no branch on the type.
     // CrystalChamber IS FlatPlain with a bigger CeilingRoughness.
     //
     // XY-PUR depuis §3.1 (le terme en Z des deux bruits est parti). C'est ce qui rend
@@ -993,7 +980,7 @@ namespace
     // RÔLE 1 — SOURCE : COLONNE DE SURFACE / SURFACE COLUMN  (SurfaceWorld)
     //=========================================================================
     // Le pont entre les deux espaces : consomme DEUX piles de hauteur (sol et voûte) et en fait une
-    // densité. C'est tout le combine de `SurfaceDensityFromColumn` :
+    // densité :
     //
     //     Density = TerrainZ - Z                 ← solide sous le sol
     //     Density = max(Density, Z - CeilSurf)   ← solide au-dessus de la voûte
@@ -1564,13 +1551,13 @@ namespace
     //=========================================================================
     // RÔLE 3 — MODIFIER : COLONNES SUR GRILLE MONDE / WORLD-GRID COLUMNS
     //=========================================================================
-    // ÉTAPE 4 de `GetSlabDensity`. Des cylindres de hauteur infinie posés sur une grille de
+    // Des cylindres de hauteur infinie posés sur une grille de
     // `ColumnSpacing`, un tirage d'existence et un jitter par cellule. Le champ de vide décide déjà
     // où est le solide, donc la colonne n'a qu'à AJOUTER de la densité le long de son XY — elle
     // n'est visible que là où le vide avait creusé autour d'elle.
     //
-    // Le cache 3×3 par cellule est repris tel quel (il était déjà `thread_local` dans l'original,
-    // et c'est exactement ce que la note de threading de VoxelDensityOp.h autorise). Sa clé
+    // Le cache 3×3 par cellule est `thread_local`, ce que la note de threading de VoxelDensityOp.h
+    // autorise. Sa clé
     // contient tous les paramètres qui influent sur le résultat + le seed, donc un changement de
     // layout qui change un param invalide bien ; un changement qui n'en touche aucun produirait
     // des colonnes identiques (cf. AUDIT C2 — la clé est complète, pas seulement le coord).
@@ -1657,7 +1644,7 @@ namespace
     private:
         struct FSlabColumn { float X, Y, R; };
 
-        static constexpr float ColBlend = 2.0f;   // identique à GetSlabDensity
+        static constexpr float ColBlend = 2.0f;
 
         /** Le tirage d'une cellule : existence, jitter, rayon. Fonction PURE de (cellule, seed,
          *  params) — donc `Eval` et `EffectOverBox` voient forcément la même colonne. */
@@ -1714,8 +1701,7 @@ namespace
     // SEUL changement est `Density += Fill·Base·2` au lieu de `Density -= Carve·Base·2`.
     //
     // Un archétype qui CREUSE dans du roc et un archétype qui REMPLIT du vide sont donc le même
-    // opérateur au signe près, exactement comme la source constante au-dessus. C'est la symétrie
-    // que le `switch` ne pouvait pas montrer : les deux blocs y sont à 900 lignes l'un de l'autre.
+    // opérateur au signe près, exactement comme la source constante au-dessus.
     //
     // ⚠️ `Sign` vaut ±1.0f et rien d'autre. La multiplication par ±1 est EXACTE en IEEE-754, donc
     // `D += (-1·F)·B·2` rend bit pour bit ce que `D -= F·B·2` rendait — l'égalité binaire des trois
@@ -2267,7 +2253,7 @@ namespace
     {
     public:
         FShaftFieldSource(const FVerticalShaftParams& InP, int32 Seed, float InSpineRadius)
-            : P(InP), Salt((uint32)Seed ^ 0x53686674u)   // 'Shft' — identique à GetVerticalShaftDensity
+            : P(InP), Salt((uint32)Seed ^ 0x53686674u)   // 'Shft'
             , SpineRadius(InSpineRadius) {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -2427,9 +2413,9 @@ namespace
         }
 
         /** Le voisinage inner 3×3 + ses connecteurs, mémoïsés par worker. Le rebuild collecte un
-         *  halo 9×9 émetteur / 15×15 total pour résoudre les fenêtres parent 5×5 et le fallback fixe ±3. Clé = cellule + tous les params
-         *  qui influent (comme l'original) : stable à travers les reconstructions de pile, ce qui
-         *  est la leçon retenue du mémo de colonne de SurfaceWorld. */
+         *  halo 9×9 émetteur / 15×15 total pour résoudre les fenêtres parent 5×5 et le fallback
+         *  fixe ±3. Clé = cellule + tous les params qui influent : stable à travers les
+         *  reconstructions de pile, ce qui est la leçon retenue du mémo de colonne de SurfaceWorld. */
         const FCells& GetCells(float WorldX, float WorldY) const
         {
             const float Spacing = FMath::Max(P.ShaftSpacing, 1.0f);
@@ -2723,9 +2709,9 @@ namespace
         void Eval(float WorldX, float WorldY, float WorldZ, FVoxelOpSample& InOut) const override
         {
             if (P.LedgeSpacing <= 0.0f || P.LedgeDepth <= 0.0f || Field == nullptr) { return; }
-            // ⚠️ La garde de l'original est `CaveSDF < 0` — le SDF APRÈS rugosité, tel que la pile
-            // l'a laissé. C'est bien `InOut.Sdf` ici, pas une re-évaluation : re-calculer donnerait
-            // le SDF SANS rugosité et déplacerait les étagères.
+            // ⚠️ La garde est `Sdf < 0` — le SDF APRÈS rugosité, tel que la pile l'a laissé. C'est
+            // bien `InOut.Sdf` ici, pas une re-évaluation : re-calculer donnerait le SDF SANS
+            // rugosité et déplacerait les étagères.
             if (InOut.Sdf >= 0.0f) { return; }
 
             const float Phase = FMath::Frac((WorldZ - P.StrateBottomWorldZ) / P.LedgeSpacing);
@@ -2886,7 +2872,7 @@ namespace
     {
     public:
         FIslandBlobSource(const FFloatingIslandParams& InP, int32 Seed)
-            : P(InP), Salt((uint32)Seed ^ 0x49736C64u)   // 'Isld' — identique à GetFloatingIslandDensity
+            : P(InP), Salt((uint32)Seed ^ 0x49736C64u)   // 'Isld'
         {}
 
         EVoxelOpRole GetRole() const override { return EVoxelOpRole::FieldSource; }
@@ -2962,8 +2948,8 @@ namespace
          *   • en Z, `Sdf ≥ WorldZ − TopSurf ≥ WorldZ − TopZ`, donc au-dessus du sommet + marge il
          *     n'y a plus rien à faire. **En dessous, il n'y a PAS de borne** : sous une île, le SDF
          *     vaut ≈ `DistXY` à toute profondeur, donc un mince fil de matière descend le long de
-         *     l'axe. C'est le comportement de l'original ; le confondre avec « rien en dessous »
-         *     serait un TROU, et c'est pourquoi seule la borne HAUTE est testée.
+         *     l'axe. Le confondre avec « rien en dessous » serait un TROU, et c'est pourquoi seule
+         *     la borne HAUTE est testée.
          *   • cette source ne couvre pas l'aval : elle publie seulement son propre intervalle SDF.
          *     La rugosité, le blend du fill et le creux du SmoothMin sont bornés par leurs propres
          *     opérateurs dans le pliage, chacun avec son contrat isolé.
@@ -3059,8 +3045,7 @@ namespace
 
     private:
         /** Tirage d'une cellule. PURE en (cellule, seed, params) ⇒ `Eval` et `EffectOverBox` ne
-         *  peuvent pas voir des îles différentes. Transcription littérale du bloc de cuisson de
-         *  `GetFloatingIslandDensity`. */
+         *  peuvent pas voir des îles différentes. */
         bool RollIsland(int32 nx, int32 ny, FIsland& Out) const
         {
             const float H = P.StrateTopWorldZ - P.StrateBottomWorldZ;
@@ -3094,17 +3079,15 @@ namespace
         }
 
         /**
-         * Le voisinage 3×3, mémoïsé par worker — la même cuisson `thread_local` que l'original.
+         * Le voisinage 3×3, mémoïsé par worker (`thread_local`).
          *
-         * ⚠️ LA CLÉ INCLUT `BoundarySealThickness`, QUE L'ORIGINAL OMET. `SpreadZ` s'en sert
-         * (`H·0.5 − max(TopHalf, UnderDepth) − Seal`), donc dans `GetFloatingIslandDensity` une
-         * édition à chaud qui ne change QUE l'épaisseur de seal sert des îles périmées. Même famille
-         * que `AUDIT §C2` : une clé de cache incomplète ne se voit pas, elle produit du terrain
-         * plausible. Ajouter le champ ne coûte
-         * qu'un recalcul, jamais une valeur différente — donc l'égalité binaire tient.
+         * ⚠️ LA CLÉ INCLUT `BoundarySealThickness` : `SpreadZ` s'en sert
+         * (`H·0.5 − max(TopHalf, UnderDepth) − Seal`), donc sans lui une édition à chaud qui ne
+         * change QUE l'épaisseur de seal servirait des îles périmées. Même famille que `AUDIT §C2` :
+         * une clé de cache incomplète ne se voit pas, elle produit du terrain plausible.
          *
-         * The key includes BoundarySealThickness, which the original omits although SpreadZ reads it.
-         * Adding it can only cost a recompute, never change a value — bit-equality is unaffected.
+         * The key includes BoundarySealThickness because SpreadZ reads it; without it a live edit
+         * of the seal thickness alone would serve stale islands.
          */
         const FCells& GetCells(float WorldX, float WorldY) const
         {
@@ -9326,8 +9309,8 @@ namespace VoxelDensityOps
 
     TUniquePtr<IVoxelDensityOp> MakeConstantVoidSource(float BaseDensity)
     {
-        // `float Density = -Params.BaseDensity;  // start as open air (void)` — la négation unaire
-        // est exacte, donc c'est littéralement la première ligne de GetFloatingIslandDensity.
+        // `Density = -BaseDensity` : on part du vide. La négation unaire est exacte.
+        // Start as open air; unary negation is exact.
         return MakeUnique<FConstantFieldSource>(-BaseDensity);
     }
 
@@ -9391,10 +9374,8 @@ namespace VoxelDensityOps
                         int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
                         bool bAppendStructuralPosts)
     {
-        // DEUX archétypes entrent ici, aucun branchement ne les distingue — parce que
-        // `GetSlabDensity` n'en fait aucun non plus. FlatPlain et CrystalChamber ne diffèrent que
-        // par leurs valeurs par défaut, et c'est maintenant visible dans le code plutôt que dans
-        // un commentaire. 8 archétypes → 7.
+        // DEUX archétypes entrent ici, aucun branchement ne les distingue : FlatPlain et
+        // CrystalChamber ne diffèrent que par leurs valeurs par défaut.
         OutStack.Add(MakeSlabVoidSource(P, Seed));
         OutStack.Add(MakeGridColumnMod(P, Seed));
 
@@ -9410,15 +9391,10 @@ namespace VoxelDensityOps
                                  int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
                                  bool bAppendStructuralPosts)
     {
-        // ⚠️ LA PREUVE QUE L'ABSTRACTION EST RÉELLE, et elle vaut d'être dite : TROIS des cinq
-        // opérateurs ci-dessous sont ceux de Maze, **repris sans une ligne de changement** —
-        // `ConstantRock`, `SdfRoughness`, `SdfCarve`. Dans le `switch`, Maze et VerticalShafts sont
-        // deux fonctions de ~100 lignes qui n'ont rien en commun à l'œil ; en opérateurs, ce sont
-        // les MÊMES trois ops avec une source différente. C'est exactement ce que `§2.5` prédisait.
+        // TROIS des cinq opérateurs ci-dessous sont ceux de Maze, repris tels quels —
+        // `ConstantRock`, `SdfRoughness`, `SdfCarve` — avec une source différente (`§2.5`).
         //
-        // THREE of the five ops below are Maze's, reused without a line changed. In the switch,
-        // Maze and VerticalShafts are two unrelated ~100-line functions; as operators they are the
-        // same three ops with a different source.
+        // THREE of the five ops below are Maze's, reused unchanged, with a different source.
         constexpr float CarveBlend = 2.0f;
 
         TUniquePtr<FShaftFieldSource> ShaftSource =
@@ -9427,9 +9403,8 @@ namespace VoxelDensityOps
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));
         OutStack.Add(MoveTemp(ShaftSource));
-        // Fréquence 0.1 et fenêtre `SurfaceRoughness + 4` — les constantes de
-        // `GetVerticalShaftDensity`, PAS celles de Maze (0.12 / `R + rough + 2`). Même opérateur,
-        // réglages différents : c'est le point.
+        // Fréquence 0.1 et fenêtre `SurfaceRoughness + 4` — PAS celles de Maze
+        // (0.12 / `R + rough + 2`). Même opérateur, réglages différents.
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.1f, 3, P.SurfaceRoughness + 4.0f));
         OutStack.Add(MakeSdfCarve(CarveBlend, P.BaseDensity));
         OutStack.Add(MakeUnique<FShaftLedgeMod>(P, ShaftPtr));
@@ -9544,8 +9519,8 @@ namespace VoxelDensityOps
 
         OutStack.Add(MakeConstantVoidSource(P.BaseDensity));
         OutStack.Add(MakeUnique<FIslandBlobSource>(P, Seed));
-        // Fréquence 0.08 et 4 octaves — les constantes de `GetFloatingIslandDensity`. Quatrième
-        // archétype à réutiliser cet opérateur (Maze 0.12/3, VerticalShafts 0.1/3).
+        // Fréquence 0.08 et 4 octaves — les constantes de FloatingIslands (Maze 0.12/3,
+        // VerticalShafts 0.1/3).
         OutStack.Add(MakeSdfRoughnessMod(P.SurfaceRoughness, 0.08f, 4,
                                          P.SurfaceRoughness + BlendK + 2.0f));
         OutStack.Add(MakeSdfFill(BlendK, P.BaseDensity));
@@ -9562,15 +9537,14 @@ namespace VoxelDensityOps
                         int32 Seed, float SpineRadius, const UVoxelStrateManager* StrateManager,
                         bool bAppendStructuralPosts)
     {
-        // Les constantes viennent telles quelles de GetMazeDensity — elles y étaient codées en dur.
+        // Constantes Maze, codées en dur. / Maze's hard-coded constants.
         constexpr float CarveBlend      = 2.0f;
         constexpr float RoughFrequency  = 0.12f;
         constexpr int32 RoughOctaves    = 3;
 
         const float R = FMath::Max(P.CorridorRadius, 0.5f);
 
-        // Fenêtre d'application de la rugosité : `MazeSDF < R + SurfaceRoughness + 2.0f` dans
-        // l'original. Reproduite à l'identique pour que l'égalité binaire tienne.
+        // Fenêtre d'application de la rugosité : `MazeSDF < R + SurfaceRoughness + 2.0f`.
         const float RoughApplyWithin = R + P.SurfaceRoughness + 2.0f;
 
         OutStack.Add(MakeConstantRockSource(P.BaseDensity));

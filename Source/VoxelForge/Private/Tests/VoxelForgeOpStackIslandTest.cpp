@@ -1,30 +1,18 @@
 // VoxelForgeOpStackIslandTest.cpp
-// FloatingIslands — le portage qui fait tourner la pile À L'ENVERS.
-// FloatingIslands — the port that runs the stack BACKWARDS.
+// FloatingIslands — la pile qui tourne À L'ENVERS / the stack that runs BACKWARDS.
 //
-// CE QUE CELUI-CI PROUVE EN PLUS DES AUTRES
-// `VerticalShaftEquivalence` a mesuré la réutilisation À L'IDENTIQUE : trois opérateurs de Maze
-// repris sans une ligne de changement. Celui-ci mesure quelque chose de plus fort, et de plus
-// risqué pour l'abstraction : **la réutilisation PAR INVERSION**.
-//
-// Les quatre archétypes déjà portés partent tous de ROC et CREUSENT. FloatingIslands part du VIDE
-// et REMPLIT. Si l'axe abstrait choisi (le SIGNE de la densité, convention interne positif = solide)
-// est le bon, alors les deux extrémités de la pile doivent être les MÊMES opérateurs au signe près :
+// Les autres archétypes partent de ROC et CREUSENT ; FloatingIslands part du VIDE et REMPLIT, avec
+// les MÊMES opérateurs au signe près (convention interne positif = solide) :
 //
 //     FConstantFieldSource(+Base)  ←→  FConstantFieldSource(-Base)
 //     FSdfConvertOp(Sign = -1)     ←→  FSdfConvertOp(Sign = +1)
 //
-// Et c'est le cas : le seul opérateur neuf de ce portage est le blob d'île. Un archétype qui se
-// réutilise en s'INVERSANT est une preuve plus forte qu'un archétype qui se réutilise à l'identique
-// — le premier dit que l'abstraction a trouvé le bon axe, le second seulement que deux archétypes
-// se ressemblaient.
+// Le seul opérateur propre à l'archétype est le blob d'île. / The only archetype-specific op is the
+// island blob; the rest is Maze's rock + carve with the opposite sign.
 //
-// ET LE VERDICT DE BOÎTE : c'est ici que `ClassifyBox` peut rendre **AllAir** pour la première fois
-// de tout le plugin. Une strate d'îles flottantes est, par construction, surtout vide ; aucun
-// archétype de grotte n'a jamais su prouver « tout air » (`OPSTACK-DECOMPOSITION §7`). Le test
-// compte les deux verdicts SÉPARÉMENT, parce qu'un total agrégé masquerait exactement ce gain-là.
-//
-// LA BARRE : bit à bit, comme les autres depuis `FPSemantics = Precise` (AUDIT §C9/§C10).
+// ET LE VERDICT DE BOÎTE : une strate d'îles flottantes est surtout vide, donc `ClassifyBox` doit
+// savoir rendre **AllAir** (`OPSTACK-DECOMPOSITION §7`). Le test compte AllSolid et AllAir
+// SÉPARÉMENT, parce qu'un total agrégé masquerait exactement ce verdict-là.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -92,8 +80,8 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
 
     if (P.StrateTopWorldZ - P.StrateBottomWorldZ <= 0.0f)
     {
-        AddError(TEXT("The FloatingIslands strate has degenerate Z bounds, which sends ")
-                 TEXT("GetFloatingIslandDensity down its early-out. The op stack has none by design."));
+        AddError(TEXT("The FloatingIslands strate has degenerate Z bounds; GetDensityAt builds no ")
+                 TEXT("stack for it. The op stack has no degenerate-strate early-out by design."));
         return false;
     }
 
@@ -127,7 +115,7 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
     }
 
     //=========================================================================
-    // 1. ÉQUIVALENCE
+    // 1. LIVENESS — roche d'île et vide ouvert / island rock and open void
     //=========================================================================
     // On compte SÉPARÉMENT le solide d'intérieur et le solide de seal : sur cet archétype la
     // quasi-totalité du volume est de l'air, donc un « N solides » agrégé serait dominé par les
@@ -135,74 +123,34 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
     const float InnerBot = P.StrateBottomWorldZ + P.BoundarySealThickness;
     const float InnerTop = P.StrateTopWorldZ    - P.BoundarySealThickness;
 
-    int32 NumDiff = 0, NumSideDisagree = 0, WorstIdx = -1;
     int32 NumInsideIsland = 0, NumOpenVoid = 0;
-    float WorstDelta = 0.0f;
-
     for (int32 i = 0; i < NumIslandSamples; ++i)
     {
         const float X = (float)Points[i].X, Y = (float)Points[i].Y, Z = (float)Points[i].Z;
-
-        const float Old = Gen->GetFloatingIslandDensity(X, Y, Z, P);
         const float New = Stack.EvalMC(X, Y, Z);
 
         const bool bInterior = (Z > InnerBot && Z < InnerTop);
-        if (bInterior && Old < 0.0f)  { ++NumInsideIsland; }   // solide loin des seals ⇒ une île
-        if (bInterior && Old >= 0.0f) { ++NumOpenVoid; }
-
-        if (!BitEqual(Old, New))
-        {
-            ++NumDiff;
-            const float D = FMath::Abs(Old - New);
-            if (D > WorstDelta) { WorstDelta = D; WorstIdx = i; }
-        }
-        if ((Old >= 0.0f) != (New >= 0.0f)) { ++NumSideDisagree; }
+        if (bInterior && New < 0.0f)  { ++NumInsideIsland; }   // solide loin des seals ⇒ une île
+        if (bInterior && New >= 0.0f) { ++NumOpenVoid; }
     }
-
-    if (NumDiff == 0)
-    {
-        AddInfo(FString::Printf(
-            TEXT("FloatingIslands: bit-identical across %d samples (%d inside island rock away from ")
-            TEXT("the seal bands, %d in open void, so the void source, the blobs, the roughness and ")
-            TEXT("the fill were all exercised). The stack runs BACKWARDS -- void source + fill ")
-            TEXT("instead of rock source + carve -- using the SAME operators with the opposite ")
-            TEXT("sign. Only the blob source is new (OPSTACK-PLAN 2.5)."),
-            NumIslandSamples, NumInsideIsland, NumOpenVoid));
-    }
-    else
-    {
-        AddError(FString::Printf(
-            TEXT("FloatingIslands: %d of %d samples differ (largest |delta| %.9g at (%.0f, %.0f, ")
-            TEXT("%.0f)); %d cross the isosurface. Since /fp:precise the bar is bit-identity, so ")
-            TEXT("this is a real port error. Check, in order: the C1 warp fix (BOTH paths must now ")
-            TEXT("use VoxelHash::SeedOffset(S, 0.0007f) -- if only one was changed, EVERY warped ")
-            TEXT("sample differs), then the SdfConvert SIGN (+1 fills, -1 carves), then the 'Isld' ")
-            TEXT("salt (0x49736C64), the roughness frequency (0.08 / 4 octaves here, NOT Maze's ")
-            TEXT("0.12 / 3), the per-island TaperEnd and TopFlatten dome branch, and the ")
-            TEXT("SmoothMin blend K = max(SDFBlendRadius, 0.01)."),
-            NumDiff, NumIslandSamples, WorstDelta,
-            WorstIdx >= 0 ? Points[WorstIdx].X : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Y : 0.0f,
-            WorstIdx >= 0 ? Points[WorstIdx].Z : 0.0f,
-            NumSideDisagree));
-    }
-
-    TestEqual(TEXT("no sample lands on the opposite side of the isosurface"), NumSideDisagree, 0);
+    AddInfo(FString::Printf(
+        TEXT("FloatingIslands: %d of %d samples inside island rock away from the seal bands, %d in ")
+        TEXT("open void."),
+        NumInsideIsland, NumIslandSamples, NumOpenVoid));
 
     if (NumInsideIsland == 0)
     {
         AddWarning(TEXT("No sample landed inside island rock away from the seal bands, so the blob ")
-                   TEXT("source and the fill were never meaningfully exercised -- the equivalence ")
-                   TEXT("above then only proves that two empty voids agree. Raise IslandDensity or ")
-                   TEXT("IslandMaxRadius."));
+                   TEXT("source and the fill were never meaningfully exercised. Raise IslandDensity ")
+                   TEXT("or IslandMaxRadius."));
     }
 
     //=========================================================================
     // 2. INVARIANCE DE FENÊTRE
     //=========================================================================
     // La source garde un cache 3×3 `thread_local` dont la clé est le jeu de params — et cette clé
-    // inclut délibérément `BoundarySealThickness`, que l'original omet alors que `SpreadZ` le lit
-    // (voir la note dans FIslandBlobSource::GetCells).
+    // inclut délibérément `BoundarySealThickness`, que `SpreadZ` lit (voir la note dans
+    // FIslandBlobSource::GetCells).
     {
         std::atomic<int32> Impure{ 0 };
         const int32 NumBlocks = FMath::Max(4, FMath::Min(16, FPlatformMisc::NumberOfCores()));
@@ -296,9 +244,8 @@ bool FVoxelForgeOpStackIslandTest::RunTest(const FString& Parameters)
         AddInfo(FString::Printf(
             TEXT("Box verdicts over 60 FloatingIslands tiles (XY sampled from +/- %d voxels = %.1f x ")
             TEXT("IslandSpacing %.0f): %d proved AllSolid, %d proved AllAir, ")
-            TEXT("%d Mixed, %d voxels checked, %d violations. Today's ClassifyTile proves ZERO of these. The AllAir count is the new ")
-            TEXT("thing: no cave archetype has ever been able to prove 'all air', and a floating-")
-            TEXT("island strate is mostly exactly that (OPSTACK-DECOMPOSITION 7)."),
+            TEXT("%d Mixed, %d voxels checked, %d violations. The AllAir count matters most: a ")
+            TEXT("floating-island strate is mostly open air (OPSTACK-DECOMPOSITION 7)."),
             SpanVoxels, (float)SpanVoxels / FMath::Max(P.IslandSpacing, 1.0f), P.IslandSpacing,
             NumProvedSolid, NumProvedAir, NumMixed, NumBruteSamples, NumUnsound));
 
