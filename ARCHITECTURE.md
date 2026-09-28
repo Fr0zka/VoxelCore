@@ -443,7 +443,9 @@ scaled engine plane (`/Engine/BasicShapes/Plane`, no collision, no shadow) snapp
 player, so it only repositions when the player crosses a cell; terrain pokes through it, so it reads as water at
 every LOD and to the horizon with no per-tile gaps (one draw). Water Z: `bHasWater` + `WaterLevelRelative` →
 `StrateManager::GetWaterLevelWorldZForChunk` (no water in the current strate ⇒ plane hidden). Material:
-`UVoxelStrateDefinition::WaterMaterial`.
+`UVoxelStrateDefinition::WaterMaterial`. ⚠️ OPEN: `UVoxelBiomeDefinition::WaterMaterial` (the biome
+content profile's water override, §8.14) is not read by the single-plane path — owner to decide whether
+the biome override should come back (REVIEW_FINDINGS, *Owner decisions*).
 
 `ClearAll`/`SetSeed` on `ChangeSeed`/regenerate clears both subsystems (decorations re-stream on the next
 Tick via the INT_MIN sentinels). **Per-biome content (§8.14):** decorations resolve the dominant biome **PER COLUMN** on the worker
