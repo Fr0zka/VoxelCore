@@ -49,19 +49,8 @@ Legend: ✅ verified against code · ◻️ checklist box.
 > ("nothing is set in stone"). ✅ BUILT & WORKING together with pass 2 (ticked 2026-07-27):
 > • **Terracing gradient Z-only** (6→2 SDF samples — see the ticked item above).
 > • **Lerp X-macro** + **BakeRoomFeature dedupe** (both ticked above, bit-identical).
-> • **T2.b LOD octave drop** — opt-in `UVoxelSettings::LODOctaveDrop` (default 0 = byte-identical);
->   `VoxelGenLOD::OctaveBias` thread_local set per tile in `GenerateMesh`, per-voxel fractal sites
->   wrapped in `VoxelGenLOD::Eff(N)`, XY-field noise deliberately excluded. ARCHITECTURE §8.10.
-> • **T2.c tile component pool** — `TileComponentPool` + `Acquire/ReleaseTileComponent`; unload
->   parks (RemoveSectionGroup strips geometry+collision, hidden, stays registered), apply pops.
->   Bonus: `ApplyMeshToTile` reuses the existing `URealtimeMesh` (`GetRealtimeMeshAs`) — the old
->   unconditional `InitializeRealtimeMesh` allocated + orphaned one mesh UObject PER APPLY.
-> • **T2.d worker clamp** — `GetMaxConcurrentTasks()` caps the asset budget to logical cores − 2
->   (the BackgroundNormal priority half had already shipped). **Tier 2 is now COMPLETE** —
->   T2.a was already done (float SSE `VoxelNoise` core, §8.10).
-> • **F2 determinism validator** — `AVoxelWorld::ValidateDeterminism` CallInEditor button:
->   boundary points sampled under two cache-window alignments + a repeat pass; any non-zero
->   delta = §8.4 regression. The tool that VERIFIES all the "bit-identical" claims above.
+> • **T2.b / T2.c / T2.d and F2** shipped in the same batch — tracked in `fable-idea.md` (Tier 2
+>   status, F2) and ARCHITECTURE §8.10, not repeated here.
 
 ## Performance
 - [x] ~~**`VoxelGenerator.cpp` (terrain-op gradient)** — compute once per voxel and reuse.~~
@@ -116,6 +105,32 @@ Legend: ✅ verified against code · ◻️ checklist box.
   two-grid deco redesign (`StreamTier` / `DecorationNearRadiusChunks`).
   **CORRECTION: `GetStrateChunkZBounds` is NOT dead** — `BuildDesiredTiles` uses it for the
   strate-aware vertical clamp; struck from the dead list.
+- [x] **2026-09 cleanup (`cleanup/2026-09`)** — the far sheet ring runtime (`GenerateSheetMesh` + its
+  streaming path) and ~40 unreferenced functions/members/types removed (each proven by a search of
+  `Source/`, `Tools/`, `Config/` and build files; see that branch's `refactor(dead-code)` commit).
+  Reflected (`UPROPERTY`/`UFUNCTION`/`UENUM`…) and enum candidates were NOT removed — see
+  *Owner decisions* below.
+
+## Owner decisions — unused but kept (2026-09 cleanup)
+Nothing in `Source/` reads these, but assets, Blueprints, tools or tests may reference them by name,
+so removing them is the owner's call.
+- [ ] `UVoxelSettings::bFarSheetRing` / `FarSheetSpanLevels` — runtime always passes `false` since the
+  sheet ring was removed; still logged in the startup config line, written as `far_sheet_ring` in the
+  tile-hash dump, and toggled by `voxel.TestFarSheetRing` (all kept because `Tools/VoxelForgeTest.ps1`
+  and the clipmap tests use them). `VoxelClipmapDesiredTiles`' sheet branch is test-only now.
+- [ ] `UVoxelSettings::CeilingViewMultiplier` / `CeilingBandChunks` — never read.
+- [ ] `UVoxelSettings::DensityVolumeMaxTasks` — only printed in the startup config log (fill runs on its
+  own thread).
+- [ ] `UVoxelStrateDefinition::WaterColor`, `Creatures`, `AmbientSound`, `Music`, `MusicVolume` and the
+  `FStrateCreature` / `FStrateAmbientActor` spawn fields (`SpawnChancePerChunk`, `MaxPerStrate`,
+  `SpawnWeight`) — authored data with no consuming system yet (F9 audio, creatures).
+- [ ] `UVoxelBiomeDefinition::WaterMaterial` — never read; the water plane uses the strate's
+  `WaterMaterial` only.
+- [ ] Plain C++ enums with no user: `EVoxelFace` (`VoxelTypes.h`), `EVoxelSeasonSelectionReason`
+  (`VoxelSeasonManifest.h`), `EVoxelOpCombine` (`VoxelDensityOp.h` — its comment carries the
+  two-channel sign convention; keep that text if the enum goes).
+- [ ] `IVoxelHeightOp::MaxDisplacement` / `FVoxelHeightStack::MaxTotalDisplacement` — no caller; kept as
+  the documented hook for a future heightfield `ClassifyBox`.
 
 ## Over-complexity (behavior-preserving splits, optional)
 
