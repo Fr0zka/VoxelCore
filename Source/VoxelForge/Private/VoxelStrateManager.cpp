@@ -687,6 +687,74 @@ namespace
             && OutSupportRadius > 0.0f;
     }
 
+    // FMath::PerlinNoise2D is in (-1, 1); the two positive octave weights sum to one,
+    // SmoothStep01 keeps the apron envelope in [0, 1], and each segment stores the scale
+    // actually consumed by VF_ProjectNativePassageFloorSegment. This is the write supremum,
+    // including a small float-rounding allowance at the authored floor's world Z.
+    static bool VF_GetNativePassageFloorReliefBound(
+        const FVoxelPassage& Passage, float& OutReliefBound)
+    {
+        OutReliefBound = 0.0f;
+        if (!Passage.bNativeFloorEnabled)
+        {
+            return true;
+        }
+        if (Passage.ControlPoints.Num() < 2
+            || Passage.ControlRadii.Num() != Passage.ControlPoints.Num()
+            || Passage.NativeFloorProfileZ.Num() != Passage.ControlPoints.Num()
+            || Passage.ControlPoints.Num() > 4096)
+        {
+            return false;
+        }
+
+        float MaxAbsFloorZ = 0.0f;
+        for (int32 Index = 0; Index < Passage.ControlPoints.Num(); ++Index)
+        {
+            if (!VoxelMath::IsFinite(Passage.NativeFloorProfileZ[Index]))
+            {
+                return false;
+            }
+            MaxAbsFloorZ = FMath::Max(
+                MaxAbsFloorZ, FMath::Abs(Passage.NativeFloorProfileZ[Index]));
+        }
+
+        // The relief helper returns exactly zero for these inputs.
+        if (!(Passage.NativeFloorReliefStrength > 0.0f)
+            || !VoxelMath::IsFinite(Passage.NativeFloorReliefStrength)
+            || !VoxelMath::IsFinite(Passage.NativeFloorReliefFrequency)
+            || !(FMath::Abs(Passage.NativeFloorReliefFrequency) > KINDA_SMALL_NUMBER))
+        {
+            return true;
+        }
+
+        float MaxAmplitude = 0.0f;
+        for (int32 SegmentIndex = 0;
+             SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+        {
+            const float ReliefScale =
+                Passage.NativeFloorReliefScales.IsValidIndex(SegmentIndex)
+                ? Passage.NativeFloorReliefScales[SegmentIndex] : 0.0f;
+            if (!VoxelMath::IsFinite(ReliefScale))
+            {
+                return false;
+            }
+            const float Amplitude =
+                FMath::Abs(Passage.NativeFloorReliefStrength)
+                * VOXEL_NOISE_SCALE * FMath::Abs(ReliefScale);
+            if (!VoxelMath::IsFinite(Amplitude))
+            {
+                return false;
+            }
+            MaxAmplitude = FMath::Max(MaxAmplitude, Amplitude);
+        }
+
+        const float RoundingAllowance =
+            8.0f * FLT_EPSILON * FMath::Max(1.0f, MaxAbsFloorZ + MaxAmplitude)
+            + KINDA_SMALL_NUMBER;
+        OutReliefBound = MaxAmplitude + RoundingAllowance;
+        return VoxelMath::IsFinite(OutReliefBound);
+    }
+
     static bool VF_ProjectNativePassageFloorUncached(
         const FVoxelPassage& Passage, const FVector& Position,
         float& OutFloorZ, float& OutSupportRadius,
@@ -2410,6 +2478,16 @@ void UVoxelStrateManager::GeneratePassages()
                     BoundsMax.Y = FMath::Max(BoundsMax.Y, Point.Y + Pad);
                     BoundsMax.Z = FMath::Max(BoundsMax.Z, Point.Z + Pad);
                 };
+                auto IncludeBounds = [&BoundsMin, &BoundsMax](
+                    const FVector& Min, const FVector& Max)
+                {
+                    BoundsMin.X = FMath::Min(BoundsMin.X, Min.X);
+                    BoundsMin.Y = FMath::Min(BoundsMin.Y, Min.Y);
+                    BoundsMin.Z = FMath::Min(BoundsMin.Z, Min.Z);
+                    BoundsMax.X = FMath::Max(BoundsMax.X, Max.X);
+                    BoundsMax.Y = FMath::Max(BoundsMax.Y, Max.Y);
+                    BoundsMax.Z = FMath::Max(BoundsMax.Z, Max.Z);
+                };
                 for (const FVector& CP : Passage.ControlPoints)
                 {
                     IncludePoint(CP, Passage.Radius + 4.0f);
@@ -2429,6 +2507,109 @@ void UVoxelStrateManager::GeneratePassages()
                 };
                 IncludeLanding(Passage.UpperLanding);
                 IncludeLanding(Passage.LowerLanding);
+
+                // These two MC writers run after the tunnel SDF: the native support slab uses
+                // the relieved floor profile, and the final corridor air envelope uses each
+                // segment's own relief branch plus the door-to-standing approaches. Include the
+                // actual write suprema so the chunk shortlist and all sphere-based proofs remain
+                // conservative even when the authored relief exceeds the old one-voxel reserve.
+                if (Passage.bWalkableTunnelContract && Passage.bNativeFloorEnabled)
+                {
+                    constexpr float CorridorHalfWidth =
+                        0.5f * VoxelPassageGeometry::WalkCorridorPlayerWidthVoxels
+                        + VoxelPassageGeometry::WalkCorridorLatticeMarginVoxels;
+                    constexpr float CorridorBottom =
+                        VoxelPassageGeometry::MaxStepHeightVoxels;
+                    constexpr float CorridorTop = CorridorBottom
+                        + VoxelPassageGeometry::WalkCorridorPlayerHeightVoxels;
+                    float ReliefBound = 0.0f;
+                    if (VF_GetNativePassageFloorReliefBound(Passage, ReliefBound)
+                        && Passage.ControlPoints.Num() >= 2
+                        && Passage.ControlRadii.Num() == Passage.ControlPoints.Num())
+                    {
+                        for (int32 SegmentIndex = 0;
+                             SegmentIndex + 1 < Passage.ControlPoints.Num();
+                             ++SegmentIndex)
+                        {
+                            const FVector& A = Passage.ControlPoints[SegmentIndex];
+                            const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                            const float RadiusA =
+                                FMath::Abs(Passage.ControlRadii[SegmentIndex]);
+                            const float RadiusB =
+                                FMath::Abs(Passage.ControlRadii[SegmentIndex + 1]);
+                            const float FloorA =
+                                Passage.NativeFloorProfileZ[SegmentIndex];
+                            const float FloorB =
+                                Passage.NativeFloorProfileZ[SegmentIndex + 1];
+                            if (!VoxelMath::IsFinite(A.X) || !VoxelMath::IsFinite(A.Y)
+                                || !VoxelMath::IsFinite(B.X) || !VoxelMath::IsFinite(B.Y)
+                                || !VoxelMath::IsFinite(FloorA)
+                                || !VoxelMath::IsFinite(FloorB))
+                            {
+                                continue;
+                            }
+                            const float SupportRadius =
+                                VoxelPassageGeometry::NativePassageFloorSupportRadius(
+                                    RadiusA, RadiusB);
+                            IncludeBounds(
+                                FVector(
+                                    FMath::Min(A.X, B.X) - SupportRadius,
+                                    FMath::Min(A.Y, B.Y) - SupportRadius,
+                                    FMath::Min(FloorA, FloorB) - ReliefBound
+                                        - VoxelPassageGeometry::LandingFloorThicknessVoxels),
+                                FVector(
+                                    FMath::Max(A.X, B.X) + SupportRadius,
+                                    FMath::Max(A.Y, B.Y) + SupportRadius,
+                                    FMath::Max(FloorA, FloorB) + ReliefBound
+                                        + KINDA_SMALL_NUMBER));
+                            IncludeBounds(
+                                FVector(
+                                    FMath::Min(A.X, B.X) - CorridorHalfWidth,
+                                    FMath::Min(A.Y, B.Y) - CorridorHalfWidth,
+                                    FMath::Min(FloorA, FloorB) + CorridorBottom
+                                        - ReliefBound),
+                                FVector(
+                                    FMath::Max(A.X, B.X) + CorridorHalfWidth,
+                                    FMath::Max(A.Y, B.Y) + CorridorHalfWidth,
+                                    FMath::Max(FloorA, FloorB) + CorridorTop
+                                        + ReliefBound));
+                        }
+                    }
+
+                    for (const FVoxelPassageLanding* Landing : {
+                             &Passage.UpperLanding, &Passage.LowerLanding })
+                    {
+                        if (!VoxelMath::IsFinite(Landing->DoorPoint.X)
+                            || !VoxelMath::IsFinite(Landing->DoorPoint.Y)
+                            || !VoxelMath::IsFinite(Landing->StandingPoint.X)
+                            || !VoxelMath::IsFinite(Landing->StandingPoint.Y)
+                            || !VoxelMath::IsFinite(Landing->FloorZ))
+                        {
+                            continue;
+                        }
+                        const float LengthSquared = FVector2D::DistSquared(
+                            FVector2D(Landing->DoorPoint.X, Landing->DoorPoint.Y),
+                            FVector2D(Landing->StandingPoint.X, Landing->StandingPoint.Y));
+                        if (!(LengthSquared > KINDA_SMALL_NUMBER)
+                            || !VoxelMath::IsFinite(LengthSquared))
+                        {
+                            continue;
+                        }
+                        IncludeBounds(
+                            FVector(
+                                FMath::Min(Landing->DoorPoint.X, Landing->StandingPoint.X)
+                                    - CorridorHalfWidth,
+                                FMath::Min(Landing->DoorPoint.Y, Landing->StandingPoint.Y)
+                                    - CorridorHalfWidth,
+                                Landing->FloorZ + CorridorBottom),
+                            FVector(
+                                FMath::Max(Landing->DoorPoint.X, Landing->StandingPoint.X)
+                                    + CorridorHalfWidth,
+                                FMath::Max(Landing->DoorPoint.Y, Landing->StandingPoint.Y)
+                                    + CorridorHalfWidth,
+                                Landing->FloorZ + CorridorTop));
+                    }
+                }
 
                 const FVector Center = (BoundsMin + BoundsMax) * 0.5f;
                 float MaxDistSq = 0.0f;
@@ -3399,6 +3580,11 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
     // a tile; a false negative could classify an air tile uniformly and remove the player's floor.
     for (const FVoxelPassage& Passage : Passages)
     {
+        float ReliefBound = 0.0f;
+        if (!VF_GetNativePassageFloorReliefBound(Passage, ReliefBound))
+        {
+            return true;
+        }
         const FVoxelPassageLanding* Landings[] = {
             &Passage.UpperLanding, &Passage.LowerLanding };
         for (const FVoxelPassageLanding* Landing : Landings)
@@ -3426,10 +3612,13 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
         // The default tube also owns a three-voxel support band. Its conservative segment AABB
         // keeps a classifier from proving AllAir over the floor and then dropping that support
         // during meshing. False positives are intentional; false negatives would be a hole.
-        if (Passage.bWalkableTunnelContract
-            && Passage.ControlPoints.Num() >= 2
-            && Passage.ControlRadii.Num() == Passage.ControlPoints.Num())
+        if (Passage.bWalkableTunnelContract)
         {
+            if (Passage.ControlPoints.Num() < 2
+                || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+            {
+                return true;
+            }
             constexpr float Pad = 1.0f;
             for (int32 SegmentIndex = 0;
                  SegmentIndex + 1 < Passage.ControlPoints.Num();
@@ -3437,22 +3626,29 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearBox(
             {
                 const FVector& A = Passage.ControlPoints[SegmentIndex];
                 const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
-                const float SupportRadius = FMath::Max(
-                    FMath::Min(
-                        FMath::Abs(Passage.ControlRadii[SegmentIndex]),
-                        FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
-                    VoxelPassageGeometry::PlayerRadiusVoxels);
-                const float FloorMinZ = FMath::Min(
-                    VoxelPassageGeometry::TunnelFloorZ(
-                        A, Passage.ControlRadii[SegmentIndex]),
-                    VoxelPassageGeometry::TunnelFloorZ(
-                        B, Passage.ControlRadii[SegmentIndex + 1]))
-                    - VoxelPassageGeometry::LandingFloorThicknessVoxels - Pad;
-                const float FloorMaxZ = FMath::Max(
-                    VoxelPassageGeometry::TunnelFloorZ(
-                        A, Passage.ControlRadii[SegmentIndex]),
-                    VoxelPassageGeometry::TunnelFloorZ(
-                        B, Passage.ControlRadii[SegmentIndex + 1])) + Pad;
+                if (!VoxelMath::IsFinite(A.X) || !VoxelMath::IsFinite(A.Y)
+                    || !VoxelMath::IsFinite(A.Z) || !VoxelMath::IsFinite(B.X)
+                    || !VoxelMath::IsFinite(B.Y) || !VoxelMath::IsFinite(B.Z)
+                    || !VoxelMath::IsFinite(Passage.ControlRadii[SegmentIndex])
+                    || !VoxelMath::IsFinite(Passage.ControlRadii[SegmentIndex + 1]))
+                {
+                    return true;
+                }
+                const float RadiusA = FMath::Abs(Passage.ControlRadii[SegmentIndex]);
+                const float RadiusB = FMath::Abs(Passage.ControlRadii[SegmentIndex + 1]);
+                const float SupportRadius =
+                    VoxelPassageGeometry::NativePassageFloorSupportRadius(RadiusA, RadiusB);
+                const float FloorA = Passage.bNativeFloorEnabled
+                    ? Passage.NativeFloorProfileZ[SegmentIndex]
+                    : VoxelPassageGeometry::TunnelFloorZ(A, RadiusA);
+                const float FloorB = Passage.bNativeFloorEnabled
+                    ? Passage.NativeFloorProfileZ[SegmentIndex + 1]
+                    : VoxelPassageGeometry::TunnelFloorZ(B, RadiusB);
+                const float FloorMinZ = FMath::Min(FloorA, FloorB)
+                    - VoxelPassageGeometry::LandingFloorThicknessVoxels
+                    - Pad - ReliefBound;
+                const float FloorMaxZ = FMath::Max(FloorA, FloorB)
+                    + Pad + ReliefBound;
                 const float FloorMinX = FMath::Min(A.X, B.X) - SupportRadius - Pad;
                 const float FloorMaxX = FMath::Max(A.X, B.X) + SupportRadius + Pad;
                 const float FloorMinY = FMath::Min(A.Y, B.Y) - SupportRadius - Pad;
@@ -4255,6 +4451,106 @@ namespace
             FMath::Clamp(Center.Z, (float)Box.Min.Z, (float)Box.Max.Z));
         return FVector::DistSquared(Closest, Center) <= Radius * Radius;
     }
+
+    static bool VF_WalkCorridorBodyCarveTouchesLattice(
+        const TArray<FVoxelPassage>& Passages,
+        const FBox& VoxelBox, const FIntVector& LatticeOrigin, int32 Step)
+    {
+        if (Step <= 0 || !VoxelBox.IsValid)
+        {
+            return true;
+        }
+        constexpr float CorridorHalfWidth =
+            0.5f * VoxelPassageGeometry::WalkCorridorPlayerWidthVoxels
+            + VoxelPassageGeometry::WalkCorridorLatticeMarginVoxels;
+        constexpr float CorridorBottom = VoxelPassageGeometry::MaxStepHeightVoxels;
+        constexpr float CorridorTop = CorridorBottom
+            + VoxelPassageGeometry::WalkCorridorPlayerHeightVoxels;
+
+        for (const FVoxelPassage& Passage : Passages)
+        {
+            if (!Passage.bWalkableTunnelContract || !Passage.bNativeFloorEnabled)
+            {
+                continue;
+            }
+            float ReliefBound = 0.0f;
+            if (!VF_GetNativePassageFloorReliefBound(Passage, ReliefBound))
+            {
+                return true;
+            }
+            if (Passage.ControlPoints.Num() < 2
+                || Passage.ControlRadii.Num() != Passage.ControlPoints.Num())
+            {
+                return true;
+            }
+
+            for (int32 SegmentIndex = 0;
+                 SegmentIndex + 1 < Passage.ControlPoints.Num(); ++SegmentIndex)
+            {
+                const FVector& A = Passage.ControlPoints[SegmentIndex];
+                const FVector& B = Passage.ControlPoints[SegmentIndex + 1];
+                const float FloorA = Passage.NativeFloorProfileZ[SegmentIndex];
+                const float FloorB = Passage.NativeFloorProfileZ[SegmentIndex + 1];
+                if (!VoxelMath::IsFinite(A.X) || !VoxelMath::IsFinite(A.Y)
+                    || !VoxelMath::IsFinite(B.X) || !VoxelMath::IsFinite(B.Y)
+                    || !VoxelMath::IsFinite(FloorA) || !VoxelMath::IsFinite(FloorB))
+                {
+                    return true;
+                }
+                if (VF_LatticeBoxTouchesAABB(
+                        VoxelBox, LatticeOrigin, Step,
+                        FMath::Min(A.X, B.X) - CorridorHalfWidth,
+                        FMath::Max(A.X, B.X) + CorridorHalfWidth,
+                        FMath::Min(A.Y, B.Y) - CorridorHalfWidth,
+                        FMath::Max(A.Y, B.Y) + CorridorHalfWidth,
+                        FMath::Min(FloorA, FloorB) + CorridorBottom - ReliefBound,
+                        FMath::Max(FloorA, FloorB) + CorridorTop + ReliefBound))
+                {
+                    return true;
+                }
+            }
+
+            for (const FVoxelPassageLanding* Landing : {
+                     &Passage.UpperLanding, &Passage.LowerLanding })
+            {
+                if (!VoxelMath::IsFinite(Landing->DoorPoint.X)
+                    || !VoxelMath::IsFinite(Landing->DoorPoint.Y)
+                    || !VoxelMath::IsFinite(Landing->StandingPoint.X)
+                    || !VoxelMath::IsFinite(Landing->StandingPoint.Y)
+                    || !VoxelMath::IsFinite(Landing->FloorZ))
+                {
+                    return true;
+                }
+                const float LengthSquared = FVector2D::DistSquared(
+                    FVector2D(Landing->DoorPoint.X, Landing->DoorPoint.Y),
+                    FVector2D(Landing->StandingPoint.X, Landing->StandingPoint.Y));
+                if (!VoxelMath::IsFinite(LengthSquared))
+                {
+                    return true;
+                }
+                if (LengthSquared <= KINDA_SMALL_NUMBER)
+                {
+                    continue;
+                }
+                if (VF_LatticeBoxTouchesAABB(
+                        VoxelBox, LatticeOrigin, Step,
+                        FMath::Min(Landing->DoorPoint.X, Landing->StandingPoint.X)
+                            - CorridorHalfWidth,
+                        FMath::Max(Landing->DoorPoint.X, Landing->StandingPoint.X)
+                            + CorridorHalfWidth,
+                        FMath::Min(Landing->DoorPoint.Y, Landing->StandingPoint.Y)
+                            - CorridorHalfWidth,
+                        FMath::Max(Landing->DoorPoint.Y, Landing->StandingPoint.Y)
+                            + CorridorHalfWidth,
+                        Landing->FloorZ + CorridorBottom,
+                        Landing->FloorZ + CorridorTop))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 }
 
 bool UVoxelStrateManager::AnyPassageNearLattice(
@@ -4265,17 +4561,20 @@ bool UVoxelStrateManager::AnyPassageNearLattice(
     // zero carve factor.  That was the LOD0 false-Mixed path. Keep the cheap domain test as the
     // common reject, then use the same exact lattice factor that MaxCarveOverBox consumes. The
     // manager cache makes the second call in the fold free for the same box.
+    const bool bBodyCarveCandidate = VF_WalkCorridorBodyCarveTouchesLattice(
+        Passages, VoxelBox, LatticeOrigin, Step);
     if (!VF_AnyPassageModifierDomainTouchesLattice(
             Passages, VoxelBox, LatticeOrigin, Step))
     {
-        return false;
+        return bBodyCarveCandidate;
     }
 
     const float MaxFactor = MaxPassageCarveFactorNearLattice(
         VoxelBox, LatticeOrigin, Step);
     // Invalid input deliberately returns 1.0 from the exact helper. A non-finite result is also
     // retained as a candidate rather than becoming an identity proof.
-    return !VoxelMath::IsFinite(MaxFactor) || MaxFactor > 0.0f;
+    return !VoxelMath::IsFinite(MaxFactor) || MaxFactor > 0.0f
+        || bBodyCarveCandidate;
 }
 
 bool UVoxelStrateManager::AnyPassageAirPostNearLattice(
@@ -4293,6 +4592,11 @@ bool UVoxelStrateManager::AnyPassageAirPostNearLattice(
     }
     if (!VoxelMath::IsFinite(BaseDensity) || !(BaseDensity > 0.0f)
         || !VoxelMath::IsFinite(SealThickness) || SealThickness < 0.0f)
+    {
+        return true;
+    }
+    if (VF_WalkCorridorBodyCarveTouchesLattice(
+            Passages, VoxelBox, LatticeOrigin, Step))
     {
         return true;
     }
@@ -5033,6 +5337,11 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
     }
     for (const FVoxelPassage& Passage : Passages)
     {
+        float ReliefBound = 0.0f;
+        if (!VF_GetNativePassageFloorReliefBound(Passage, ReliefBound))
+        {
+            return true;
+        }
         const FVoxelPassageLanding* Landings[] = {
             &Passage.UpperLanding, &Passage.LowerLanding };
         for (const FVoxelPassageLanding* Landing : Landings)
@@ -5084,15 +5393,16 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
                 {
                     return true;
                 }
-                const float SupportRadius = FMath::Max(
-                    FMath::Min(
-                        FMath::Abs(Passage.ControlRadii[SegmentIndex]),
-                        FMath::Abs(Passage.ControlRadii[SegmentIndex + 1])) - 0.5f,
-                    VoxelPassageGeometry::PlayerRadiusVoxels);
-                const float FloorA = VoxelPassageGeometry::TunnelFloorZ(
-                    A, Passage.ControlRadii[SegmentIndex]);
-                const float FloorB = VoxelPassageGeometry::TunnelFloorZ(
-                    B, Passage.ControlRadii[SegmentIndex + 1]);
+                const float RadiusA = FMath::Abs(Passage.ControlRadii[SegmentIndex]);
+                const float RadiusB = FMath::Abs(Passage.ControlRadii[SegmentIndex + 1]);
+                const float SupportRadius =
+                    VoxelPassageGeometry::NativePassageFloorSupportRadius(RadiusA, RadiusB);
+                const float FloorA = Passage.bNativeFloorEnabled
+                    ? Passage.NativeFloorProfileZ[SegmentIndex]
+                    : VoxelPassageGeometry::TunnelFloorZ(A, RadiusA);
+                const float FloorB = Passage.bNativeFloorEnabled
+                    ? Passage.NativeFloorProfileZ[SegmentIndex + 1]
+                    : VoxelPassageGeometry::TunnelFloorZ(B, RadiusB);
                 if (VF_LatticeBoxTouchesAABB(
                         VoxelBox, LatticeOrigin, Step,
                         FMath::Min(A.X, B.X) - SupportRadius - Pad,
@@ -5100,8 +5410,9 @@ bool UVoxelStrateManager::AnyPassageLandingFloorNearLattice(
                         FMath::Min(A.Y, B.Y) - SupportRadius - Pad,
                         FMath::Max(A.Y, B.Y) + SupportRadius + Pad,
                         FMath::Min(FloorA, FloorB)
-                            - VoxelPassageGeometry::LandingFloorThicknessVoxels - Pad,
-                        FMath::Max(FloorA, FloorB) + Pad))
+                            - VoxelPassageGeometry::LandingFloorThicknessVoxels
+                            - Pad - ReliefBound,
+                        FMath::Max(FloorA, FloorB) + Pad + ReliefBound))
                 {
                     return true;
                 }

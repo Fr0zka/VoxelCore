@@ -99,6 +99,11 @@ namespace
         TArray<int32> SampleStations;
         TArray<int32> SampleLaterals;
         TArray<int32> SampleHeights;
+        TSet<FIntVector> ProofStencilTileOrigins;
+        int32 ProofStencilUniformTiles = 0;
+        int32 ProofStencilSealedTiles = 0;
+        int32 ProofStencilOutOfLayoutAirTiles = 0;
+        int32 ProofStencilClassifyTiles = 0;
         int32 SolidSamples = 0;
         int32 BlockingSolidSamples = 0;
         int32 SolidStations = 0;
@@ -214,6 +219,41 @@ namespace
             (2.0f * FloorProbeHalfRange) / static_cast<float>(FloorProbeIntervals);
         constexpr float FirstBodySampleZ = 0.25f;
         constexpr float BodySampleSpacing = 0.5f;
+        OutSamples.ProofStencilTileOrigins.Reset();
+        OutSamples.ProofStencilUniformTiles = 0;
+        OutSamples.ProofStencilSealedTiles = 0;
+        OutSamples.ProofStencilOutOfLayoutAirTiles = 0;
+        OutSamples.ProofStencilClassifyTiles = 0;
+        const auto AddStencilTilesAtPosition = [&OutSamples](const FVector& Position)
+        {
+            int32 AxisStarts[3][2] = {};
+            int32 AxisCounts[3] = {};
+            const double Coordinates[3] = { Position.X, Position.Y, Position.Z };
+            for (int32 Axis = 0; Axis < 3; ++Axis)
+            {
+                const int32 TileIndex = FMath::FloorToInt(
+                    Coordinates[Axis] / static_cast<double>(CHUNK_SIZE));
+                AxisStarts[Axis][0] = TileIndex * CHUNK_SIZE;
+                AxisCounts[Axis] = 1;
+                // MC tiles share their high-face samples. Include both tiles when a stencil
+                // position lies exactly on a 32-voxel boundary.
+                if (Coordinates[Axis]
+                    == static_cast<double>(AxisStarts[Axis][0]))
+                {
+                    AxisStarts[Axis][1] = AxisStarts[Axis][0] - CHUNK_SIZE;
+                    AxisCounts[Axis] = 2;
+                }
+            }
+            for (int32 XIndex = 0; XIndex < AxisCounts[0]; ++XIndex)
+            for (int32 YIndex = 0; YIndex < AxisCounts[1]; ++YIndex)
+            for (int32 ZIndex = 0; ZIndex < AxisCounts[2]; ++ZIndex)
+            {
+                OutSamples.ProofStencilTileOrigins.Add(FIntVector(
+                    AxisStarts[0][XIndex],
+                    AxisStarts[1][YIndex],
+                    AxisStarts[2][ZIndex]));
+            }
+        };
         TArray<FVector> FeetStations;
         TArray<FVector> LateralAxes;
         TArray<float> ExpectedFloorZ;
@@ -344,6 +384,13 @@ namespace
                 }
 
                 MeasuredFloorZ[FloorIndex] = BestFloor;
+                FVector FloorStencilPosition = FeetStations[StationIndex]
+                    + LateralAxes[StationIndex]
+                        * (-PlayerHalfWidthVoxels
+                           + static_cast<float>(LateralIndex)
+                                * LateralSampleSpacing);
+                FloorStencilPosition.Z = BestFloor;
+                AddStencilTilesAtPosition(FloorStencilPosition);
                 if (BestDistance != FLT_MAX)
                 {
                     bHasMeasuredFloor[FloorIndex] = 1;
@@ -515,8 +562,10 @@ namespace
                         0.0f));
                     const float BodySide = SliceRadius
                         * (static_cast<float>(LateralIndex) / 2.0f - 1.0f);
-                    OutSamples.Positions.Add(
-                        Feet + Lateral * BodySide + FVector(0.0f, 0.0f, Height));
+                    const FVector BodyPosition =
+                        Feet + Lateral * BodySide + FVector(0.0f, 0.0f, Height);
+                    OutSamples.Positions.Add(BodyPosition);
+                    AddStencilTilesAtPosition(BodyPosition);
                     OutSamples.SampleStations.Add(StationIndex);
                     OutSamples.SampleLaterals.Add(LateralIndex);
                     OutSamples.SampleHeights.Add(VerticalIndex);
@@ -631,7 +680,8 @@ namespace
     bool SampleOwnerSeed(
         int32 Seed,
         FWalkCorridorSamples& OutSamples,
-        FString& OutError)
+        FString& OutError,
+        bool bCheckProofStencil = false)
     {
         FOwnerPassageWorld World;
         if (!World.Build(Seed, OutError))
@@ -641,6 +691,24 @@ namespace
         if (!BuildWalkCorridorSamples(World, Seed, OutSamples, OutError))
         {
             return false;
+        }
+        if (bCheckProofStencil)
+        {
+            for (const FIntVector& Origin : OutSamples.ProofStencilTileOrigins)
+            {
+                const bool bSealedSolid = World.Generator->TryProveSealedSolidTile(
+                    Origin, 1, CHUNK_SIZE);
+                const bool bOutOfLayoutAir = World.Generator->TryProveOutOfLayoutAirTile(
+                    Origin, 1, CHUNK_SIZE);
+                const EVoxelTileClass Verdict = World.Generator->ClassifyTile(
+                    Origin, 1, CHUNK_SIZE);
+                const bool bUniformClassify = Verdict != EVoxelTileClass::Mixed;
+                OutSamples.ProofStencilSealedTiles += bSealedSolid ? 1 : 0;
+                OutSamples.ProofStencilOutOfLayoutAirTiles += bOutOfLayoutAir ? 1 : 0;
+                OutSamples.ProofStencilClassifyTiles += bUniformClassify ? 1 : 0;
+                OutSamples.ProofStencilUniformTiles +=
+                    (bSealedSolid || bOutOfLayoutAir || bUniformClassify) ? 1 : 0;
+            }
         }
         if (Seed == 0 && OutSamples.SolidSamples > 0)
         {
@@ -1093,6 +1161,11 @@ bool FVoxelForgeDescentCorridorSeedSweepTest::RunTest(const FString& Parameters)
     int64 TotalBlockingSolidSamples = 0;
     int64 TotalWidthFloorGaps = 0;
     int64 TotalSamples = 0;
+    int64 TotalProofStencilTiles = 0;
+    int64 TotalProofStencilUniformTiles = 0;
+    int64 TotalProofStencilSealedTiles = 0;
+    int64 TotalProofStencilOutOfLayoutAirTiles = 0;
+    int64 TotalProofStencilClassifyTiles = 0;
     int32 FirstFailingSeed = INDEX_NONE;
     FWalkCorridorSamples Worst;
     FString WorstError;
@@ -1101,13 +1174,18 @@ bool FVoxelForgeDescentCorridorSeedSweepTest::RunTest(const FString& Parameters)
     {
         FWalkCorridorSamples Samples;
         FString Error;
-        if (!SampleOwnerSeed(Seed, Samples, Error))
+        if (!SampleOwnerSeed(Seed, Samples, Error, /*bCheckProofStencil=*/true))
         {
             AddError(Error);
             return false;
         }
         LogCorridorResult(*this, Seed, Samples);
         TotalSamples += Samples.Densities.Num();
+        TotalProofStencilTiles += Samples.ProofStencilTileOrigins.Num();
+        TotalProofStencilUniformTiles += Samples.ProofStencilUniformTiles;
+        TotalProofStencilSealedTiles += Samples.ProofStencilSealedTiles;
+        TotalProofStencilOutOfLayoutAirTiles += Samples.ProofStencilOutOfLayoutAirTiles;
+        TotalProofStencilClassifyTiles += Samples.ProofStencilClassifyTiles;
         TotalSolidSamples += Samples.SolidSamples;
         TotalBlockingSolidSamples += Samples.BlockingSolidSamples;
         TotalWidthFloorGaps += Samples.WidthFloorGaps;
@@ -1169,9 +1247,19 @@ bool FVoxelForgeDescentCorridorSeedSweepTest::RunTest(const FString& Parameters)
         static_cast<long long>(TotalWidthFloorGaps), static_cast<long long>(TotalSamples),
         FirstFailingSeed, WorstError.IsEmpty() ? TEXT("none") : *WorstError,
         Worst.BlockingSolidSamples);
+    UE_LOG(LogTemp, Display,
+        TEXT("[VoxelForgeDescentProofStencilSweep] seeds=%d tiles_checked=%lld "
+             "uniform_tiles=%lld sealed_solid=%lld out_of_layout_air=%lld classify_uniform=%lld"),
+        SeedCount, static_cast<long long>(TotalProofStencilTiles),
+        static_cast<long long>(TotalProofStencilUniformTiles),
+        static_cast<long long>(TotalProofStencilSealedTiles),
+        static_cast<long long>(TotalProofStencilOutOfLayoutAirTiles),
+        static_cast<long long>(TotalProofStencilClassifyTiles));
     TestEqual(TEXT("All 64 owner seeds have a clear, walkable A-to-B body corridor"),
         SeedsWithWalkFailures, 0);
-    return SeedsWithWalkFailures == 0;
+    TestEqual(TEXT("No corridor stencil tile is proven uniform by either proof or ClassifyTile"),
+        TotalProofStencilUniformTiles, static_cast<int64>(0));
+    return SeedsWithWalkFailures == 0 && TotalProofStencilUniformTiles == 0;
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -7107,8 +7107,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
 
     // ── Structural passage/origin guards for non-open-air categories. ──
     // Carvers kill AllSolid but never add rock; landing and origin support floors kill AllAir.
-    if (StrateManager->AnyPassageNearLattice(
-            TileVoxelBox, OriginVoxels, Step))
+    const bool bHasPassageCarvingCandidate =
+        StrateManager->AnyPassageNearLattice(
+            TileVoxelBox, OriginVoxels, Step);
+    if (bHasPassageCarvingCandidate)
     {
         bCanSolid = false;
     }
@@ -7355,10 +7357,10 @@ EVoxelTileClass UVoxelGenerator::ClassifyTileUncached(
             && CaveMinZ == MinZ && CaveMaxZ == MaxZ;
         if (bCaveOnlyTile && StackVerdict == EVoxelTileClass::AllSolid)
         {
-            // The stack verdict covers the complete cave-only MC lattice. Its exact structural
-            // post path was supplied above, so a broad conservative passage guard must not force
-            // this already-certified solid tile through GenerateMesh.
-            bCanSolid = true;
+            // The operator stack does not own the final passage carve. Keep
+            // its AllSolid shortcut only when the exact-lattice passage guard
+            // found no modifier or body-envelope write in this tile.
+            bCanSolid = !bHasPassageCarvingCandidate;
             bCanAir = false;
         }
         else if (bCaveOnlyTile && StackVerdict == EVoxelTileClass::AllAir)
