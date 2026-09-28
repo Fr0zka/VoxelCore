@@ -78,35 +78,6 @@ public:
                                 int32 BandZMinVox = INT32_MIN, int32 BandZMaxVox = INT32_MAX,
                                 int64* OutDensitySampleCount = nullptr);
 
-    /**
-     * F18 — FEUILLE de champ lointain (anneau render-distance, cf. UVoxelSettings::bFarSheetRing).
-     * Dans une strate ouverte (SurfaceWorld) le champ lointain est exactement DEUX heightfields —
-     * TerrainZ (sol) et CeilSurf (plafond sky-cap), déjà calculés par colonne par l'oracle
-     * GetSurfaceHeightAt. On construit donc deux grilles déplacées régulières au lieu d'un marching
-     * cubes 3D : sol = polygroup 0, cap = polygroup 1 (classes vraies PAR CONSTRUCTION — pas de vote,
-     * pas de sonde de classification), mêmes conventions que GenerateMesh (positions monde cm, UVs
-     * planaires, masques couleur F6 biome/pente/fondu, normales du gradient de hauteur, jupes
-     * périmètre par seau, run d'indices sol‖cap + NumCeilingTriangles).
-     *
-     * @param OriginVoxels  - Coin min de la tuile (voxels). Seul XY est utilisé (les hauteurs sont absolues).
-     * @param StepXY        - Pas d'échantillonnage XY en voxels (aligné sur l'anneau MC pour la continuité).
-     * @param CellsXY       - Cellules par axe XY (extent = CellsXY × StepXY).
-     * @param StrateChunkZ  - Chunk Z DANS la strate de référence (le cœur de la bande) — identifie la
-     *                        strate dont on maille sol+cap. Hors SurfaceWorld ⇒ mesh vide.
-     * @param HoleMin/MaxX/YVox - TROU XY (voxels, Max EXCLUSIF ; sentinelles MAX/MIN = pas de trou) :
-     *                        les cellules ENTIÈREMENT dans ce rectangle (la zone couverte par les
-     *                        coquilles MC autour du joueur) sont sautées — sinon la feuille recouvre
-     *                        le terrain proche avec son échantillonnage grossier. Les cellules à
-     *                        cheval restent (anneau de recouvrement au raccord) ; pas de jupe sur
-     *                        les bords du trou (le terrain MC remplit derrière).
-     * Non couvert (accepté, cf. fable-idea F18) : passages/spine/chasms creusés (le heightfield pur ne
-     * les contient pas), diff layer — invisibles à distance de feuille, l'anneau MC proche les garde.
-     */
-    FVoxelMeshData GenerateSheetMesh(FIntVector OriginVoxels, int32 StepXY, int32 CellsXY,
-                                     int32 StrateChunkZ,
-                                     int32 HoleMinXVox = INT32_MAX, int32 HoleMinYVox = INT32_MAX,
-                                     int32 HoleMaxXVox = INT32_MIN, int32 HoleMaxYVox = INT32_MIN);
-
     //=========================================================================
     // SERVICES (injectés par AVoxelWorld)
     //=========================================================================

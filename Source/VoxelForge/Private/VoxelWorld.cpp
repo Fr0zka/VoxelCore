@@ -59,7 +59,6 @@
 #include "Serialization/JsonWriter.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"   // Unreal Insights scopes (Perf 0)
 
-static int32 VF_MaxMarchingCubesLevel(const UVoxelSettings* Settings);
 static bool VF_TileOverlapsVoxelBounds(const FVoxelTileKey& Tile,
                                        const FVector& BoundsMin, const FVector& BoundsMax);
 static bool VF_TileFootprintsOverlap(const FVoxelTileKey& A, const FVoxelTileKey& B);
@@ -2232,7 +2231,7 @@ void AVoxelWorld::ConfigureHeadlessStreamingTest()
 
 void AVoxelWorld::RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                                  int32 Step, int32 Cells, int32 BandChunkLo, int32 BandChunkHi,
-                                 bool bSheetTile, const FVoxelMeshData& MeshData)
+                                 const FVoxelMeshData& MeshData)
 {
     if (!bTileHashDumpEnabled)
     {
@@ -2246,7 +2245,6 @@ void AVoxelWorld::RecordTileHash(const FVoxelTileKey& Tile, const FIntVector& Or
     Record.Cells = Cells;
     Record.BandChunkLo = BandChunkLo;
     Record.BandChunkHi = BandChunkHi;
-    Record.bSheetTile = bSheetTile;
     Record.bEmpty = MeshData.IsEmpty();
     Record.NumTriangles = MeshData.Triangles.Num() / 3;
     Record.GeometryHash = VoxelForgeGeometryHash::Compute(MeshData);
@@ -2315,7 +2313,8 @@ void AVoxelWorld::WriteTileHashDump()
         Writer->WriteValue(TEXT("cells"), Record.Cells);
         Writer->WriteValue(TEXT("band_chunk_lo"), Record.BandChunkLo);
         Writer->WriteValue(TEXT("band_chunk_hi"), Record.BandChunkHi);
-        Writer->WriteValue(TEXT("sheet_tile"), Record.bSheetTile);
+        // The parity harness still compares this field; the runtime has no sheet tiles.
+        Writer->WriteValue(TEXT("sheet_tile"), false);
         Writer->WriteValue(TEXT("empty"), Record.bEmpty);
         Writer->WriteValue(TEXT("triangle_count"), Record.NumTriangles);
         Writer->WriteValue(TEXT("geometry_hash"), Record.GeometryHash);
@@ -4577,12 +4576,11 @@ void AVoxelWorld::Tick(float DeltaTime)
             const double SpanZ = static_cast<double>(Max.Z - Min.Z + 1) * TileExtentMetres;
             VoxelForgeStartupTrace::RecordEvent(TEXT("steady_desired_level"), FString::Printf(
                 TEXT("\"level\":%d,\"tiles\":%d,\"min_coord\":[%d,%d,%d],\"max_coord\":[%d,%d,%d],"
-                     "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s],\"sheet\":%d"),
+                     "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s]"),
                 Level, SteadyLevelCounts.FindChecked(Level),
                 Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z,
                 *FString::SanitizeFloat(TileExtentMetres),
-                *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
-                Settings && Level > VF_MaxMarchingCubesLevel(Settings) ? 1 : 0));
+                *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ)));
             VoxelForgeStartupTrace::RecordEvent(TEXT("steady_loaded_level"), FString::Printf(
                 TEXT("\"level\":%d,\"tiles\":%d,\"vertices\":%llu,\"triangles\":%llu,\"geometry_bytes\":%llu"),
                 Level, LoadedLevelCounts.FindRef(Level),
@@ -6217,8 +6215,7 @@ void AVoxelWorld::SyncRemeshTile(const FVoxelTileKey& Tile)
     Result.GenerationStartCycles = GenerateStartCycles;
     GenerateTileResult(Tile, OriginVoxels, Step, Cells, GenerationEpoch, /*bWantCapture*/ false,
                        BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                       /*bSheetTile*/ false, /*SheetChunkZ*/ 0,
-                        /*Hole*/ 0, 0, 0, 0, Result, nullptr);   // hole unused (not a sheet tile)
+                       Result, nullptr);
     Result.GenerationEndCycles = GenerateStartCycles != 0
         ? FPlatformTime::Cycles64() : 0;
 
@@ -6471,28 +6468,16 @@ static FORCEINLINE FIntVector VF_FloorDiv(const FIntVector& V, int32 D)
     return FIntVector(VF_FloorDiv(V.X, D), VF_FloorDiv(V.Y, D), VF_FloorDiv(V.Z, D));
 }
 
-// F18 — the outer shell is either the MC render-distance level or the larger sheet ring. When
-// the sheet span skips levels, VF_MaxMarchingCubesLevel fills them with MC bridge shells.
-// Shared by desired selection and range culling so both use the same outer horizon.
+// The outer shell is the MaxClipLevel ring stretched to RenderDistanceChunks. Shared by desired
+// selection and range culling so both use the same outer horizon. The selector's far sheet ring
+// is not part of the runtime, so it is always switched off here.
 static FORCEINLINE void VF_OuterShell(const UVoxelSettings* Settings, int32 R, int32 MaxLevel,
                                       int32& OutLevel, int32& OutRadius)
 {
     VoxelClipmapDesiredTiles::FParameters Parameters;
     Parameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
-    Parameters.bFarSheetRing = Settings && Settings->bFarSheetRing;
-    Parameters.FarSheetSpanLevels = Settings ? Settings->FarSheetSpanLevels : 2;
+    Parameters.bFarSheetRing = false;
     VoxelClipmapDesiredTiles::OuterShell(Parameters, R, MaxLevel, OutLevel, OutRadius);
-}
-
-// When an expanded sheet ring skips LOD levels, keep an MC bridge at every intervening level.
-static int32 VF_MaxMarchingCubesLevel(const UVoxelSettings* Settings)
-{
-    const int32 Radius = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
-    const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
-    int32 OuterLevel = MaxLevel, OuterRadius = Radius;
-    VF_OuterShell(Settings, Radius, MaxLevel, OuterLevel, OuterRadius);
-    (void)OuterRadius;
-    return OuterLevel > MaxLevel ? OuterLevel - 1 : MaxLevel;
 }
 
 void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& PlayerPosition,
@@ -6512,8 +6497,7 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
     const int32 MaxLevel = Settings ? FMath::Clamp(Settings->MaxClipLevel, 0, 8) : 4;
 
-    // Render-distance tiles expand horizontally. The sheet ring retains its configured span;
-    // intermediate levels are emitted as marching-cubes bridge shells below it.
+    // Render-distance tiles expand horizontally.
     // IsTileInClipRange shares the outer-shell calculation so culling sees this same horizon.
     int32 StrateTopZ = 0, StrateBottomZ = 0;
     bool bHasStrate = false;
@@ -6537,8 +6521,7 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
     TileParameters.ClipRadius = R;
     TileParameters.MaxClipLevel = MaxLevel;
     TileParameters.RenderDistanceChunks = Settings ? Settings->RenderDistanceChunks : 0;
-    TileParameters.bFarSheetRing = Settings && Settings->bFarSheetRing;
-    TileParameters.FarSheetSpanLevels = Settings ? Settings->FarSheetSpanLevels : 2;
+    TileParameters.bFarSheetRing = false;
     VoxelClipmapDesiredTiles::Build(Center, ZLo, ZHi, TileParameters, DesiredSorted);
     for (const FVoxelTileKey& Key : DesiredSorted)
     {
@@ -6681,10 +6664,10 @@ void AVoxelWorld::BuildDesiredTiles(const FIntVector& Center, const FVector& Pla
         DesiredTransitionMaxLevel = FMath::Max(DesiredTransitionMaxLevel, Pair.Key.Level);
     }
     // A worker from the previous desired epoch can finish late with a component at a level no
-    // longer present in TileComponents when this index is built. Index through the supported
-    // maximum sheet level (MaxClipLevel 8 + FarSheetSpanLevels 4) so that such a retired tile still
+    // longer present in TileComponents when this index is built. Index through the highest
+    // possible tile level (MaxClipLevel is clamped to 8) so that such a retired tile still
     // finds all of its desired descendants when the result is reconciled.
-    constexpr int32 MaxSupportedTileLevel = 12;
+    constexpr int32 MaxSupportedTileLevel = 8;
     const int32 DescendantIndexMaxLevel = FMath::Max(
         DesiredTransitionMaxLevel, MaxSupportedTileLevel);
     for (const FVoxelTileKey& Key : DesiredSorted)
@@ -6727,7 +6710,7 @@ void AVoxelWorld::CancelObsoleteTileWork()
 }
 
 // Fold every registered anchor's small level-0 box into the current desired set (§9.3). Runs inside
-// BuildDesiredTiles after the player clipmap + sheet ring, keyed on the same DesiredStamp so the leaver
+// BuildDesiredTiles after the player clipmap, keyed on the same DesiredStamp so the leaver
 // sweep + delta cull handle anchor tiles leaving. Level-0 only (collision lives on level-0 tiles); empty
 // tiles in the box are ~free (the trivial-tile reject skips gen). Dedup vs the player clipmap by stamp.
 // §9.4: a tile the player clipmap did NOT stamp (bNew) that only a CollisionOnly anchor wants goes into
@@ -6839,7 +6822,7 @@ void AVoxelWorld::UnregisterStreamingAnchor(AActor* Actor)
 bool AVoxelWorld::IsTileInClipRange(const FVoxelTileKey& Tile, const FIntVector& Center) const
 {
     // In range = the tile's centre falls within the OUTERMOST shell (VF_OuterShell — the
-    // render-distance/sheet-ring level+radius, same as BuildDesiredTiles). A loaded-but-not-
+    // render-distance level+radius, same as BuildDesiredTiles). A loaded-but-not-
     // desired tile in range is mid-LOD-transition (wait for its replacement); one out of range
     // has left the view entirely (cull immediately).
     const int32 R        = Settings ? FMath::Max(1, Settings->ClipRadius) : 3;
@@ -7021,13 +7004,13 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 const double SpanZ = static_cast<double>(Summary.Max.Z - Summary.Min.Z + 1) * TileExtentMetres;
                 VoxelForgeStartupTrace::RecordEvent(TEXT("desired_level"), FString::Printf(
                     TEXT("\"level\":%d,\"tiles\":%d,\"min_coord\":[%d,%d,%d],\"max_coord\":[%d,%d,%d],"
-                         "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s],\"sheet\":%d"),
+                         "\"tile_extent_m\":%s,\"coverage_extent_m\":[%s,%s,%s]"),
                     Summary.Level, Summary.Count,
                     Summary.Min.X, Summary.Min.Y, Summary.Min.Z,
-                Summary.Max.X, Summary.Max.Y, Summary.Max.Z,
-                *FString::SanitizeFloat(TileExtentMetres),
-                *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY), *FString::SanitizeFloat(SpanZ),
-                    Settings && Summary.Level > VF_MaxMarchingCubesLevel(Settings) ? 1 : 0));
+                    Summary.Max.X, Summary.Max.Y, Summary.Max.Z,
+                    *FString::SanitizeFloat(TileExtentMetres),
+                    *FString::SanitizeFloat(SpanX), *FString::SanitizeFloat(SpanY),
+                    *FString::SanitizeFloat(SpanZ)));
             }
             bStartupTraceDesiredRecorded = true;
         }
@@ -7044,13 +7027,8 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
         // either way; everything else re-gens in place via BandRemeshQueue (no visual pop).
         {
             const int32 CutMin = Settings ? Settings->GetEffectiveStrateContentCutMinLevel() : 9;
-            // F18 — l'anneau feuille dépend aussi de la bande (sa strate de référence) : on l'arme
-            // dès que les feuilles sont actives, même si la coupe de contenu MC est désactivée.
-            const bool bSheetsWantBand = Settings && Settings->bFarSheetRing
-                                      && Settings->RenderDistanceChunks > 0;
-            const int32 TopMC = VF_MaxMarchingCubesLevel(Settings);
             int32 NewLo = MIN_int32, NewHi = MAX_int32;
-            if ((CutMin <= 8 || bSheetsWantBand) && StrateManager)
+            if (CutMin <= 8 && StrateManager)
             {
                 int32 StrTopZ = 0, StrBotZ = 0;
                 if (StrateManager->GetStrateChunkZBounds(CenterChunk.Z, StrTopZ, StrBotZ))
@@ -7069,8 +7047,7 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                     NewLo, NewHi, MeshBandChunkLo, MeshBandChunkHi, CutMin, CenterChunk.Z);
                 for (const FVoxelTileKey& T : LoadedTiles)
                 {
-                    // Sheets (above the last MC bridge level) always depend on the strate band.
-                    if (T.Level < CutMin && T.Level <= TopMC) continue;
+                    if (T.Level < CutMin) continue;
                     const int32 CLo = T.Coord.Z << T.Level;
                     const int32 CHi = ((T.Coord.Z + 1) << T.Level) - 1;
                     const bool bInOld  = CLo >= MeshBandChunkLo && CHi <= MeshBandChunkHi;
@@ -7084,44 +7061,6 @@ void AVoxelWorld::UpdateChunksAroundPosition(const FVector& CenterPosition, APaw
                 MeshBandChunkLo = NewLo;
                 MeshBandChunkHi = NewHi;
                 bAllChunksLoaded = false;   // le drain de BandRemeshQueue vit dans le bloc submit
-            }
-        }
-
-        // The sheet XY hole follows the outermost MC bridge level and shrinks by one tile, leaving
-        // an overlap at the mesh transition. Requeue sheets overlapping either the old or new hole
-        // when the player crosses a bridge-level tile.
-        {
-            int32 NewMinX = MAX_int32, NewMinY = MAX_int32;
-            int32 NewMaxX = MIN_int32, NewMaxY = MIN_int32;
-            const int32 TopMCLvl = VF_MaxMarchingCubesLevel(Settings);
-            if (Settings && Settings->bFarSheetRing && Settings->RenderDistanceChunks > 0)
-            {
-                const int32 RClip  = FMath::Max(1, Settings->ClipRadius);
-                const int32 Shrink = FMath::Max(0, RClip - 1);
-                const int32 ExtM   = CHUNK_SIZE << TopMCLvl;                      // tuile MaxLevel en voxels
-                const FIntVector CM = VF_FloorDiv(CenterChunk, 1 << TopMCLvl);    // tuile MaxLevel du joueur
-                NewMinX = (CM.X - Shrink) * ExtM;
-                NewMinY = (CM.Y - Shrink) * ExtM;
-                NewMaxX = (CM.X + Shrink + 1) * ExtM;   // EXCLUSIF
-                NewMaxY = (CM.Y + Shrink + 1) * ExtM;
-            }
-            if (NewMinX != SheetHoleMinXVox || NewMinY != SheetHoleMinYVox
-                || NewMaxX != SheetHoleMaxXVox || NewMaxY != SheetHoleMaxYVox)
-            {
-                for (const FVoxelTileKey& T : LoadedTiles)
-                {
-                    if (T.Level <= TopMCLvl) continue;   // seules les feuilles portent le trou
-                    const int32 Ext   = CHUNK_SIZE << T.Level;
-                    const int32 TMinX = T.Coord.X * Ext, TMinY = T.Coord.Y * Ext;
-                    const bool bOldOv = TMinX < SheetHoleMaxXVox && TMinX + Ext > SheetHoleMinXVox
-                                     && TMinY < SheetHoleMaxYVox && TMinY + Ext > SheetHoleMinYVox;
-                    const bool bNewOv = TMinX < NewMaxX && TMinX + Ext > NewMinX
-                                     && TMinY < NewMaxY && TMinY + Ext > NewMinY;
-                    if ((bOldOv || bNewOv) && IsDesired(T)) BandRemeshQueue.Add(T);
-                }
-                SheetHoleMinXVox = NewMinX; SheetHoleMinYVox = NewMinY;
-                SheetHoleMaxXVox = NewMaxX; SheetHoleMaxYVox = NewMaxY;
-                bAllChunksLoaded = false;
             }
         }
 
@@ -7391,20 +7330,9 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
     const int32 FullRes = Settings ? FMath::Max(1, Settings->FullResClipLevels) : 2;
     const int32 Extent  = CHUNK_SIZE << Tile.Level;
 
-    // F18 — sheet-ring keys follow the last MC bridge level and mesh as two heightfields
-    // (GenerateSheetMesh). Their sampling step matches that MC level; cells grow with sheet extent
-    // up to 128 per axis, after which the step increases.
-    const int32 TopMC = VF_MaxMarchingCubesLevel(Settings);
-    const bool bSheetTile = Tile.Level > TopMC;
-
-    int32 Cells = (Tile.Level < FullRes)
+    const int32 Cells = (Tile.Level < FullRes)
         ? CHUNK_SIZE
         : (Settings ? FMath::Clamp(Settings->CoarseTileCells, 4, CHUNK_SIZE) : 16);
-    if (bSheetTile)
-    {
-        const int32 StepMC = FMath::Max(1, (CHUNK_SIZE << TopMC) / Cells);
-        Cells = FMath::Clamp(Extent / StepMC, 4, 128);
-    }
     const int32 Step    = FMath::Max(1, Extent / Cells);
     const uint32 TaskEpoch = GenerationEpoch;
     const uint32 TaskDesiredEpoch = DesiredEpoch;
@@ -7425,40 +7353,8 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
     // below the configured minimum and all LODs in the gap (no band) mesh full.
     int32 BandVoxLo = INT32_MIN, BandVoxHi = INT32_MAX;
     int32 BandChunkLo = MIN_int32, BandChunkHi = MAX_int32;
-    int32 SheetChunkZ = 0;
-    if (bSheetTile)
-    {
-        // F18 — la feuille a besoin de la STRATE de référence (les deux heightfields sont ceux de
-        // la strate du joueur) : pas de bande armée (gap inter-strates, ou bounds introuvables)
-        // ⇒ rien à mailler, tuile vide (re-queue automatique via BandRemeshQueue en atterrissant).
-        if (MeshBandChunkLo == MIN_int32)
-        {
-            FChunkResult Empty;
-            Empty.Tile  = Tile;
-            Empty.Epoch = TaskEpoch;
-            Empty.DesiredEpoch = TaskDesiredEpoch;
-            Empty.ModificationEpoch = TaskModificationEpoch;
-            Empty.RequestStartCycles = RequestStartCycles;
-            Empty.WorkPriority = WorkPriority;
-            if (WorkPriority == EVoxelTileWorkPriority::CollisionCritical)
-                CriticalProcessQueue.Enqueue(MoveTemp(Empty));
-            else if (WorkPriority == EVoxelTileWorkPriority::Edited)
-                EditedProcessQueue.Enqueue(MoveTemp(Empty));
-            else if (WorkPriority == EVoxelTileWorkPriority::LOD0)
-                NearProcessQueue.Enqueue(MoveTemp(Empty));
-            else
-                ProcessQueue.Enqueue(MoveTemp(Empty));
-            return;
-        }
-        BandChunkLo = MeshBandChunkLo;   // pour la résolution matériaux sol/cap dans ApplyMeshToTile
-        BandChunkHi = MeshBandChunkHi;
-        SheetChunkZ = MeshBandChunkLo + (MeshBandChunkHi - MeshBandChunkLo) / 2;   // chunk au cœur de la strate
-    }
-    // F18 — trou XY courant (zone couverte par les coquilles MC, découpée des feuilles).
-    const int32 HoleMinX = SheetHoleMinXVox, HoleMinY = SheetHoleMinYVox;
-    const int32 HoleMaxX = SheetHoleMaxXVox, HoleMaxY = SheetHoleMaxYVox;
     const int32 CutMin = Settings ? Settings->GetEffectiveStrateContentCutMinLevel() : 9;
-    if (!bSheetTile && Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
+    if (Tile.Level >= CutMin && MeshBandChunkLo != MIN_int32)
     {
         BandChunkLo = MeshBandChunkLo;
         BandChunkHi = MeshBandChunkHi;
@@ -7512,7 +7408,6 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
         : UE::Tasks::ETaskPriority::BackgroundNormal;
     UE::Tasks::Launch(TEXT("ChunkGen"), [this, Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                                           BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                                          bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
                                           RequestStartCycles, TaskDesiredEpoch, TaskModificationEpoch, Cancellation,
                                           WorkPriority]()
     {
@@ -7565,7 +7460,6 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
         Result.GenerationStartCycles = GenerationStartCycles;
         GenerateTileResult(Tile, OriginVoxels, Step, Cells, TaskEpoch, bWantCapture,
                            BandVoxLo, BandVoxHi, BandChunkLo, BandChunkHi,
-                           bSheetTile, SheetChunkZ, HoleMinX, HoleMinY, HoleMaxX, HoleMaxY,
                            Result, &Cancellation->bObsolete);
         Result.GenerationEndCycles = GenerationStartCycles != 0
             ? FPlatformTime::Cycles64() : 0;
@@ -7611,8 +7505,6 @@ void AVoxelWorld::LoadTile(const FVoxelTileKey& Tile, EVoxelTileWorkPriority Wor
 void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector& OriginVoxels,
                                       int32 Step, int32 Cells, uint32 Epoch, bool bWantCapture,
                                       int32 BandVoxLo, int32 BandVoxHi, int32 BandChunkLo, int32 BandChunkHi,
-                                      bool bSheetTile, int32 SheetChunkZ,
-                                      int32 HoleMinX, int32 HoleMinY, int32 HoleMaxX, int32 HoleMaxY,
                                       FChunkResult& Result,
                                       const std::atomic<bool>* ObsoleteFlag)
 {
@@ -7666,7 +7558,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                     / static_cast<double>(WormEligibleSamples)
                 : 0.0;
             UE_LOG(LogTemp, Display,
-                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d sheet=%d aborted=%d empty=%d triangles=%d ceiling_triangles=%d "
+                TEXT("[VoxelForgeTileProfile] tile=(%d,%d,%d) level=%d step=%d cells=%d aborted=%d empty=%d triangles=%d ceiling_triangles=%d "
                      "band=(%d,%d) "
                      "verdict=%d proof=%d air_proof=%d classify=%.6f mesh=%.6f streams=%.6f seconds=%.6f "
                      "cache_build=%.6f evaluation=%.6f "
@@ -7686,7 +7578,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
                      "worm_eligible=%llu worm_block_proofs=%llu worm_block_skipped=%llu "
                      "worm_skip_rate=%.6f"),
                 Tile.Coord.X, Tile.Coord.Y, Tile.Coord.Z, Tile.Level, Step, Cells,
-                bSheetTile ? 1 : 0, Result.bAborted ? 1 : 0,
+                Result.bAborted ? 1 : 0,
                 Result.bEmpty ? 1 : 0, Result.NumTriangles, Result.NumCeilingTriangles,
                 BandChunkLo, BandChunkHi,
                 ClassifyVerdict, Result.bSealedSolidProof ? 1 : 0,
@@ -7825,7 +7717,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     // (Gate IsoLevel == 0 : les verdicts du classifieur supposent l'iso MC à zéro exactement.)
     bool bTrivialEmpty = false;
     if (GVoxelForgeSealedSolidProof != 0
-        && !bSheetTile && !bWantCapture && Generator && Mesher
+        && !bWantCapture && Generator && Mesher
         && Mesher->IsoLevel == 0.0f)
     {
         TotalSealedSolidProofCandidates.fetch_add(1, std::memory_order_relaxed);
@@ -7867,7 +7759,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     }
     const int32 OuterClassifierMode = FMath::Clamp(GVoxelForgeOuterClassifierMode, 0, 1);
     if (!bTrivialEmpty && OuterClassifierMode != 0
-        && !bSheetTile && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
+        && !bWantCapture && Generator && Mesher && Mesher->IsoLevel == 0.0f)
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_ClassifyTile);
         INC_DWORD_STAT(STAT_VoxelForgeTilesClassified);
@@ -7972,8 +7864,6 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
         bTrivialEmpty = (ValidatedVerdict != EVoxelTileClass::Mixed);
     }
 
-    // F18 — feuille : deux heightfields sol/cap échantillonnés par colonne (pas de marching
-    // cubes, pas de classifieur — la classe de surface est vraie par construction).
     // `TilesMeshed` peut dépasser `TilesClassified` : les tuiles qui ratent cette porte sont
     // maillées sans classification. / `TilesMeshed` may exceed `TilesClassified`: tiles that
     // fail this gate are meshed without classification.
@@ -7982,13 +7872,10 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(VoxelForge_GenerateMesh);
         const double MeshStartSeconds = bMeasureTile ? FPlatformTime::Seconds() : 0.0;
-        MeshData = bSheetTile
-            ? Mesher->GenerateSheetMesh(OriginVoxels, Step, Cells, SheetChunkZ,
-                                        HoleMinX, HoleMinY, HoleMaxX, HoleMaxY)
-            : Mesher->GenerateMesh(OriginVoxels, Step, Cells,
-                                   bWantCapture ? &Result.CaptureGrid : nullptr,
-                                   BandVoxLo, BandVoxHi,
-                                   &Result.MesherDensityCalls);
+        MeshData = Mesher->GenerateMesh(OriginVoxels, Step, Cells,
+                                        bWantCapture ? &Result.CaptureGrid : nullptr,
+                                        BandVoxLo, BandVoxHi,
+                                        &Result.MesherDensityCalls);
         TotalMesherDensityCalls.fetch_add(
             static_cast<uint64>(Result.MesherDensityCalls), std::memory_order_relaxed);
         MeshSeconds = bMeasureTile ? FPlatformTime::Seconds() - MeshStartSeconds : 0.0;
@@ -8041,7 +7928,7 @@ void AVoxelWorld::GenerateTileResult(const FVoxelTileKey& Tile, const FIntVector
     // Parity instrumentation observes the same FVoxelMeshData that the runtime stream builder
     // consumes. It is intentionally after the abort fence, so a canceled worker cannot publish a
     // partial identity, and it records empty/proof tiles as well as visible meshes.
-    RecordTileHash(Tile, OriginVoxels, Step, Cells, BandChunkLo, BandChunkHi, bSheetTile, MeshData);
+    RecordTileHash(Tile, OriginVoxels, Step, Cells, BandChunkLo, BandChunkHi, MeshData);
 
     Result.ClassifySeconds = ClassifySeconds;
     Result.MeshSeconds = MeshSeconds;

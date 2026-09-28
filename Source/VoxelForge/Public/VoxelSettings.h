@@ -183,22 +183,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "0"))
 	int32 RenderDistanceChunks = 768;
 
-	// F18 — the render-distance ring streams per-surface SHEETS instead of MC tiles: in an open
-	// strate the far field is exactly two heightfields (TerrainZ + sky-cap CeilSurf, both already
-	// computed per column), so each far tile becomes two displaced grids (ground polygroup 0 /
-	// cap polygroup 1 — same materials), ~3-6× cheaper to generate and far fewer components (one
-	// sheet spans 2^FarSheetSpanLevels MC-tile footprints per axis). Non-open strates produce
-	// empty sheets (their far ring was enclosed rock anyway). Carved features (passages, chasms,
-	// spine) don't show at sheet distance. Needs the strate band armed (StrateContentCutMinLevel
-	// active); in the inter-strate gap the sheet ring blanks until you land. The ship default is OFF:
-	// the ring stays real MC tiles at level MaxClipLevel (pre-F18 behaviour). Only matters when
-	// RenderDistanceChunks > 0.
+	// UNUSED: the far sheet ring was removed from the runtime; the render-distance ring is always
+	// marching-cubes tiles at MaxClipLevel. Kept only so saved assets and the test harness's
+	// `voxel.TestFarSheetRing` switch still load; it has no effect.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap")
 	bool bFarSheetRing = false;
 
-	// Sheet tile size = MaxClipLevel + this many levels (2 → one sheet covers 4×4 MC-tile
-	// footprints → ~16× fewer far components). Sampling density stays that of the MaxClipLevel
-	// MC ring (cell count grows instead), capped at 128 cells/axis (beyond, cells coarsen).
+	// UNUSED (see bFarSheetRing). Kept so saved assets still load; it has no effect.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Clipmap", meta = (ClampMin = "1", ClampMax = "4", EditCondition = "bFarSheetRing"))
 	int32 FarSheetSpanLevels = 2;
 
