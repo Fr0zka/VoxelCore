@@ -769,17 +769,12 @@ driven by `EditorBrush*` props.
   so the cull sees the same horizon; the ring's dz sweep is pre-clamped to the vertical strate
   band). The ring is made of level-MaxClipLevel MC tiles, so its cost grows with
   (distance/2^MaxClipLevel)². The far "sheet" ring (heightfield tiles past `MaxClipLevel`) was
-  dropped by the owner's decision: `bFarSheetRing` / `FarSheetSpanLevels` stay in `UVoxelSettings`
-  only so saved assets load, and the runtime (`VF_OuterShell`, `BuildDesiredTiles`) always passes
-  `bFarSheetRing = false` to the selector (`VoxelClipmapDesiredTiles`, whose automation tests still
-  exercise the sheet branch).
+  dropped by the owner's decision; it no longer exists in the selector or the settings.
   (A "step cap" variant — raising CoarseTileCells per level so far levels keep a fine Step — was
   tried and rejected 2026-07-06.)
   Trade-offs accepted: other strates simply don't render at far LOD (they're sealed/enclosed —
   invisible except through passage mouths, which read as dark holes); passage tubes crossing the gap
   are cut at coarse levels only (near levels mesh full).
-  The ceiling settings `CeilingViewMultiplier` / `CeilingBandChunks` are unused (left in place for
-  saved assets).
 - **SKIRTS — LOD-seam crack filler** (`GenerateMesh`, after the cell loop; `VoxelSettings::bGenerateSkirts`
   + `SkirtCells`, wired onto the mesher at setup). Neighbouring shells mesh at different resolutions so
   their iso-surfaces don't meet along the shared face → a thin see-through crack. After meshing, every
