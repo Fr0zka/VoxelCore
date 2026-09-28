@@ -136,9 +136,8 @@ Original note: Noise terrain everywhere = beautiful nowhere. Deterministic desti
 
 **F18 — Far-field per-surface SHEETS. ⛔ REMOVED (owner decision, 2026-09 cleanup).** Built 2026-07-06 as a
 render-distance ring of heightfield "sheet" tiles past `MaxClipLevel` (meshed by `GenerateSheetMesh`); the
-runtime path is deleted. `UVoxelSettings::bFarSheetRing` / `FarSheetSpanLevels` remain only so saved assets
-load, and the runtime passes `bFarSheetRing = false`; the render-distance ring is plain level-`MaxClipLevel`
-MC tiles (ARCHITECTURE §8.10).
+runtime path, its settings and the selector's sheet branch are deleted; the render-distance ring is plain
+level-`MaxClipLevel` MC tiles (ARCHITECTURE §8.10).
 
 **F19 — AI navigation & agents (function-based). PARKED (no NPCs yet); FOUNDATION BUILT 2026-07-07.**
 Mobs need two things the world didn't give them: (1) to *exist* away from the local player, (2) to *route*.
