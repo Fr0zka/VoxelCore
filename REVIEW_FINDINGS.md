@@ -111,16 +111,25 @@ Legend: ✅ verified against code · ◻️ checklist box.
   Reflected (`UPROPERTY`/`UFUNCTION`/`UENUM`…) and enum candidates were NOT removed — see
   *Owner decisions* below.
 
-## Owner decisions — unused but kept (2026-09 cleanup)
-Nothing in `Source/` reads these, but assets, Blueprints, tools or tests may reference them by name,
-so removing them is the owner's call.
-- [ ] `UVoxelSettings::bFarSheetRing` / `FarSheetSpanLevels` — runtime always passes `false` since the
-  sheet ring was removed; still logged in the startup config line, written as `far_sheet_ring` in the
-  tile-hash dump, and toggled by `voxel.TestFarSheetRing` (all kept because `Tools/VoxelForgeTest.ps1`
-  and the clipmap tests use them). `VoxelClipmapDesiredTiles`' sheet branch is test-only now.
-- [ ] `UVoxelSettings::CeilingViewMultiplier` / `CeilingBandChunks` — never read.
-- [ ] `UVoxelSettings::DensityVolumeMaxTasks` — only printed in the startup config log (fill runs on its
-  own thread).
+## Owner decisions (2026-09 cleanup)
+Items left for the owner: unused data that assets, Blueprints, tools or tests may reference by name,
+and changes that would alter generated terrain.
+- [x] `UVoxelSettings::bFarSheetRing` / `FarSheetSpanLevels`, `voxel.TestFarSheetRing` and the
+  selector's sheet branch — removed (owner go-ahead); the harness no longer passes the switch and the
+  `sheet_tile` dump field stays for the parity compare.
+- [x] `UVoxelSettings::CeilingViewMultiplier` / `CeilingBandChunks` / `DensityVolumeMaxTasks` — removed
+  (never read).
+- [ ] **Operator stack as the only density path.** Strates without `bUseOperatorStack` (and cooked-season
+  entries without a recipe) still run the per-archetype `switch` in `UVoxelGenerator::GetDensityAt`
+  (`GetSlabDensity`, `GetMazeDensity`, `GetVerticalShaftDensity`, `GetFloatingIslandDensity`, the
+  SurfaceWorld column path, native `GetDensityWithParams`). The tests call those helpers "legacy
+  diagnostic only… not the owner path", and several of them no longer match the stack (e.g.
+  SurfaceWorld, VerticalShafts, TunnelNetwork telemetry). Retiring the switch means: drop the gate in
+  `UVoxelStrateManager::UsesOperatorStackForChunk`, remove the switch (fallback: native stack, then
+  air for a degenerate strate), delete those helpers and the legacy/stack comparisons in ~15 tests, and
+  remove `bUseOperatorStack` (+ commandlet `-opstack`). **It changes terrain for any strate not already
+  opted in**, so it was not done in the cleanup. Related live "legacy" paths that would go with it:
+  the no-strate-manager fallback world (`GetDensityWithParams` with legacy posts).
 - [ ] `UVoxelStrateDefinition::WaterColor`, `Creatures`, `AmbientSound`, `Music`, `MusicVolume` and the
   `FStrateCreature` / `FStrateAmbientActor` spawn fields (`SpawnChancePerChunk`, `MaxPerStrate`,
   `SpawnWeight`) — authored data with no consuming system yet (F9 audio, creatures).
